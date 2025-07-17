@@ -1,0 +1,21 @@
+[[source]]
+url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+verify_ssl = true
+name = "mirror"
+
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+openai = "*"
+ncatbot = "==3.8.10.*"
+pyyaml = "*"
+
+[dev-packages]
+isort = "*"
+
+[requires]
+python_version = "3.10"
+python_full_version = "3.10.11"
