@@ -67,7 +67,7 @@ class OpenAIChatPlugin(BasePlugin):
             # 设置`is_configured`为False
             self.config['is_configured'] = False
 
-    async def _handle_message(self, event: GroupMessage | PrivateMessage):
+    async def _handle_message(self, event: GroupMessage | PrivateMessage | BaseMessage):
         """处理消息事件
 
         :param event: 事件对象
@@ -88,16 +88,30 @@ class OpenAIChatPlugin(BasePlugin):
 
         if event.message_type == 'group':  # 群消息
             conversation_dict = 'group_conversations'
-            if event.group_id not in self.data['data'][conversation_dict]:  # 检查群会话是否存在
+
+            # 检查是否必须@机器人才能触发对话
+            if self.config['must_at_bot']:
+                _at_bot = False
+                for msg in event.message:
+                    if 'at' in msg['type'] and msg['data']['qq'] == config.bt_uin:
+                        _log.debug("群消息已@机器人，处理该消息。")
+                        _at_bot = True
+                        break  # 找到@机器人消息后退出循环
+                if not _at_bot:
+                    _log.debug("群消息未@机器人，忽略该消息。")
+                    return
+
+            # 检查群会话是否存在
+            if event.group_id not in self.data['data'][conversation_dict]:
                 self.data['data'][conversation_dict][event.group_id] = \
                     config.plugins_config['openai_chat_plugin']['presents']['default']['conversations']
-                self.data['data'][conversation_dict][event.group_id].append({"role": "user", "content": user_message})
+            self.data['data'][conversation_dict][event.group_id].append({"role": "user", "content": user_message})
         else:
             conversation_dict = 'user_conversations'
             if event.user_id not in self.data['data'][conversation_dict]:  # 私聊消息
                 self.data['data'][conversation_dict][event.user_id] = \
                     config.plugins_config['openai_chat_plugin']['presents']['default']['conversations']
-                self.data['data'][conversation_dict][event.user_id].append({"role": "user", "content": user_message})
+            self.data['data'][conversation_dict][event.user_id].append({"role": "user", "content": user_message})
 
         try:
             # 添加用户消息到会话
@@ -106,8 +120,6 @@ class OpenAIChatPlugin(BasePlugin):
                 messages=self.data['data'][conversation_dict][
                     event.group_id if event.message_type == 'group' else event.user_id]
             )
-
-            # 获取AI回复
             reply_message = response.choices[0].message.content
 
             # 回复消息
