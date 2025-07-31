@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-from Tools.scripts.dutree import display
-from ncatbot.core import GroupMessage, BaseMessage, PrivateMessage
+import shlex
+
+from ncatbot.core import BaseMessage, GroupMessage, PrivateMessage
 from ncatbot.plugin import BasePlugin, CompatibleEnrollment
 from ncatbot.utils import config
 from ncatbot.utils.logger import get_log
 from openai import OpenAI
-import shlex
 
 bot = CompatibleEnrollment  # 兼容回调函数注册器
 _log = get_log("openai_chat_plugin")  # 日志记录器
