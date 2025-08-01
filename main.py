@@ -13,36 +13,35 @@ _log = get_log("openai_chat_plugin")  # 日志记录器
 
 class OpenAIChatPlugin(BasePlugin):
     name = "OpenAIChatPlugin"  # 插件名
-    version = "0.0.3"  # 插件版本
+    version = "0.0.4"  # 插件版本
 
-    async def command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
-        """处理命令事件"""
+    async def admin_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
+        """处理管理员命令事件"""
         # 替换消息中的转义符，如\\n -> \n
         replaced_message = event.raw_message.replace("\\n", "\n")
 
         # 解析命令
         command = shlex.split(replaced_message)
 
+        # 检测是否为管理员命令
+        if command[0] != '/chat-admin':
+            return
+
         # 检测命令长度
-        # 如/chat
+        # 如/chat-admin
         if len(command) == 1:
             # 显示帮助信息
-            await event.reply_text(
-                "命令无效，请执行\n/nchelp OpenAIChatPlugin\n获得帮助信息。"
-            )
+            # await event.reply_text(
+            #     "管理员命令无效，请执行\n/chat-admin help OpenAIChatPlugin\n获得帮助信息。"
+            # )
             return
 
         elif len(command) > 1:
-            if event.message_type == 'group':  # 群消息
-                conversation_dict = 'group_conversations'
-            else:
-                conversation_dict = 'user_conversations'
-
-            # 功能：选择多配置文件
-            # 例如：/chat set-present <name> [group:<id>|user:<id>]
+            # 功能：选择多预设（管理员功能）
+            # 例如：/chat-admin set-present <name> [group:<id>|user:<id>]
             if command[1] == 'set-present':
                 if len(command) < 3:
-                    await event.reply_text("请提供配置文件名称。")
+                    await event.reply_text("请提供预设名称。")
                     return
 
                 present_name = command[2]
@@ -52,19 +51,22 @@ class OpenAIChatPlugin(BasePlugin):
                 if len(command) > 3:
                     target = command[3]
 
-                # 设置配置文件
+                # 设置预设
                 if target is None:  # 没有指定目标，使用默认配置
                     try:
-                        self.data['data'][conversation_dict][
-                            event.group_id if event.message_type == 'group' else event.user_id] = \
-                            config.plugins_config['openai_chat_plugin']['presents'][present_name]['conversations']
+                        if event.message_type == 'group':
+                            self.data['data']['group_conversations'][event.group_id] = \
+                                config.plugins_config['openai_chat_plugin']['presents'][present_name]['conversations']
+                        else:
+                            self.data['data']['user_conversations'][event.user_id] = \
+                                config.plugins_config['openai_chat_plugin']['presents'][present_name]['conversations']
                     except KeyError:
-                        await event.reply_text(f"配置文件 {present_name} 不存在。")
+                        await event.reply_text(f"预设 {present_name} 不存在。")
                         return
                     else:
                         display_name = config.plugins_config['openai_chat_plugin']['presents'][present_name].get(
                             'display_name', present_name)
-                    await event.reply_text(f"已设置当前配置文件为: {present_name}({display_name})")
+                    await event.reply_text(f"已设置当前预设为: {present_name}({display_name})")
                 else:  # 指定了目标
                     try:
                         if target.startswith('group:'):
@@ -73,21 +75,21 @@ class OpenAIChatPlugin(BasePlugin):
                                 config.plugins_config['openai_chat_plugin']['presents'][present_name]['conversations']
                             display_name = config.plugins_config['openai_chat_plugin']['presents'][present_name].get(
                                 'display_name', present_name)
-                            await event.reply_text(f"已为群组 {group_id} 设置配置文件: {present_name}({display_name})")
+                            await event.reply_text(f"已为群组 {group_id} 设置预设: {present_name}({display_name})")
                         elif target.startswith('user:'):
                             user_id = int(target.split(':')[1])
                             self.data['data']['user_conversations'][user_id] = \
                                 config.plugins_config['openai_chat_plugin']['presents'][present_name]['conversations']
                             display_name = config.plugins_config['openai_chat_plugin']['presents'][present_name].get(
                                 'display_name', present_name)
-                            await event.reply_text(f"已为用户 {user_id} 设置配置文件: {present_name}({display_name})")
+                            await event.reply_text(f"已为用户 {user_id} 设置预设: {present_name}({display_name})")
                         else:
                             await event.reply_text("目标格式错误，请使用 group:<id> 或 user:<id>。")
                     except (ValueError, IndexError):
                         await event.reply_text("目标格式错误，请使用 group:<id> 或 user:<id>。")
 
-            # 功能：重置当前会话
-            # 例如：/chat reset [group:<id>|user:<id>]
+            # 功能：重置会话（管理员功能）
+            # 例如：/chat-admin reset [group:<id>|user:<id>]
             elif command[1] == 'reset':
                 target = None
 
@@ -97,9 +99,12 @@ class OpenAIChatPlugin(BasePlugin):
 
                 if target is None:
                     # 重置当前会话
-                    self.data['data'][conversation_dict][
-                        event.group_id if event.message_type == 'group' else event.user_id] = \
-                        config.plugins_config['openai_chat_plugin']['presents']['default']['conversations']
+                    if event.message_type == 'group':
+                        self.data['data']['group_conversations'][event.group_id] = \
+                            config.plugins_config['openai_chat_plugin']['presents']['default']['conversations']
+                    else:
+                        self.data['data']['user_conversations'][event.user_id] = \
+                            config.plugins_config['openai_chat_plugin']['presents']['default']['conversations']
                     await event.reply_text("已重置当前会话。")
                 else:
                     try:
@@ -118,21 +123,99 @@ class OpenAIChatPlugin(BasePlugin):
                     except (ValueError, IndexError):
                         await event.reply_text("目标格式错误，请使用 group:<id> 或 user:<id>。")
 
+            # 功能：显示管理员帮助信息
+            elif command[1] == 'help':
+                help_text = """OpenAI Chat Plugin 管理员命令帮助：
+
+/chat-admin set-present <name> [group:<id>|user:<id>] - 设置预设（管理员功能）
+/chat-admin reset [group:<id>|user:<id>] - 重置会话（管理员功能）
+/chat-admin help - 显示此帮助信息
+
+示例：
+/chat-admin set-present MyPresent
+/chat-admin set-present MyPresent group:1919810
+/chat-admin set-present MyPresent user:114514
+/chat-admin reset
+/chat-admin reset group:1919810
+/chat-admin reset user:114514
+
+注意：这些命令仅限管理员使用，可以跨群聊设置预设。"""
+                await event.reply_text(help_text)
+
+            else:
+                await event.reply_text("未知管理员命令，请使用 /chat-admin help 查看帮助信息。")
+
+    async def user_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
+        """处理用户命令事件"""
+        # 替换消息中的转义符，如\\n -> \n
+        replaced_message = event.raw_message.replace("\\n", "\n")
+
+        # 解析命令
+        command = shlex.split(replaced_message)
+
+        # 检测是否为用户命令
+        if command[0] != '/chat':
+            return
+
+        # 检测命令长度
+        # 如/chat
+        if len(command) == 1:
+            # 显示帮助信息
+            await event.reply_text(
+                "命令无效，请执行\n/nchelp OpenAIChatPlugin\n获得帮助信息。"
+            )
+            return
+
+        elif len(command) > 1:
+            if event.message_type == 'group':  # 群消息
+                conversation_dict = 'group_conversations'
+            else:
+                conversation_dict = 'user_conversations'
+
+            # 功能：选择预设（仅限当前用户/群组）
+            # 例如：/chat set-present <name>
+            if command[1] == 'set-present':
+                if len(command) < 3:
+                    await event.reply_text("请提供预设名称。")
+                    return
+
+                present_name = command[2]
+
+                # 设置预设（仅限当前用户/群组）
+                try:
+                    self.data['data'][conversation_dict][
+                        event.group_id if event.message_type == 'group' else event.user_id] = \
+                        config.plugins_config['openai_chat_plugin']['presents'][present_name]['conversations']
+                except KeyError:
+                    await event.reply_text(f"预设 {present_name} 不存在。")
+                    return
+                else:
+                    display_name = config.plugins_config['openai_chat_plugin']['presents'][present_name].get(
+                        'display_name', present_name)
+                await event.reply_text(f"已设置当前预设为: {present_name}({display_name})")
+
+            # 功能：重置当前会话
+            # 例如：/chat reset
+            elif command[1] == 'reset':
+                # 重置当前会话
+                self.data['data'][conversation_dict][
+                    event.group_id if event.message_type == 'group' else event.user_id] = \
+                    config.plugins_config['openai_chat_plugin']['presents']['default']['conversations']
+                await event.reply_text("已重置当前会话。")
+
             # 功能：显示帮助信息
             elif command[1] == 'help':
-                help_text = """OpenAI Chat Plugin 命令帮助：
+                help_text = """OpenAI Chat Plugin 用户命令帮助：
 
-/chat set-present <name> [group:<id>|user:<id>] - 设置配置文件
-/chat reset [group:<id>|user:<id>] - 重置会话
+/chat set-present <name> - 设置预设（仅限当前用户/群组）
+/chat reset - 重置当前会话
 /chat help - 显示此帮助信息
 
 示例：
 /chat set-present MyPresent
-/chat set-present MyPresent group:1919810
-/chat set-present MyPresent user:114514
 /chat reset
-/chat reset group:1919810
-/chat reset user:114514"""
+/chat help
+"""
                 await event.reply_text(help_text)
 
             else:
@@ -168,13 +251,22 @@ class OpenAIChatPlugin(BasePlugin):
             default=False
         )
 
-        self.register_user_func("命令事件处理器", self.command_handler, prefix='/chat',
+        self.register_user_func("用户命令", self.user_command_handler, prefix='/chat', description="设置预设、重置会话", usage="/chat <set-present|reset|help> [present_name]",
                                 examples=[
-                                    "/chat set-present MyPresent",
-                                    "/chat set-present MyPresent group:1919810",  # 群组设置配置文件
-                                    "/chat set-present MyPresent user:114514",  # 用户设置配置文件
+                                    "/chat set-present MyPresent",  # 设置预设
                                     "/chat reset",  # 重置当前会话
                                     "/chat help"  # 显示帮助信息
+                                ])
+
+        self.register_admin_func("管理员命令", self.admin_command_handler, prefix='/chat-admin', description="跨群组/用户设置预设、重置会话", usage="/chat-admin <set-present|reset|help> [args]",
+                                examples=[
+                                    "/chat-admin set-present MyPresent",  # 设置预设
+                                    "/chat-admin set-present MyPresent group:1919810",  # 跨群组设置预设
+                                    "/chat-admin set-present MyPresent user:114514",  # 跨用户设置预设
+                                    "/chat-admin reset",  # 重置当前会话
+                                    "/chat-admin reset group:1919810",  # 跨群组重置会话
+                                    "/chat-admin reset user:114514",  # 跨用户重置会话
+                                    "/chat-admin help"  # 显示帮助信息
                                 ])
 
         # 初始化持久化数据
@@ -188,9 +280,9 @@ class OpenAIChatPlugin(BasePlugin):
         if not self.config['is_configured']:
             _log.warning("插件未配置，请先配置插件。")
 
-        # 检查是否正确添加了配置文件
+        # 检查是否正确添加了预设
         if not config.plugins_config['openai_chat_plugin']:
-            _log.error("插件配置文件未正确添加，请检查配置文件。")
+            _log.error("插件预设未正确添加，请检查预设。")
 
             # 设置`is_configured`为False
             self.config['is_configured'] = False
@@ -207,7 +299,7 @@ class OpenAIChatPlugin(BasePlugin):
             return
 
         # 检查消息是否以命令前缀开头，如果是则跳过聊天处理
-        if event.raw_message.strip().startswith('/chat'):
+        if event.raw_message.strip().startswith('/'):
             _log.debug("检测到命令消息，跳过聊天处理以避免重复触发。")
             return
 

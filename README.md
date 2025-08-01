@@ -201,6 +201,10 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 
 ## 📝 更新日志
 
+### v0.0.4
+- ✅ 改进命令处理系统
+- ✅ 增加权限控制功能
+
 ### v0.0.3
 - ✅ 修复命令处理逻辑错误
 - ✅ 添加异常处理机制
