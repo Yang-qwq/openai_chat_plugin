@@ -13,7 +13,7 @@ _log = get_log("openai_chat_plugin")  # 日志记录器
 
 class OpenAIChatPlugin(BasePlugin):
     name = "OpenAIChatPlugin"  # 插件名
-    version = "0.0.4"  # 插件版本
+    version = "0.0.5"  # 插件版本
 
     async def admin_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
         """处理管理员命令事件"""
@@ -246,28 +246,35 @@ class OpenAIChatPlugin(BasePlugin):
             default=True
         )
         self.register_config(
+            "max_conversations", description="每个会话的最大消息数", allowed_values=["int"],
+            default=21
+        )
+        self.register_config(
             "is_configured", description="插件是否已配置",
             allowed_values=["bool"],
             default=False
         )
 
-        self.register_user_func("用户命令", self.user_command_handler, prefix='/chat', description="设置预设、重置会话", usage="/chat <set-present|reset|help> [present_name]",
+        self.register_user_func("用户命令", self.user_command_handler, prefix='/chat', description="设置预设、重置会话",
+                                usage="/chat <set-present|reset|help> [present_name]",
                                 examples=[
                                     "/chat set-present MyPresent",  # 设置预设
                                     "/chat reset",  # 重置当前会话
                                     "/chat help"  # 显示帮助信息
                                 ])
 
-        self.register_admin_func("管理员命令", self.admin_command_handler, prefix='/chat-admin', description="跨群组/用户设置预设、重置会话", usage="/chat-admin <set-present|reset|help> [args]",
-                                examples=[
-                                    "/chat-admin set-present MyPresent",  # 设置预设
-                                    "/chat-admin set-present MyPresent group:1919810",  # 跨群组设置预设
-                                    "/chat-admin set-present MyPresent user:114514",  # 跨用户设置预设
-                                    "/chat-admin reset",  # 重置当前会话
-                                    "/chat-admin reset group:1919810",  # 跨群组重置会话
-                                    "/chat-admin reset user:114514",  # 跨用户重置会话
-                                    "/chat-admin help"  # 显示帮助信息
-                                ])
+        self.register_admin_func("管理员命令", self.admin_command_handler, prefix='/chat-admin',
+                                 description="跨群组/用户设置预设、重置会话",
+                                 usage="/chat-admin <set-present|reset|help> [args]",
+                                 examples=[
+                                     "/chat-admin set-present MyPresent",  # 设置预设
+                                     "/chat-admin set-present MyPresent group:1919810",  # 跨群组设置预设
+                                     "/chat-admin set-present MyPresent user:114514",  # 跨用户设置预设
+                                     "/chat-admin reset",  # 重置当前会话
+                                     "/chat-admin reset group:1919810",  # 跨群组重置会话
+                                     "/chat-admin reset user:114514",  # 跨用户重置会话
+                                     "/chat-admin help"  # 显示帮助信息
+                                 ])
 
         # 初始化持久化数据
         if 'data' not in self.data:
@@ -286,6 +293,48 @@ class OpenAIChatPlugin(BasePlugin):
 
             # 设置`is_configured`为False
             self.config['is_configured'] = False
+        
+        # 检查并修剪所有现有会话，确保符合新的配置限制
+        self._trim_all_conversations()
+
+    def _trim_conversation_if_needed(self, conversation):
+        """检查会话长度，如果超过限制则删除最早的非system消息（保护最近的对话）
+        
+        :param conversation: 会话列表
+        :return: None
+        """
+        while len(conversation) > self.config['max_conversations']:
+            # 找到最早的非system消息的索引（从前往后找第一个非system消息）
+            earliest_non_system_index = None
+            for i, msg in enumerate(conversation):
+                if msg.get('role') != 'system':
+                    earliest_non_system_index = i
+                    break
+            
+            # 如果找到了非system消息，删除它
+            if earliest_non_system_index is not None:
+                conversation.pop(earliest_non_system_index)
+                _log.debug(f"会话长度超过限制({self.config['max_conversations']})，已删除最早的非system消息")
+            else:
+                # 如果没有找到非system消息，说明所有消息都是system，无法删除
+                _log.warning(f"会话长度超过限制({self.config['max_conversations']})，但所有消息都是system，无法删除")
+                break
+
+    def _trim_all_conversations(self):
+        """检查并修剪所有现有会话，确保符合新的配置限制"""
+        # 检查群组会话
+        for group_id, conversation in self.data['data']['group_conversations'].items():
+            original_length = len(conversation)
+            self._trim_conversation_if_needed(conversation)
+            if len(conversation) < original_length:
+                _log.info(f"群组 {group_id} 的会话已从 {original_length} 条消息修剪到 {len(conversation)} 条消息")
+        
+        # 检查用户会话
+        for user_id, conversation in self.data['data']['user_conversations'].items():
+            original_length = len(conversation)
+            self._trim_conversation_if_needed(conversation)
+            if len(conversation) < original_length:
+                _log.info(f"用户 {user_id} 的会话已从 {original_length} 条消息修剪到 {len(conversation)} 条消息")
 
     async def _handle_message(self, event: GroupMessage | PrivateMessage | BaseMessage):
         """处理消息事件
@@ -330,12 +379,22 @@ class OpenAIChatPlugin(BasePlugin):
             if event.group_id not in self.data['data'][conversation_dict]:
                 self.data['data'][conversation_dict][event.group_id] = \
                     config.plugins_config['openai_chat_plugin']['presents']['default']['conversations']
+            
+            # 在添加用户消息前检查会话长度
+            conversation = self.data['data'][conversation_dict][event.group_id]
+            self._trim_conversation_if_needed(conversation)
+            
             self.data['data'][conversation_dict][event.group_id].append({"role": "user", "content": user_message})
         else:
             conversation_dict = 'user_conversations'
             if event.user_id not in self.data['data'][conversation_dict]:  # 私聊消息
                 self.data['data'][conversation_dict][event.user_id] = \
                     config.plugins_config['openai_chat_plugin']['presents']['default']['conversations']
+            
+            # 在添加用户消息前检查会话长度
+            conversation = self.data['data'][conversation_dict][event.user_id]
+            self._trim_conversation_if_needed(conversation)
+            
             self.data['data'][conversation_dict][event.user_id].append({"role": "user", "content": user_message})
 
         try:
@@ -354,6 +413,11 @@ class OpenAIChatPlugin(BasePlugin):
             self.data['data'][conversation_dict][
                 event.group_id if event.message_type == 'group' else event.user_id].append(
                 {"role": "assistant", "content": reply_message})
+            
+            # 添加AI回复后再次检查会话长度
+            conversation = self.data['data'][conversation_dict][
+                event.group_id if event.message_type == 'group' else event.user_id]
+            self._trim_conversation_if_needed(conversation)
         except Exception as e:
             _log.error(f"API 调用失败: {e}")
             # await event.reply("抱歉，AI 服务暂时不可用，请稍后再试。")

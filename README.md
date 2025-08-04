@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.0.3-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.0.5-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -14,6 +14,8 @@
 - 🔄 **会话管理**：支持重置和切换对话配置
 - 🎯 **精确控制**：支持@机器人触发和用户名前缀
 - 📝 **命令系统**：完整的命令控制界面
+- 🧠 **智能会话管理**：自动控制会话长度，保护最近对话
+- ⚡ **内存优化**：动态修剪超长会话，提升性能
 
 ## 📋 系统要求
 
@@ -144,6 +146,7 @@ plugins_config:
 | `base_url` | string | https://api.openai.com/v1 | API基础URL |
 | `must_at_bot` | boolean | true | 群聊中是否必须@机器人 |
 | `insert_username_as_prefix` | boolean | false | 是否添加用户名前缀 |
+| `max_conversations` | integer | 21 | 每个会话的最大消息数 |
 | `is_configured` | boolean | false | 插件是否已配置 |
 
 ## 🎯 高级功能
@@ -173,6 +176,22 @@ presents:
 - 私聊会话独立存储
 - 支持会话重置和配置切换
 
+### 智能会话管理
+
+插件具备智能的会话长度控制功能：
+
+- **自动修剪**：当会话长度超过 `max_conversations` 限制时，自动删除最早的非system消息
+- **保护最近对话**：优先保留最近的对话内容，删除最早的历史消息
+- **配置自适应**：支持动态调整最大消息数，插件会自动清理超长会话
+- **双重检查**：在添加新消息前后都进行长度检查，确保会话始终符合限制
+- **主动清理**：插件加载时会自动检查并清理所有超长会话
+
+**工作原理**：
+1. 插件启动时检查所有现有会话
+2. 删除最早的非system消息（保留预设配置）
+3. 持续删除直到会话长度符合限制
+4. 记录详细的修剪日志便于调试
+
 ## 🐛 故障排除
 
 ### 常见问题
@@ -190,6 +209,11 @@ presents:
    - 检查 `config.yaml` 中的 `presents` 配置
    - 确认配置文件名称拼写正确
 
+4. **会话长度异常**
+   - 检查 `max_conversations` 配置值是否合理
+   - 查看日志确认自动修剪功能是否正常工作
+   - 确认预设配置中的system消息数量
+
 ### 日志查看
 
 插件会输出详细的调试日志，可以通过日志查看运行状态：
@@ -200,6 +224,15 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.0.5
+- ✅ **智能会话管理**：新增自动会话长度控制功能
+- ✅ **配置自适应**：支持动态调整最大消息数限制
+- ✅ **内存优化**：自动删除最早的非system消息，保护最近对话
+- ✅ **双重保护机制**：在添加消息前后都进行长度检查
+- ✅ **主动清理功能**：插件加载时自动清理超长会话
+- ✅ **递归修剪算法**：确保会话长度始终符合配置要求
+- ✅ **详细日志记录**：记录所有修剪操作便于调试
 
 ### v0.0.4
 - ✅ 改进命令处理系统
