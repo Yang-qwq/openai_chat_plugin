@@ -262,15 +262,19 @@ class OpenAIChatPlugin(BasePlugin):
             if len(conversation) < original_length:
                 _log.info(f"用户 {user_id} 的会话已从 {original_length} 条消息修剪到 {len(conversation)} 条消息")
 
-    def _extract_memory_block(self, text):
+    def _extract_memory_block(self, text) -> str | None:
         """提取 memory 类型的代码块内容，如果存在则返回内容，否则返回 None"""
+        # 检查是否允许访问记忆
+        if not self.config.get('allow_access_memory', True):
+            return None
+            
         pattern = r"```memory\\s*([\s\S]*?)```"
         match = re.search(pattern, text)
         if match:
             return match.group(1).strip()
         return None
 
-    def _get_memory_file_path(self, present_name):
+    def _get_memory_file_path(self, present_name) -> Path:
         """获取当前 present 的 memory 文件路径"""
         return self._data_path.parent / f"memory_{present_name}.txt"
 
@@ -280,10 +284,36 @@ class OpenAIChatPlugin(BasePlugin):
         :param file_path: memory 文件路径
         :return: 文件内容字符串，若文件为空则返回提示
         """
-        if file_path.exists():
+        try:
+            if not file_path.exists():
+                return "(memory 文件不存在)"
+            
+            # 检查文件大小，防止读取过大的文件
+            # file_size = file_path.stat().st_size
+            # if file_size > 1024 * 1024:  # 1MB 限制
+            #     _log.warning(f"Memory file too large: {file_path}, size: {file_size} bytes")
+            #     return f"(memory 文件过大：{file_size // 1024}KB，超过 1MB 限制)"
+            
             lines = file_path.read_text(encoding='utf-8').splitlines()
-            return '\n'.join(lines) if lines else "(memory 文件为空)"
-        return "(memory 文件为空)"
+            
+            if not lines:
+                return "(memory 文件为空)"
+            
+            content = '\n'.join(lines)
+            return content
+                
+        except UnicodeDecodeError:
+            _log.error(f"Unicode decode error when reading memory file: {file_path}")
+            return "(读取失败：文件编码错误)"
+        except PermissionError:
+            _log.error(f"Permission denied when reading memory file: {file_path}")
+            return "(读取失败：权限不足)"
+        except OSError as e:
+            _log.error(f"OS error when reading memory file: {file_path}, error: {e}")
+            return f"(读取失败：系统错误 - {e})"
+        except Exception as e:
+            _log.error(f"Unexpected error when reading memory file: {file_path}, error: {e}")
+            return f"(读取失败：未知错误 - {e})"
 
     def _memory_write(self, file_path: Path, content: str) -> str:
         """向指定 memory 文件追加写入内容
@@ -292,9 +322,33 @@ class OpenAIChatPlugin(BasePlugin):
         :param content: 要写入的内容
         :return: 写入结果提示
         """
-        with file_path.open('a', encoding='utf-8') as f:
-            f.write(content + '\n')
-        return "(memory 已写入)"
+        try:
+            # 验证输入内容
+            if not content or not content.strip():
+                return "(write 命令内容为空)"
+            
+            # 限制内容长度，防止过长的内容
+            # if len(content) > 10000:  # 10KB 限制
+            #     return "(write 命令内容过长，超过 10KB 限制)"
+            
+            # 确保目录存在
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            with file_path.open('a', encoding='utf-8') as f:
+                f.write(content.strip() + '\n')
+            
+            _log.info(f"Successfully wrote to memory file: {file_path}, content length: {len(content)}")
+            return "(memory 已写入)"
+            
+        except PermissionError:
+            _log.error(f"Permission denied when writing to memory file: {file_path}")
+            return "(写入失败：权限不足)"
+        except OSError as e:
+            _log.error(f"OS error when writing to memory file: {file_path}, error: {e}")
+            return f"(写入失败：系统错误 - {e})"
+        except Exception as e:
+            _log.error(f"Unexpected error when writing to memory file: {file_path}, error: {e}")
+            return f"(写入失败：未知错误 - {e})"
 
     def _memory_regex_search(self, file_path: Path, pattern: str) -> str:
         """在指定 memory 文件中使用正则表达式查找匹配内容
@@ -303,14 +357,48 @@ class OpenAIChatPlugin(BasePlugin):
         :param pattern: 正则表达式
         :return: 匹配到的内容或提示信息
         """
-        if not file_path.exists():
-            return "(memory 文件为空)"
-        lines = file_path.read_text(encoding='utf-8').splitlines()
         try:
-            matched = [line for line in lines if re.search(pattern, line)]
-        except re.error as e:
-            return f"(正则表达式错误: {e})"
-        return '\n'.join(matched) if matched else "(未找到匹配内容)"
+            # 验证正则表达式模式
+            if not pattern or not pattern.strip():
+                return "(regex_search 命令缺少搜索模式)"
+            
+            # 限制正则表达式长度，防止过长的模式
+            # if len(pattern) > 1000:  # 1KB 限制
+            #     return "(regex_search 命令模式过长，超过 1KB 限制)"
+            
+            # 测试正则表达式是否有效
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                return f"(正则表达式语法错误: {e})"
+            
+            if not file_path.exists():
+                return "(memory 文件为空)"
+                
+            lines = file_path.read_text(encoding='utf-8').splitlines()
+            
+            # 执行搜索
+            matched = []
+            for i, line in enumerate(lines):
+                try:
+                    if re.search(pattern, line):
+                        matched.append(f"[{i}] {line}")
+                except re.error as e:
+                    _log.warning(f"正则表达搜索错误: {e}，在行 {i} 中的内容: {line[:100]}...")
+                    continue
+            
+            if matched:
+                _log.debug(f"正则表达式搜索成功，匹配到 {len(matched)} 行")
+                return '\n'.join(matched)
+            else:
+                return "(未找到匹配内容)"
+                
+        except UnicodeDecodeError:
+            _log.error(f"Unicode decode error when reading memory file: {file_path}")
+            return "(读取失败：文件编码错误)"
+        except Exception as e:
+            _log.error(f"Unexpected error in regex search: {e}")
+            return f"(搜索失败：未知错误 - {e})"
 
     def _memory_delete(self, file_path: Path, idx: int) -> str:
         """删除指定 memory 文件中指定索引的内容行
@@ -319,35 +407,118 @@ class OpenAIChatPlugin(BasePlugin):
         :param idx: 要删除的行索引（从0开始）
         :return: 删除结果提示
         """
-        if not file_path.exists():
-            return f"(memory 文件为空)"
-        lines = file_path.read_text(encoding='utf-8').splitlines()
-        if 0 <= idx < len(lines):
-            deleted = lines.pop(idx)
-            file_path.write_text('\n'.join(lines) + ('\n' if lines else ''), encoding='utf-8')
-            return f"(已删除第{idx}行: {deleted})"
-        else:
-            return f"(索引超出范围: {idx})"
+        try:
+            # 验证索引
+            if idx < 0:
+                return f"(删除索引无效：{idx}，索引必须为非负整数)"
+            
+            if not file_path.exists():
+                return "(memory 文件为空)"
+            
+            lines = file_path.read_text(encoding='utf-8').splitlines()
+            
+            if idx >= len(lines):
+                return f"(索引超出范围：{idx}，文件只有 {len(lines)} 行)"
+            
+            # 备份要删除的内容
+            deleted = lines[idx]
+            
+            # 删除指定行
+            lines.pop(idx)
+            
+            # 写回文件
+            try:
+                file_path.write_text('\n'.join(lines) + ('\n' if lines else ''), encoding='utf-8')
+                _log.info(f"Successfully deleted line {idx} from memory file: {file_path}, deleted content: {deleted[:100]}...")
+                return f"(已删除第{idx}行: {deleted[:100]}{'...' if len(deleted) > 100 else ''})"
+            except (PermissionError, OSError) as e:
+                _log.error(f"Failed to write back memory file after deletion: {file_path}, error: {e}")
+                return f"(删除成功但保存失败：{e})"
+                
+        except UnicodeDecodeError:
+            _log.error(f"Unicode decode error when reading memory file: {file_path}")
+            return "(读取失败：文件编码错误)"
+        except Exception as e:
+            _log.error(f"Unexpected error in delete operation: {e}")
+            return f"(删除失败：未知错误 - {e})"
 
     def _handle_memory_block(self, memory_block, present_name):
+        """处理 memory 代码块，支持多条语句和错误处理
+        
+        :param memory_block: memory 代码块内容
+        :param present_name: 当前 present 名称
+        :return: 处理结果字符串
+        """
         file_path = self._get_memory_file_path(present_name)
-        cmd = memory_block.strip()
-        # read
+        
+        # 清理和验证输入
+        if not memory_block or not memory_block.strip():
+            # _log.warning(f"Empty memory block for present: {present_name}")
+            return "(memory 代码块为空)"
+        
+        # 分割多条语句（按换行符分割）
+        commands = [cmd.strip() for cmd in memory_block.split('\n') if cmd.strip()]
+        
+        if not commands:
+            _log.warning(f"memory代码框中没有有效命令，present: {present_name}")
+            return "(memory 代码块中没有有效命令)"
+        
+        # _log.info(f"Processing {len(commands)} memory commands for present: {present_name}")
+        
+        results = []
+        for i, cmd in enumerate(commands):
+            try:
+                result = self._execute_single_memory_command(cmd, file_path, i + 1)
+                results.append(f"[{i + 1}] {result}")
+            except Exception as e:
+                error_msg = f"[{i + 1}] 命令执行失败: {str(e)}"
+                _log.error(f"Memory command execution failed for present {present_name}, command {i + 1}: {cmd}, error: {e}")
+                results.append(error_msg)
+        
+        return '\n'.join(results)
+    
+    def _execute_single_memory_command(self, cmd, file_path, cmd_index):
+        """执行单个 memory 命令
+        
+        :param cmd: 单个命令
+        :param file_path: memory 文件路径
+        :param cmd_index: 命令索引（用于日志）
+        :return: 命令执行结果
+        """
+        _log.debug(f"Executing memory command [{cmd_index}]: {cmd}")
+        
+        # read 命令
         if cmd == 'read':
             return self._memory_read(file_path)
-        # write <content>
-        m = re.match(r'^write\s+([\s\S]+)$', cmd)
-        if m:
-            return self._memory_write(file_path, m.group(1))
-        # regex_search <pattern>
-        m = re.match(r'^regex_search\s+(.+)$', cmd)
-        if m:
-            return self._memory_regex_search(file_path, m.group(1))
-        # delete <index>
-        m = re.match(r'^delete\s+(\d+)$', cmd)
-        if m:
-            return self._memory_delete(file_path, int(m.group(1)))
-        return "(未知 memory 操作)"
+        
+        # write <content> 命令
+        write_match = re.match(r'^write\s+(.+)$', cmd)
+        if write_match:
+            content = write_match.group(1).strip()
+            if not content:
+                return "(write 命令缺少内容)"
+            return self._memory_write(file_path, content)
+        
+        # regex_search <pattern> 命令
+        regex_match = re.match(r'^regex_search\s+(.+)$', cmd)
+        if regex_match:
+            pattern = regex_match.group(1).strip()
+            if not pattern:
+                return "(regex_search 命令缺少搜索模式)"
+            return self._memory_regex_search(file_path, pattern)
+        
+        # delete <index> 命令
+        delete_match = re.match(r'^delete\s+(\d+)$', cmd)
+        if delete_match:
+            try:
+                idx = int(delete_match.group(1))
+                return self._memory_delete(file_path, idx)
+            except ValueError:
+                return f"(delete 命令索引无效: {delete_match.group(1)})"
+        
+        # 未知命令
+        _log.warning(f"Unknown memory command: {cmd}")
+        return f"(未知 memory 操作: {cmd})"
 
     async def _handle_message(self, event: GroupMessage | PrivateMessage | BaseMessage):
         """处理消息事件
@@ -492,7 +663,7 @@ class OpenAIChatPlugin(BasePlugin):
             default=False
         )
         self.register_config(
-            "enable_long_term_memory", description="是否启用长期记忆（会话持久化）",
+            "allow_access_memory", description="是否允许访问记忆（memory 代码块）",
             allowed_values=["bool"],
             default=True
         )
