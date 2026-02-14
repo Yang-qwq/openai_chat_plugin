@@ -49,7 +49,7 @@ USER_HELP_TEXT = """OpenAI Chat Plugin 用户命令帮助：
 
 class OpenAIChatPlugin(BasePlugin):
     name = 'OpenAIChatPlugin'  # 插件名
-    version = '0.1.0'  # 插件版本
+    version = '0.1.1'  # 插件版本
 
     async def admin_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
         """处理管理员命令事件
@@ -495,7 +495,14 @@ class OpenAIChatPlugin(BasePlugin):
                 if self.config['enable_builtin_function_calling']:
                     if response.choices[0].message.tool_calls:
                         current_retries_times += 1
-                        # await self.api.post_group_msg()
+
+                        # 发送思考中的消息（可选）
+                        # 先检查回复内容是否为空
+                        # if not response.choices[0].message.content == '':
+                        #     if event.message_type == 'group':
+                        #         await self.api.post_group_msg(event.group_id, response.choices[0].message.content)
+                        #     else:
+                        #         await self.api.post_private_msg(event.user_id, response.choices[0].message.content)
 
                         # 处理每个工具调用请求
                         for tool_call in response.choices[0].message.tool_calls:
@@ -532,8 +539,8 @@ class OpenAIChatPlugin(BasePlugin):
                 event.group_id if event.message_type == 'group' else event.user_id]
             self._trim_conversation_if_needed(conversation)
         except Exception as e:
-            _log.error(f'API 调用失败: {e}')
-            # await event.reply("抱歉，AI 服务暂时不可用，请稍后再试。")
+            _log.error(f'API 调用失败: {e.__class__.__name__}: {e}')
+            await event.reply("抱歉，插件出现内部错误，请稍后再试。")
 
     @bot.group_event()
     async def on_group_message(self, event: GroupMessage):

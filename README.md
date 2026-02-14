@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.1.1-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -137,6 +137,25 @@ your_editor data/openai_chat_plugin/presents/default/prompt.md
 
 ## 🎯 高级功能
 
+### 多配置文件支持
+
+插件支持创建多个对话预设，每个预设可以有不同的系统提示词：
+
+```
+data/openai_chat_plugin/
+| -- presents/
+    | -- default/
+        | -- config.yaml
+        | -- prompt.md  <-- 系统提示词文件
+    | -- programmer/
+        | -- config.yaml
+        | -- prompt.md  <-- 程序员预设的系统提示词文件
+    | -- translator/
+        | -- config.yaml
+        | -- prompt.md  <-- 翻译预设的系统提示词文件
+    ...
+```
+
 ### 会话持久化
 
 - 群聊会话独立存储
@@ -192,6 +211,10 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.1.1
+
+- ✅ **修复内置函数调用兼容性问题**：修复了在某些环境下内置函数调用可能无法正常工作的问题，提升了稳定性和可靠性
 
 ### v0.1.0
 

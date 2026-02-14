@@ -38,16 +38,20 @@ tools = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "id": {
-                        "type": "integer",
+                    "id_list": {
+                        "type": "array",
+                        "items": {
+                            "type": "integer"
+                        },
                         "description": "要删除的记忆的ID"
                     }
                 },
-                "required": ["id"]
+                "required": ["id_list"]
             }
         }
     }
 ]
+
 
 def memory_common_tool(work_space: os.PathLike | str, action: str, content: str) -> str:
     """记忆读取、写入工具
@@ -102,29 +106,29 @@ def memory_common_tool(work_space: os.PathLike | str, action: str, content: str)
     return json.dumps({"status": "error", "message": "无效的操作类型"}, ensure_ascii=False)
 
 
-def memory_delete_tool(work_space: os.PathLike | str, _id: int) -> str:
+def memory_delete_tool(work_space: os.PathLike | str, id_list: list[int]) -> str:
     """记忆删除工具
 
     :param work_space: 工作空间对象或路径
-    :param _id: 要删除的记忆的ID
+    :param id_list: 要删除的记忆的ID
     :return: str, json字符串，包含操作结果
     """
-    _log.debug(f"执行记忆删除工具，要删除的记忆ID: {_id}")
+    _log.debug(f"执行记忆删除工具，要删除的记忆ID: {id_list}")
 
     memory_file = os.path.join(work_space, "memory.json")
     if not os.path.exists(memory_file):
         return json.dumps({"status": "error", "message": "记忆文件不存在"}, ensure_ascii=False)
 
-    with open(memory_file, 'r', encoding='utf-8') as f:
-        memory_data = json.load(f)
+    memory_file_object = open(memory_file, 'r+', encoding='utf-8')
+    memory_data = json.load(memory_file_object)
 
     # 根据ID过滤掉要删除的记忆
-    new_memory_data = [item for item in memory_data if item["id"] != _id]
-
-    if len(new_memory_data) == len(memory_data):
+    new_memory_data = [item for item in memory_data if item["id"] not in id_list]
+    if len(new_memory_data) == len(memory_data):  # 没有找到要删除的记忆
         return json.dumps({"status": "error", "message": "未找到要删除的记忆"}, ensure_ascii=False)
-
-    with open(memory_file, 'w', encoding='utf-8') as f:
-        json.dump(new_memory_data, f, ensure_ascii=False, indent=2)
-
+    else:  # 写回文件
+        memory_file_object.seek(0)
+        json.dump(new_memory_data, memory_file_object, ensure_ascii=False, indent=2)
+        memory_file_object.truncate()
+        memory_file_object.close()
     return json.dumps({"status": "success", "message": "记忆删除成功"}, ensure_ascii=False)
