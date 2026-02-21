@@ -49,7 +49,7 @@ USER_HELP_TEXT = """OpenAI Chat Plugin 用户命令帮助：
 
 class OpenAIChatPlugin(BasePlugin):
     name = 'OpenAIChatPlugin'  # 插件名
-    version = '0.1.1'  # 插件版本
+    version = '0.1.2'  # 插件版本
 
     async def admin_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
         """处理管理员命令事件
@@ -100,8 +100,10 @@ class OpenAIChatPlugin(BasePlugin):
 
                     if event.message_type == 'group':
                         self.data['data']['group_conversations'][event.group_id] = conversations.copy()
+                        self._set_preset_name('group_conversations', event.group_id, present_name)
                     else:
                         self.data['data']['user_conversations'][event.user_id] = conversations.copy()
+                        self._set_preset_name('user_conversations', event.user_id, present_name)
 
                     await event.reply_text(f"已设置当前预设为: {present_name}({display_name})")
                 else:  # 指定了目标
@@ -116,10 +118,12 @@ class OpenAIChatPlugin(BasePlugin):
                         if target.startswith('group:'):
                             group_id = int(target.split(':')[1])
                             self.data['data']['group_conversations'][group_id] = conversations.copy()
+                            self._set_preset_name('group_conversations', group_id, present_name)
                             await event.reply_text(f"已为群组 {group_id} 设置预设: {present_name}({display_name})")
                         elif target.startswith('user:'):
                             user_id = int(target.split(':')[1])
                             self.data['data']['user_conversations'][user_id] = conversations.copy()
+                            self._set_preset_name('user_conversations', user_id, present_name)
                             await event.reply_text(f"已为用户 {user_id} 设置预设: {present_name}({display_name})")
                         else:
                             await event.reply_text("目标格式错误，请使用 group:<id> 或 user:<id>。")
@@ -135,28 +139,42 @@ class OpenAIChatPlugin(BasePlugin):
                 if len(command) > 2:
                     target = command[2]
 
-                # 加载默认预设
-                default_conversations = load_preset(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME)
-                if default_conversations is None:
-                    await event.reply_text("默认预设不存在，无法重置会话。")
-                    return
-
                 if target is None:
-                    # 重置当前会话
+                    # 重置当前会话，加载该会话记录的预设
                     if event.message_type == 'group':
-                        self.data['data']['group_conversations'][event.group_id] = default_conversations.copy()
+                        preset_name = self._get_preset_name('group_conversations', event.group_id)
+                        preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
+                        if preset_conversations is None:
+                            await event.reply_text(f"预设 {preset_name} 不存在，无法重置会话。")
+                            return
+                        self.data['data']['group_conversations'][event.group_id] = preset_conversations.copy()
                     else:
-                        self.data['data']['user_conversations'][event.user_id] = default_conversations.copy()
+                        preset_name = self._get_preset_name('user_conversations', event.user_id)
+                        preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
+                        if preset_conversations is None:
+                            await event.reply_text(f"预设 {preset_name} 不存在，无法重置会话。")
+                            return
+                        self.data['data']['user_conversations'][event.user_id] = preset_conversations.copy()
                     await event.reply_text("已重置当前会话。")
                 else:
                     try:
                         if target.startswith('group:'):
                             group_id = int(target.split(':')[1])
-                            self.data['data']['group_conversations'][group_id] = default_conversations.copy()
+                            preset_name = self._get_preset_name('group_conversations', group_id)
+                            preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
+                            if preset_conversations is None:
+                                await event.reply_text(f"预设 {preset_name} 不存在，无法重置会话。")
+                                return
+                            self.data['data']['group_conversations'][group_id] = preset_conversations.copy()
                             await event.reply_text(f"已重置群组 {group_id} 的会话。")
                         elif target.startswith('user:'):
                             user_id = int(target.split(':')[1])
-                            self.data['data']['user_conversations'][user_id] = default_conversations.copy()
+                            preset_name = self._get_preset_name('user_conversations', user_id)
+                            preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
+                            if preset_conversations is None:
+                                await event.reply_text(f"预设 {preset_name} 不存在，无法重置会话。")
+                                return
+                            self.data['data']['user_conversations'][user_id] = preset_conversations.copy()
                             await event.reply_text(f"已重置用户 {user_id} 的会话。")
                         else:
                             await event.reply_text("目标格式错误，请使用 group:<id> 或 user:<id>。")
@@ -217,21 +235,23 @@ class OpenAIChatPlugin(BasePlugin):
                     return
 
                 display_name = get_preset_display_name(self.work_space.path.as_posix() + '/', present_name)
-                self.data['data'][conversation_dict][
-                    event.group_id if event.message_type == 'group' else event.user_id] = conversations.copy()
+                session_id = event.group_id if event.message_type == 'group' else event.user_id
+                self.data['data'][conversation_dict][session_id] = conversations.copy()
+                self._set_preset_name(conversation_dict, session_id, present_name)
                 await event.reply_text(f"已设置当前预设为: {present_name}({display_name})")
 
             # 功能：重置当前会话
             # 例如：/chat reset
             elif command[1] == 'reset':
-                # 重置当前会话
-                default_conversations = load_preset(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME)
-                if default_conversations is None:
-                    await event.reply_text("默认预设不存在，无法重置会话。")
+                # 重置当前会话，加载该会话记录的预设
+                session_id = event.group_id if event.message_type == 'group' else event.user_id
+                preset_name = self._get_preset_name(conversation_dict, session_id)
+                preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
+                if preset_conversations is None:
+                    await event.reply_text(f"预设 {preset_name} 不存在，无法重置会话。")
                     return
 
-                self.data['data'][conversation_dict][
-                    event.group_id if event.message_type == 'group' else event.user_id] = default_conversations.copy()
+                self.data['data'][conversation_dict][session_id] = preset_conversations.copy()
                 await event.reply_text("已重置当前会话。")
                 return
 
@@ -309,8 +329,20 @@ class OpenAIChatPlugin(BasePlugin):
         if 'data' not in self.data:
             self.data['data'] = {
                 'group_conversations': {},
-                'user_conversations': {}
+                'user_conversations': {},
+                'group_preset_names': {},
+                'user_preset_names': {}
             }
+
+        # 确认每个字段都存在，避免旧版本数据缺少字段导致的KeyError
+        if 'group_conversations' not in self.data['data']:
+            self.data['data']['group_conversations'] = {}
+        if 'user_conversations' not in self.data['data']:
+            self.data['data']['user_conversations'] = {}
+        if 'group_preset_names' not in self.data['data']:
+            self.data['data']['group_preset_names'] = {}
+        if 'user_preset_names' not in self.data['data']:
+            self.data['data']['user_preset_names'] = {}
 
         # 检查是否已存在默认预设
         if os.path.exists(self.work_space.path.as_posix() + '/presents/default/config.yaml') and os.path.exists(
@@ -357,6 +389,26 @@ class OpenAIChatPlugin(BasePlugin):
 
         # 检查并修剪所有现有会话，确保符合新的配置限制
         self._trim_all_conversations()
+
+    def _get_preset_name(self, conversation_dict: str, session_id: int) -> str:
+        """获取会话当前使用的预设名称
+
+        :param conversation_dict: 'group_conversations' 或 'user_conversations'
+        :param session_id: 群组ID或用户ID
+        :return: 预设名称，若无记录则返回默认预设
+        """
+        key = 'group_preset_names' if conversation_dict == 'group_conversations' else 'user_preset_names'
+        return self.data['data'][key].get(session_id, DEFAULT_PRESENT_NAME)
+
+    def _set_preset_name(self, conversation_dict: str, session_id: int, preset_name: str) -> None:
+        """记录会话使用的预设名称
+
+        :param conversation_dict: 'group_conversations' 或 'user_conversations'
+        :param session_id: 群组ID或用户ID
+        :param preset_name: 预设名称
+        """
+        key = 'group_preset_names' if conversation_dict == 'group_conversations' else 'user_preset_names'
+        self.data['data'][key][session_id] = preset_name
 
     def _trim_conversation_if_needed(self, conversation):
         """检查会话长度，如果超过限制则删除最早的非system消息（保护最近的对话）
@@ -444,12 +496,14 @@ class OpenAIChatPlugin(BasePlugin):
                     _log.error("默认预设不存在，无法初始化会话。")
                     return
                 self.data['data'][conversation_dict][event.group_id] = default_conversations.copy()
+                self._set_preset_name(conversation_dict, event.group_id, DEFAULT_PRESENT_NAME)
 
             # 在添加用户消息前检查会话长度
             conversation = self.data['data'][conversation_dict][event.group_id]
             self._trim_conversation_if_needed(conversation)
 
             self.data['data'][conversation_dict][event.group_id].append({"role": "user", "content": user_message})
+            _log.info(f"[群组 {event.group_id}] 用户输入: {user_message[:200]}{'...' if len(user_message) > 200 else ''}")
         else:
             conversation_dict = 'user_conversations'
             if event.user_id not in self.data['data'][conversation_dict]:  # 私聊消息
@@ -458,6 +512,7 @@ class OpenAIChatPlugin(BasePlugin):
                     _log.error("默认预设不存在，无法初始化会话。")
                     return
                 self.data['data'][conversation_dict][event.user_id] = default_conversations.copy()
+                self._set_preset_name(conversation_dict, event.user_id, DEFAULT_PRESENT_NAME)
 
             # 在添加用户消息前检查会话长度
             conversation = self.data['data'][conversation_dict][event.user_id]
@@ -465,6 +520,7 @@ class OpenAIChatPlugin(BasePlugin):
 
             # 添加用户消息到会话
             self.data['data'][conversation_dict][event.user_id].append({"role": "user", "content": user_message})
+            _log.info(f"[用户 {event.user_id}] 用户输入: {user_message[:200]}{'...' if len(user_message) > 200 else ''}")
 
         try:
             current_retries_times = 0
@@ -495,6 +551,13 @@ class OpenAIChatPlugin(BasePlugin):
                 if self.config['enable_builtin_function_calling']:
                     if response.choices[0].message.tool_calls:
                         current_retries_times += 1
+                        thinking_content = (response.choices[0].message.content or '').strip()
+                        if thinking_content:
+                            _session_id = event.group_id if event.message_type == 'group' else event.user_id
+                            _log.info(
+                                f"[{'群组' if event.message_type == 'group' else '用户'} {_session_id}] "
+                                f"AI思考/中间内容: {thinking_content[:200]}{'...' if len(thinking_content) > 200 else ''}"
+                            )
 
                         # 发送思考中的消息（可选）
                         # 先检查回复内容是否为空
@@ -505,17 +568,29 @@ class OpenAIChatPlugin(BasePlugin):
                         #         await self.api.post_private_msg(event.user_id, response.choices[0].message.content)
 
                         # 处理每个工具调用请求
+                        session_id = event.group_id if event.message_type == 'group' else event.user_id
+                        preset_name = self._get_preset_name(conversation_dict, session_id)
                         for tool_call in response.choices[0].message.tool_calls:
                             tool_name = tool_call.function.name
                             tool_args = json.loads(tool_call.function.arguments)
 
+                            # 记忆文件保存到预设目录 presents/xxx/memory.json
+                            preset_memory_path = os.path.join(
+                                self.work_space.path.as_posix(), 'presents', preset_name
+                            )
                             if tool_name == 'memory_common_tool':
-                                result = memory_common_tool(self.work_space.path.as_posix(), **tool_args)
+                                result = memory_common_tool(preset_memory_path, **tool_args)
                             elif tool_name == 'memory_delete_tool':
-                                result = memory_delete_tool(self.work_space.path.as_posix(), **tool_args)
+                                result = memory_delete_tool(preset_memory_path, **tool_args)
                             else:
                                 _log.warning(f"未知工具调用请求: {tool_name}")
                                 continue
+
+                            _log.info(
+                                f"[{'群组' if event.message_type == 'group' else '用户'} {session_id}] 工具调用: "
+                                f"{tool_name}({json.dumps(tool_args, ensure_ascii=False)[:100]}) -> "
+                                f"{str(result)[:100]}{'...' if len(str(result)) > 100 else ''}"
+                            )
 
                             # 将工具调用结果添加到会话中，供模型后续生成回复时参考
                             self.data['data'][conversation_dict][
@@ -525,6 +600,11 @@ class OpenAIChatPlugin(BasePlugin):
                         break
 
             reply_message = response.choices[0].message.content
+            session_id = event.group_id if event.message_type == 'group' else event.user_id
+            _log.info(
+                f"[{'群组' if event.message_type == 'group' else '用户'} {session_id}] AI回复: "
+                f"{reply_message[:200]}{'...' if len(reply_message or '') > 200 else ''}"
+            )
 
             # 回复消息
             await event.reply(reply_message)
