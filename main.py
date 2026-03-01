@@ -49,7 +49,7 @@ USER_HELP_TEXT = """OpenAI Chat Plugin 用户命令帮助：
 
 class OpenAIChatPlugin(BasePlugin):
     name = 'OpenAIChatPlugin'  # 插件名
-    version = '0.1.2'  # 插件版本
+    version = '0.1.3'  # 插件版本
 
     async def admin_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
         """处理管理员命令事件
@@ -275,7 +275,7 @@ class OpenAIChatPlugin(BasePlugin):
         )
         self.register_config(
             "insert_userdata_as_prefix",
-            description="是否修改用户消息，在消息前添加用户名作为前缀（例如：'Alice: 你好'）", value_type="bool",
+            description="是否修改用户消息，在消息前添加用户名作为前缀（例如：'Alice(123456): 你好'），以便模型更好地区分不同用户的消息",
             default=False
         )
         self.register_config(
@@ -285,7 +285,7 @@ class OpenAIChatPlugin(BasePlugin):
         )
         self.register_config(
             "max_conversations", description="每个会话的最大消息数", value_type="int",
-            default=21
+            default=51
         )
         self.register_config(
             "enable_builtin_function_calling", description="是否启用内置函数调用功能", value_type="bool",
@@ -297,7 +297,7 @@ class OpenAIChatPlugin(BasePlugin):
         )
         self.register_config("max_retries_times",
                              description="当启用内置函数调用功能时，模型想要调用工具后重新生成回复的最大重试次数",
-                             value_type="int", default=10)
+                             value_type="int", default=15)
         self.register_config(
             "is_configured", description="插件是否已配置",
             value_type="bool",
@@ -411,27 +411,19 @@ class OpenAIChatPlugin(BasePlugin):
         self.data['data'][key][session_id] = preset_name
 
     def _trim_conversation_if_needed(self, conversation):
-        """检查会话长度，如果超过限制则删除最早的非system消息（保护最近的对话）
+        """检查会话长度，如果超过限制则删除最早的消息（保护最近的对话）
 
         :param conversation: 会话列表
         :return: None
         """
         while len(conversation) > self.config['max_conversations']:
-            # 找到最早的非system消息的索引（从前往后找第一个非system消息）
-            earliest_non_system_index = None
-            for i, msg in enumerate(conversation):
-                if msg.get('role') != 'system':
-                    earliest_non_system_index = i
-                    break
+            # 找到最早的非system消息的索引
+            earliest_non_system_index = next((i for i, msg in enumerate(conversation) if msg['role'] != 'system'), None)  # 找到最早的非system消息索引
 
-            # 如果找到了非system消息，删除它
             if earliest_non_system_index is not None:
-                conversation.pop(earliest_non_system_index)
-                _log.debug(f"会话长度超过限制({self.config['max_conversations']})，已删除最早的非system消息")
+                del conversation[earliest_non_system_index]  # 删除最早的非system消息
             else:
-                # 如果没有找到非system消息，说明所有消息都是system，无法删除
-                _log.warning(f"会话长度超过限制({self.config['max_conversations']})，但所有消息都是system，无法删除")
-                break
+                conversation.pop(1)  # 一般来说不会出现全是system消息的情况，如果出现则删除第二条消息（保留第一条system消息）
 
     def _trim_all_conversations(self):
         """检查并修剪所有现有会话，确保符合新的配置限制"""
@@ -579,9 +571,23 @@ class OpenAIChatPlugin(BasePlugin):
                                 self.work_space.path.as_posix(), 'presents', preset_name
                             )
                             if tool_name == 'memory_common_tool':
-                                result = memory_common_tool(preset_memory_path, **tool_args)
+                                if not self.config['allow_access_memory']:  # 如果不允许访问记忆功能，则拒绝工具调用请求并返回错误信息
+                                    result = json.dumps({
+                                        "success": "error",
+                                        "message": "`allow_access_memory` not enabled in config, your action is not allowed."
+                                    })
+                                    _log.warning(f"工具调用被拒绝: {tool_name}，因为当前预设不允许访问记忆功能。")
+                                else:
+                                    result = memory_common_tool(preset_memory_path, **tool_args)
                             elif tool_name == 'memory_delete_tool':
-                                result = memory_delete_tool(preset_memory_path, **tool_args)
+                                if not self.config['allow_access_memory']:
+                                    result = json.dumps({
+                                        "success": "error",
+                                        "message": "`allow_access_memory` not enabled in config, your action is not allowed."
+                                    })
+                                    _log.warning(f"工具调用被拒绝: {tool_name}，因为当前预设不允许访问记忆功能。")
+                                else:
+                                    result = memory_delete_tool(preset_memory_path, **tool_args)
                             else:
                                 _log.warning(f"未知工具调用请求: {tool_name}")
                                 continue

@@ -5,6 +5,22 @@ import re
 
 from ncatbot.utils.logger import get_log
 
+"""
+记忆工具，提供记忆的增删查功能，数据存储在工作空间的memory.json文件中，数据结构为一个列表，每条记忆是一个字典，包含id和content字段
+
+工具定义如下：
+1. memory_common_tool：用于记忆的读取和写入，支持添加记忆
+    和查询记忆两种操作，查询支持正则表达式。
+2. memory_delete_tool：用于记忆的删除，根据记忆ID删除对应的记忆
+
+数据结构示例：
+[
+    {"id": 1, "content": "这是第一条记忆"},
+    {"id": 2, "content": "这是第二条记忆"}
+]
+
+"""
+
 _log = get_log("openai_chat_plugin.tools")
 
 tools = [
@@ -12,18 +28,18 @@ tools = [
         "type": "function",
         "function": {
             "name": "memory_common_tool",
-            "description": "用于读取、写入记忆数据",
+            "description": "Used for reading and writing memory data",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
                         "enum": ["add", "query"],
-                        "description": "操作类型，add表示添加记忆，query表示查询记忆"
+                        "description": "The type of operation, 'add' for adding memory, 'query' for querying memory"
                     },
                     "content": {
                         "type": "string",
-                        "description": "当action为add时，content是要添加的记忆内容；当action为query时，content是查询的关键词或问题，支持正则表达式；不输入则查询全部记忆"
+                        "description": "When action is 'add', content is the memory content to be added; when action is 'query', content is the keyword or question for querying, if not provided, it will query all memory"
                     }
                 },
                 "required": ["action"]
@@ -34,7 +50,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "memory_delete_tool",
-            "description": "用于删除记忆数据",
+            "description": "Used for deleting memory data",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -43,7 +59,7 @@ tools = [
                         "items": {
                             "type": "integer"
                         },
-                        "description": "要删除的记忆的ID"
+                        "description": "The list of memory IDs to be deleted"
                     }
                 },
                 "required": ["id_list"]

@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.1.2-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.1.3-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -130,7 +130,7 @@ your_editor data/openai_chat_plugin/presents/default/prompt.md
 | `base_url`                        | string  | https://api.openai.com/v1 | API基础URL                 |
 | `must_at_bot`                     | boolean | True                      | 群聊中是否必须@机器人              |
 | `insert_userdata_as_prefix`       | boolean | False                     | 是否插入用户信息作为前缀             |
-| `max_conversations`               | integer | 21                        | 每个会话的最大消息数               |
+| `max_conversations`               | integer | 51                        | 每个会话的最大消息数               |
 | `enable_builtin_function_calling` | boolean | False                     | 是否启用内置函数调用功能             |
 | `allow_access_memory`             | boolean | False                     | 是否允许访问会话记忆（内置函数调用功能需要开启） |
 | `is_configured`                   | boolean | False                     | 插件是否已配置                  |
@@ -211,6 +211,11 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.1.3
+
+- ⚙️ **变更会话修剪策略**：调整了会话修剪策略，现在会优先删除最早的非system消息，确保预设配置始终保留在会话中
+- 🛠️ **bug修复**：修复`allow_access_memory`配置项未生效的问题，现在该配置项可以正确控制是否允许访问会话记忆
 
 ### v0.1.2
 
