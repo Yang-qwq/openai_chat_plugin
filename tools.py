@@ -1,98 +1,93 @@
 # -*- coding: utf-8 -*-
+"""
+Function Calling 工具代码实现
+
+## 记忆工具
+
+增删查功能，数据存储在工作空间的 `memory.json`。
+
+v0.1.4+ 记忆数据结构（列表中的每一项是一个 dict）：
+```python
+[
+    {
+        'id': '<str:UUID>',
+        'from_user': int,     # 产生该记忆的用户ID；0 表示“全局/未知来源”
+        'from_group': int,    # 群ID；-1 表示私聊/全局/未知来源
+        'create_time': 'str:ISO8601',  # 例如 '2024-06-01T12:00:00Z'
+        'content': '这是第一条记忆'
+    },
+    ...
+]
+```
+"""
+
 import json
 import os
 import re
+from datetime import datetime, timezone
+import uuid
 
 from ncatbot.utils.logger import get_log
 
-"""
-记忆工具，提供记忆的增删查功能，数据存储在工作空间的memory.json文件中，数据结构为一个列表，每条记忆是一个字典，包含id和content字段
-
-工具定义如下：
-1. memory_common_tool：用于记忆的读取和写入，支持添加记忆
-    和查询记忆两种操作，查询支持正则表达式。
-2. memory_delete_tool：用于记忆的删除，根据记忆ID删除对应的记忆
-
-数据结构示例：
-[
-    {"id": 1, "content": "这是第一条记忆"},
-    {"id": 2, "content": "这是第二条记忆"}
-]
-
-"""
-
-_log = get_log("openai_chat_plugin.tools")
+_log = get_log('openai_chat_plugin.tools')
 
 tools = [
     {
-        "type": "function",
-        "function": {
-            "name": "memory_common_tool",
-            "description": "Used for reading and writing memory data",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["add", "query"],
-                        "description": "The type of operation, 'add' for adding memory, 'query' for querying memory"
+        'type': 'function',
+        'function': {
+            'name': 'memory_access_tool',
+            'description': 'Used for reading, writing and deleting memory data',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'action': {
+                        'type': 'string',
+                        'enum': ['add', 'query', 'delete'],
+                        'description': "The type of operation: 'add' add memory, 'query' query memory, 'delete' delete memory by id"
                     },
-                    "content": {
-                        "type": "string",
-                        "description": "When action is 'add', content is the memory content to be added; when action is 'query', content is the keyword or question for querying, if not provided, it will query all memory"
+                    'content': {
+                        'type': 'string',
+                        'description': "When action is 'add', content is the memory content to be added; when action is 'query', content is the regex for querying (optional; blank returns all memories, may cause performance issues)"
+                    },
+                    '_id': {
+                        'type': 'string',
+                        'description': "When action is 'delete', _id is the single memory id to delete"
                     }
                 },
-                "required": ["action"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "memory_delete_tool",
-            "description": "Used for deleting memory data",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "id_list": {
-                        "type": "array",
-                        "items": {
-                            "type": "integer"
-                        },
-                        "description": "The list of memory IDs to be deleted"
-                    }
-                },
-                "required": ["id_list"]
+                'required': ['action']
             }
         }
     }
 ]
 
 
-def memory_common_tool(work_space: os.PathLike | str, action: str, content: str) -> str:
+def memory_access_tool(
+        work_space: os.PathLike | str,
+        action: str,
+        content: str | None = None,
+        _id: str | None = None,
+        from_user: int | None = None,
+        from_group: int | None = None,
+        **_extra: object,
+) -> str:
     """记忆读取、写入工具
 
     :param work_space: 工作空间对象或路径
     :param action: 操作类型，add表示添加记忆，query表示查询记忆
-    :param content: 当action为add时，content是要添加的记忆内容；当action为query时，content是查询的关键词或问题，不输入则查询全部记忆
+    :param content: add 时为记忆正文；query 时为作用于每条 memory.content 的正则（省略或空白则返回全部）；delete 时不用
+    :param _id: 当action为delete时，_id为要删除的记忆id（一次只能删除一条）
+    :param from_user: 插件注入，用户ID
+    :param from_group: 插件注入，群ID
     :return: str, json字符串，包含操作结果
     """
-    # 这里的记忆数据结构为一个列表，每条记忆是一个字典，包含id和content字段，例如：
-    # [
-    #     {"id": 1, "content": "这是第一条记忆"},
-    #     {"id": 2, "content": "这是第二条记忆"}
-    # ]
-
-    _log.debug(f"执行记忆工具，操作类型: {action}, 内容: {content}")
-
     # 检查操作类型是否合法
-    if action not in ["add", "query"]:
-        return json.dumps({"status": "error", "message": "无效的操作类型"}, ensure_ascii=False)
+    if action not in ['add', 'query', 'delete']:
+        return json.dumps({'status': 'error', 'message': '无效的操作类型'}, ensure_ascii=False)
 
     # 打开记忆文件
-    memory_file = os.path.join(work_space, "memory.json")
+    memory_file = os.path.join(work_space, 'memory.json')
     if not os.path.exists(memory_file):
-        _log.debug("记忆文件不存在，创建新的记忆文件")
+        _log.debug('记忆文件不存在，创建新的记忆文件')
         with open(memory_file, 'w', encoding='utf-8') as f:
             json.dump([], f)
 
@@ -102,49 +97,73 @@ def memory_common_tool(work_space: os.PathLike | str, action: str, content: str)
 
     # 根据操作类型执行相应的逻辑
     # 添加记忆：生成新的ID，添加到记忆数据中，并写回文件
-    if action == "add":
-        new_id = max([item["id"] for item in memory_data], default=0) + 1
-        new_memory = {"id": new_id, "content": content}
+    if action == 'add':
+        if not isinstance(content, str) or not content.strip():
+            return json.dumps({'status': 'error', 'message': 'content 不能为空'}, ensure_ascii=False)
+
+        # 兼容：如果主程序没有注入来源，则写入“未知来源/全局”标记。
+        new_id = str(uuid.uuid4())
+        now_iso = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        new_memory = {
+            'id': new_id,
+            'from_user': from_user if isinstance(from_user, int) else 0,
+            'from_group': from_group if isinstance(from_group, int) else -1,
+            'create_time': now_iso,
+            'content': content
+        }
         memory_data.append(new_memory)
         with open(memory_file, 'w', encoding='utf-8') as f:
             json.dump(memory_data, f, ensure_ascii=False, indent=2)
-        return json.dumps({"status": "success", "message": "记忆添加成功", "id": new_id}, ensure_ascii=False)
+        return json.dumps(
+            {'status': 'success', 'message': '记忆添加成功', 'id': new_id},
+            ensure_ascii=False
+        )
 
-    # 查询记忆：根据content过滤记忆数据，如果content为空则返回全部记忆
-    elif action == "query":
-        if content:
-            # 支持正则表达式查询
-            pattern = re.compile(content, re.IGNORECASE)
-            filtered_memory = [item for item in memory_data if pattern.search(item["content"])]
+    # 查询记忆：整库 dict 项；有 content 则仅保留 memory.content 被该正则匹配的项，否则返回全部
+    elif action == 'query':
+        all_items = [item for item in memory_data if isinstance(item, dict)]
+
+        if isinstance(content, str) and content.strip():
+            try:
+                pattern = re.compile(content.strip(), re.IGNORECASE)
+            except re.error as exc:
+                return json.dumps({'status': 'error', 'message': f'正则表达式错误: {exc}'}, ensure_ascii=False)
+
+            filtered_memory = [
+                item for item in all_items
+                if isinstance(item.get('content'), str) and pattern.search(item['content'])
+            ]
         else:
-            filtered_memory = memory_data
-        return json.dumps({"status": "success", "message": "", "data": filtered_memory}, ensure_ascii=False)
-    return json.dumps({"status": "error", "message": "无效的操作类型"}, ensure_ascii=False)
+            filtered_memory = all_items
 
+        return json.dumps({'status': 'success', 'message': '', 'data': filtered_memory}, ensure_ascii=False)
 
-def memory_delete_tool(work_space: os.PathLike | str, id_list: list[int]) -> str:
-    """记忆删除工具
+    # 删除记忆：根据 id 删除记忆
+    elif action == 'delete':
+        if not isinstance(_id, str):
+            return json.dumps(
+                {'status': 'error', 'message': '请提供字符串类型的 _id'},
+                ensure_ascii=False
+            )
 
-    :param work_space: 工作空间对象或路径
-    :param id_list: 要删除的记忆的ID
-    :return: str, json字符串，包含操作结果
-    """
-    _log.debug(f"执行记忆删除工具，要删除的记忆ID: {id_list}")
+        visible_ids = {item.get('id') for item in memory_data if isinstance(item, dict)}
+        target_id = _id
 
-    memory_file = os.path.join(work_space, "memory.json")
-    if not os.path.exists(memory_file):
-        return json.dumps({"status": "error", "message": "记忆文件不存在"}, ensure_ascii=False)
+        new_memory_data = [
+            item for item in memory_data
+            if not (isinstance(item, dict) and item.get('id') == target_id and item.get('id') in visible_ids)
+        ]
 
-    memory_file_object = open(memory_file, 'r+', encoding='utf-8')
-    memory_data = json.load(memory_file_object)
+        if len(new_memory_data) == len(memory_data):
+            return json.dumps({'status': 'error', 'message': '未找到可删除的记忆'}, ensure_ascii=False)
 
-    # 根据ID过滤掉要删除的记忆
-    new_memory_data = [item for item in memory_data if item["id"] not in id_list]
-    if len(new_memory_data) == len(memory_data):  # 没有找到要删除的记忆
-        return json.dumps({"status": "error", "message": "未找到要删除的记忆"}, ensure_ascii=False)
-    else:  # 写回文件
-        memory_file_object.seek(0)
-        json.dump(new_memory_data, memory_file_object, ensure_ascii=False, indent=2)
-        memory_file_object.truncate()
-        memory_file_object.close()
-    return json.dumps({"status": "success", "message": "记忆删除成功"}, ensure_ascii=False)
+        with open(memory_file, 'w', encoding='utf-8') as f:
+            json.dump(new_memory_data, f, ensure_ascii=False, indent=2)
+
+        deleted_count = len(memory_data) - len(new_memory_data)
+        return json.dumps(
+            {'status': 'success', 'message': '记忆删除成功', 'deleted_count': deleted_count},
+            ensure_ascii=False
+        )
+
+    return json.dumps({'status': 'error', 'message': '无效的操作类型'}, ensure_ascii=False)

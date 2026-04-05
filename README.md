@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.1.3-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.1.4-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -211,6 +211,11 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.1.4
+
+- ⚙️ **重构记忆存储结构**：增加`memory.json`中的新字段（`from_user`, `from_group`, `create_time`），同时重构了记忆调用，减少了工具数量
+- ✅ **输出工具调用中间内容**：现在工具调用中间内容会被记录到上下文和输出了
 
 ### v0.1.3
 
