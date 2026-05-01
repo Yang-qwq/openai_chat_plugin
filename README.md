@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.1.4-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.1.5-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -211,6 +211,12 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.1.5
+
+- 🛠️ **bug修复**：修复错误的添加行为导致污染上下文的问题
+- ✅ **支持提示词批量更新**：已创建会话中的提示词现在可以通过系统命令更新了
+- ✅ **系统时间获取**：现在机器人可以通过调用读取系统时间
 
 ### v0.1.4
 
