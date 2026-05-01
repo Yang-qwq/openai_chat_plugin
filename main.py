@@ -10,7 +10,7 @@ from ncatbot.utils.logger import get_log
 from openai import OpenAI
 
 from .present_manager import get_preset_display_name, load_preset
-from .tools import memory_access_tool, tools
+from .tools import *
 from .update import is_need_update, update_data
 
 bot = CompatibleEnrollment  # 兼容回调函数注册器
@@ -22,6 +22,7 @@ ADMIN_HELP_TEXT = '''OpenAI Chat Plugin 管理员命令帮助：
 
 /chat-admin set-present <name> [group:<id>|user:<id>] - 设置预设（管理员功能）
 /chat-admin reset [group:<id>|user:<id>] - 重置会话（管理员功能）
+/chat-admin update-prompt [group:<id>|user:<id>|all(default)] - 更新指定用户的提示词，不清除会话记录（管理员功能）
 /chat-admin help - 显示此帮助信息
 
 示例：
@@ -49,7 +50,7 @@ USER_HELP_TEXT = '''OpenAI Chat Plugin 用户命令帮助：
 
 class OpenAIChatPlugin(BasePlugin):
     name = 'OpenAIChatPlugin'  # 插件名
-    version = '0.1.4'  # 插件版本
+    version = '0.1.5'  # 插件版本
 
     async def admin_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
         """处理管理员命令事件
@@ -181,6 +182,56 @@ class OpenAIChatPlugin(BasePlugin):
                     except (ValueError, IndexError):
                         await event.reply_text('目标格式错误，请使用 group:<id> 或 user:<id>')
 
+            # 功能：更新指定 prompt（从磁盘重新加载 system，保留对话历史）
+            elif command[1] == 'update-prompt':
+                _log.info('正在批量更新所有会话的提示词...')
+                target = None
+                if len(command) > 2:
+                    target = command[2]
+
+                if target is None or target.lower() == 'all':
+                    updated = 0
+                    for group_id in self.data['data']['group_conversations']:
+                        if self._refresh_system_prompt_in_session('group_conversations', group_id):
+                            updated += 1
+                    for user_id in self.data['data']['user_conversations']:
+                        if self._refresh_system_prompt_in_session('user_conversations', user_id):
+                            updated += 1
+                    _log.info(f'已批量更新提示词，成功处理 {updated} 个会话')
+                    await event.reply_text(f'已批量更新提示词，成功处理 {updated} 个会话')
+                else:
+                    try:
+                        if target.startswith('group:'):
+                            group_id = int(target.split(':')[1])
+                            if group_id not in self.data['data']['group_conversations']:
+                                _log.warning(f'群组 {group_id} 暂无会话记录，无法更新提示词')
+                                await event.reply_text(f'群组 {group_id} 暂无会话记录')
+                                return
+                            if self._refresh_system_prompt_in_session('group_conversations', group_id):
+                                _log.info(f'已更新群组 {group_id} 的提示词')
+                                await event.reply_text(f'已更新群组 {group_id} 的提示词')
+                            else:
+                                _log.error(f'未能更新群组 {group_id} 的提示词（预设不存在、无有效 system 或 prompt 为空）')
+                                await event.reply_text(
+                                    f'未能更新群组 {group_id} 的提示词（预设不存在、无有效 system 或 prompt 为空）')
+                        elif target.startswith('user:'):
+                            user_id = int(target.split(':')[1])
+                            if user_id not in self.data['data']['user_conversations']:
+                                _log.warning(f'用户 {user_id} 暂无会话记录，无法更新提示词')
+                                await event.reply_text(f'用户 {user_id} 暂无会话记录')
+                                return
+                            if self._refresh_system_prompt_in_session('user_conversations', user_id):
+                                _log.info(f'已更新用户 {user_id} 的提示词')
+                                await event.reply_text(f'已更新用户 {user_id} 的提示词')
+                            else:
+                                _log.error(f'未能更新用户 {user_id} 的提示词（预设不存在、无有效 system 或 prompt 为空）')
+                                await event.reply_text(
+                                    f'未能更新用户 {user_id} 的提示词（预设不存在、无有效 system 或 prompt 为空）')
+                        else:
+                            await event.reply_text('目标格式错误，请使用 group:<id>、user:<id> 或 all')
+                    except (ValueError, IndexError):
+                        await event.reply_text('目标格式错误，请使用 group:<id>、user:<id> 或 all')
+
             # 功能：显示管理员帮助信息
             elif command[1] == 'help':
                 await event.reply_text(ADMIN_HELP_TEXT)
@@ -295,6 +346,10 @@ class OpenAIChatPlugin(BasePlugin):
             'allow_access_memory', description='是否允许AI记录和访问会话历史（内置函数调用功能需要开启）',
             default=False, value_type='bool'
         )
+        self.register_config(
+            'allow_web_requests', description='是否允许AI进行网络请求（内置函数调用功能需要开启）',
+            default=False, value_type='bool'
+        )
         self.register_config('max_retries_times',
                              description='当启用内置函数调用功能时，模型想要调用工具后重新生成回复的最大重试次数',
                              value_type='int', default=15)
@@ -390,6 +445,28 @@ class OpenAIChatPlugin(BasePlugin):
         # 检查并修剪所有现有会话，确保符合新的配置限制
         self._trim_all_conversations()
 
+    def _assistant_message_to_history_dict(self, assistant_message) -> dict:
+        """将 API 返回的 assistant 消息转为可写入 messages 历史的 dict（含 tool_calls）。
+
+        :param assistant_message: API 返回的 assistant 消息
+        :return: dict, 可写入 messages 历史的 dict（含 tool_calls）
+        """
+        entry: dict = {'role': 'assistant', 'content': assistant_message.content}
+        tcs = assistant_message.tool_calls
+        if tcs:
+            entry['tool_calls'] = [
+                {
+                    'id': tc.id,
+                    'type': getattr(tc, 'type', None) or 'function',
+                    'function': {
+                        'name': tc.function.name,
+                        'arguments': tc.function.arguments or '{}',
+                    },
+                }
+                for tc in tcs
+            ]
+        return entry
+
     def _get_preset_name(self, conversation_dict: str, session_id: int) -> str:
         """获取会话当前使用的预设名称
 
@@ -410,6 +487,32 @@ class OpenAIChatPlugin(BasePlugin):
         key = 'group_preset_names' if conversation_dict == 'group_conversations' else 'user_preset_names'
         self.data['data'][key][session_id] = preset_name
 
+    def _refresh_system_prompt_in_session(self, conversation_dict: str, session_id: int) -> bool:
+        """从磁盘预设更新会话中的 system 提示词，保留 user / assistant 等其余消息
+
+        :param conversation_dict: 'group_conversations' 或 'user_conversations'
+        :param session_id: 群组ID或用户ID
+        :return: 是否成功更新
+        """
+        conversations = self.data['data'][conversation_dict].get(session_id)
+        if conversations is None:
+            return False
+        preset_name = self._get_preset_name(conversation_dict, session_id)
+        preset_template = load_preset(self.work_space.path.as_posix() + '/', preset_name)
+        if preset_template is None:
+            _log.error(f'预设 {preset_name} 不存在，无法更新 {conversation_dict} {session_id} 的提示词')
+            return False
+        if len(preset_template) == 0 or preset_template[0]['role'] != 'system':
+            _log.warning(f'预设 {preset_name} 没有有效的 system 消息，跳过 {conversation_dict} {session_id}')
+            return False
+        new_system = {'role': 'system', 'content': preset_template[0]['content']}
+        if len(conversations) > 0 and conversations[0]['role'] == 'system':
+            conversations[0] = new_system
+        else:
+            conversations.insert(0, new_system)
+        _log.info(f'已更新 {conversation_dict} 中 {session_id} 的提示词')
+        return True
+
     def _trim_conversation_if_needed(self, conversation):
         """检查会话长度，如果超过限制则删除最早的消息（保护最近的对话）
 
@@ -418,7 +521,8 @@ class OpenAIChatPlugin(BasePlugin):
         """
         while len(conversation) > self.config['max_conversations']:
             # 找到最早的非system消息的索引
-            earliest_non_system_index = next((i for i, msg in enumerate(conversation) if msg['role'] != 'system'), None)  # 找到最早的非system消息索引
+            earliest_non_system_index = next((i for i, msg in enumerate(conversation) if msg['role'] != 'system'),
+                                             None)  # 找到最早的非system消息索引
 
             if earliest_non_system_index is not None:
                 del conversation[earliest_non_system_index]  # 删除最早的非system消息
@@ -515,7 +619,8 @@ class OpenAIChatPlugin(BasePlugin):
 
             # 添加用户消息到会话
             self.data['data'][conversation_dict][event.user_id].append({'role': 'user', 'content': user_message})
-            _log.info(f'[用户 {event.user_id}] 用户输入: {user_message[:200]}{"..." if len(user_message) > 200 else ""}')
+            _log.info(
+                f'[用户 {event.user_id}] 用户输入: {user_message[:200]}{"..." if len(user_message) > 200 else ""}')
 
         try:
             current_retries_times = 0
@@ -554,19 +659,18 @@ class OpenAIChatPlugin(BasePlugin):
                                 f'AI思考/中间内容: {thinking_content[:200]}{"..." if len(thinking_content) > 200 else ""}'
                             )
 
-                        # 发送并插入思考中的消息到会话（可选）
-                        if response.choices[0].message.content != '':
-                            # 先检查回复内容是否为空，如果为空则不发送
-                            # 将思考中的消息添加到会话中，供模型后续生成回复时参考
-                            self.data['data'][conversation_dict][
-                                event.group_id if event.message_type == 'group' else event.user_id].append(
-                                {'role': 'assistant', 'content': response.choices[0].message.content})
+                        # 完整 assistant 轮次（含 tool_calls）必须先于各条 tool 消息写入历史
+                        assistant_msg = response.choices[0].message
+                        self.data['data'][conversation_dict][
+                            event.group_id if event.message_type == 'group' else event.user_id
+                        ].append(self._assistant_message_to_history_dict(assistant_msg))
 
-                            # 发送思考中的消息 （可选）
+                        # 可选：将调用工具前的正文发到 QQ
+                        if assistant_msg.content:
                             if event.message_type == 'group':
-                                await self.api.post_group_msg(event.group_id, response.choices[0].message.content)
+                                await self.api.post_group_msg(event.group_id, assistant_msg.content)
                             else:
-                                await self.api.post_private_msg(event.user_id, response.choices[0].message.content)
+                                await self.api.post_private_msg(event.user_id, assistant_msg.content)
 
                         # 处理每个工具调用请求
                         session_id = event.group_id if event.message_type == 'group' else event.user_id
@@ -579,12 +683,13 @@ class OpenAIChatPlugin(BasePlugin):
                             preset_memory_path = os.path.join(
                                 self.work_space.path.as_posix(), 'presents', preset_name
                             )
-                            if tool_name == 'memory_access_tool':
+                            if tool_name == 'get_system_time_tool':
+                                # 这个工具不需要权限
+                                result = get_system_time_tool()
+                            elif tool_name == 'memory_access_tool':
                                 if not self.config['allow_access_memory']:  # 如果不允许访问记忆功能，则拒绝工具调用请求并返回错误信息
-                                    result = json.dumps({
-                                        'success': 'error',
-                                        'message': '`allow_access_memory` 配置未启用，当前预设不允许访问记忆功能'
-                                    })
+                                    result = _generate_error_message(
+                                        '`allow_access_memory` 配置未启用，无法使用记忆功能')
                                     _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许访问记忆功能')
                                 else:
                                     # 来源由会话决定
@@ -595,7 +700,7 @@ class OpenAIChatPlugin(BasePlugin):
                                     result = memory_access_tool(preset_memory_path, **tool_args)
                             else:
                                 _log.warning(f'未知工具调用请求: {tool_name}')
-                                continue
+                                result = _generate_error_message(f'未知工具: {tool_name}')
 
                             _log.info(
                                 f'[{"群组" if event.message_type == "group" else "用户"} {session_id}] 工具调用: '
@@ -610,11 +715,19 @@ class OpenAIChatPlugin(BasePlugin):
                     else:
                         break
 
-            reply_message = response.choices[0].message.content
+            last_msg = response.choices[0].message
+            reply_message = last_msg.content or ''
+            # 最后一轮 API 仍在请求工具时 while 已无法继续，content 往往为空，避免 reply(None)
+            if last_msg.tool_calls and not reply_message.strip():
+                reply_message = '抱歉，连续工具调用次数已达上限，本轮未能完成回复，请简化问题或稍后再试'
+                _log.warning(
+                    '工具调用轮数已达到配置上限'
+                )
+
             session_id = event.group_id if event.message_type == 'group' else event.user_id
             _log.info(
                 f'[{"群组" if event.message_type == "group" else "用户"} {session_id}] AI回复: '
-                f'{reply_message[:200]}{"..." if len(reply_message or "") > 200 else ""}'
+                f'{reply_message[:200]}{"..." if len(reply_message) > 200 else ""}'
             )
 
             # 回复消息

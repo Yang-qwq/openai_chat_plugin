@@ -26,8 +26,11 @@ import os
 import re
 from datetime import datetime, timezone
 import uuid
+from typing import Any
 
 from ncatbot.utils.logger import get_log
+
+__all__ = ['tools', '_generate_error_message', 'memory_access_tool', 'get_system_time_tool']
 
 _log = get_log('openai_chat_plugin.tools')
 
@@ -57,8 +60,30 @@ tools = [
                 'required': ['action']
             }
         }
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'get_system_time_tool',
+            'description': 'Get system time in multiple formats',
+            'parameters': {}
+        }
     }
 ]
+
+
+def _generate_error_message(message: str, data: Any = None) -> str:
+    """生成错误消息的工具函数
+
+    :param message: 错误消息文本
+    :param data:
+    :return: str, json字符串，包含错误状态、消息文本和可选的附加数据
+    """
+
+    if data is None:
+        return json.dumps({'status': 'error', 'message': message}, ensure_ascii=False)
+    else:
+        return json.dumps({'status': 'error', 'message': message, 'data': data}, ensure_ascii=False)
 
 
 def memory_access_tool(
@@ -82,7 +107,7 @@ def memory_access_tool(
     """
     # 检查操作类型是否合法
     if action not in ['add', 'query', 'delete']:
-        return json.dumps({'status': 'error', 'message': '无效的操作类型'}, ensure_ascii=False)
+        return _generate_error_message('无效的操作类型，请使用 "add"、"query" 或 "delete"')
 
     # 打开记忆文件
     memory_file = os.path.join(work_space, 'memory.json')
@@ -99,7 +124,7 @@ def memory_access_tool(
     # 添加记忆：生成新的ID，添加到记忆数据中，并写回文件
     if action == 'add':
         if not isinstance(content, str) or not content.strip():
-            return json.dumps({'status': 'error', 'message': 'content 不能为空'}, ensure_ascii=False)
+            return _generate_error_message('请提供非空的 content 字符串用于添加记忆')
 
         # 兼容：如果主程序没有注入来源，则写入“未知来源/全局”标记。
         new_id = str(uuid.uuid4())
@@ -115,7 +140,7 @@ def memory_access_tool(
         with open(memory_file, 'w', encoding='utf-8') as f:
             json.dump(memory_data, f, ensure_ascii=False, indent=2)
         return json.dumps(
-            {'status': 'success', 'message': '记忆添加成功', 'id': new_id},
+            {'status': 'success', 'message': '记忆添加成功'},
             ensure_ascii=False
         )
 
@@ -127,7 +152,7 @@ def memory_access_tool(
             try:
                 pattern = re.compile(content.strip(), re.IGNORECASE)
             except re.error as exc:
-                return json.dumps({'status': 'error', 'message': f'正则表达式错误: {exc}'}, ensure_ascii=False)
+                return _generate_error_message(f'无效的正则表达式: {exc}')
 
             filtered_memory = [
                 item for item in all_items
@@ -141,10 +166,7 @@ def memory_access_tool(
     # 删除记忆：根据 id 删除记忆
     elif action == 'delete':
         if not isinstance(_id, str):
-            return json.dumps(
-                {'status': 'error', 'message': '请提供字符串类型的 _id'},
-                ensure_ascii=False
-            )
+            return _generate_error_message('请提供要删除的记忆 ID')
 
         visible_ids = {item.get('id') for item in memory_data if isinstance(item, dict)}
         target_id = _id
@@ -155,15 +177,32 @@ def memory_access_tool(
         ]
 
         if len(new_memory_data) == len(memory_data):
-            return json.dumps({'status': 'error', 'message': '未找到可删除的记忆'}, ensure_ascii=False)
+            return _generate_error_message('未找到要删除的记忆')
 
         with open(memory_file, 'w', encoding='utf-8') as f:
             json.dump(new_memory_data, f, ensure_ascii=False, indent=2)
 
-        deleted_count = len(memory_data) - len(new_memory_data)
         return json.dumps(
-            {'status': 'success', 'message': '记忆删除成功', 'deleted_count': deleted_count},
+            {'status': 'success', 'message': '记忆删除成功'},
             ensure_ascii=False
         )
 
-    return json.dumps({'status': 'error', 'message': '无效的操作类型'}, ensure_ascii=False)
+    return _generate_error_message('无效的操作类型')
+
+
+def get_system_time_tool() -> str:
+    """获取多种格式的系统时间
+
+    :return: str, json字符串，包含多种格式的系统时间
+    """
+    now = datetime.now(timezone.utc)
+
+    return json.dumps({
+        'status': 'success',
+        'message': '',
+        'data': {
+            'timestamp': now.timestamp(),
+            'iso8601': now.isoformat().replace('+00:00', 'Z'),
+            'rfc2822': now.strftime('%a, %d %b %Y %H:%M:%S GMT')
+        }
+    })
