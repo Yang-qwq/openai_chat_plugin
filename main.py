@@ -9,8 +9,8 @@ from ncatbot.utils import config
 from ncatbot.utils.logger import get_log
 from openai import OpenAI
 
+from . import tools
 from .present_manager import get_preset_display_name, load_preset
-from .tools import *
 from .update import is_need_update, update_data
 
 bot = CompatibleEnrollment  # 兼容回调函数注册器
@@ -50,7 +50,7 @@ USER_HELP_TEXT = '''OpenAI Chat Plugin 用户命令帮助：
 
 class OpenAIChatPlugin(BasePlugin):
     name = 'OpenAIChatPlugin'  # 插件名
-    version = '0.1.5'  # 插件版本
+    version = '0.1.6'  # 插件版本
 
     async def admin_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
         """处理管理员命令事件
@@ -315,46 +315,42 @@ class OpenAIChatPlugin(BasePlugin):
 
     async def on_load(self):
         self.register_config(
-            'api_key', description='你的OpenAI API Key', default='sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+            'ApiKey', description='你的OpenAI API Key', default='sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
             value_type='str'
         )
         self.register_config(
-            'model', description='使用的模型', default='openai/gpt-4o-mini', value_type='str'
+            'Model', description='使用的模型', default='openai/gpt-4o-mini', value_type='str'
         )
         self.register_config(
-            'base_url', description='OpenAI API 基础URL', default='https://api.openai.com/v1', value_type='str'
+            'BaseUrl', description='OpenAI API 基础URL', default='https://api.openai.com/v1', value_type='str'
         )
         self.register_config(
-            'insert_userdata_as_prefix',
+            'InsertUserdataAsPrefix',
             description="是否修改用户消息，在消息前添加用户名作为前缀（例如：'Alice(123456): 你好'），以便模型更好地区分不同用户的消息",
             default=False
         )
         self.register_config(
-            'must_at_bot', description='是否必须@机器人才能触发对话',
+            'MustAtBot', description='是否必须@机器人才能触发对话',
             value_type='bool',
             default=True
         )
         self.register_config(
-            'max_conversations', description='每个会话的最大消息数', value_type='int',
-            default=51
-        )
-        self.register_config(
-            'enable_builtin_function_calling', description='是否启用内置函数调用功能', value_type='bool',
+            'EnableBuiltinFunctionCalling', description='是否启用内置函数调用功能', value_type='bool',
             default=False
         )
         self.register_config(
-            'allow_access_memory', description='是否允许AI记录和访问会话历史（内置函数调用功能需要开启）',
+            'AllowAccessMemory', description='是否允许AI记录和访问会话历史（内置函数调用功能需要开启）',
             default=False, value_type='bool'
         )
         self.register_config(
-            'allow_web_requests', description='是否允许AI进行网络请求（内置函数调用功能需要开启）',
+            'AllowWebRequests', description='是否允许AI进行网络请求（内置函数调用功能需要开启）',
             default=False, value_type='bool'
         )
-        self.register_config('max_retries_times',
+        self.register_config('MaxRetriesTimes',
                              description='当启用内置函数调用功能时，模型想要调用工具后重新生成回复的最大重试次数',
                              value_type='int', default=15)
         self.register_config(
-            'is_configured', description='插件是否已配置',
+            'IsConfigured', description='插件是否已配置',
             value_type='bool',
             default=False
         )
@@ -422,7 +418,7 @@ class OpenAIChatPlugin(BasePlugin):
                 _log.info('已创建默认预设的 prompt.md 文件，请编辑该文件添加 system 提示词')
 
         # 判断是否已配置
-        if not self.config['is_configured']:
+        if not self.config['IsConfigured']:
             _log.warning('插件未配置，请先配置插件')
 
         # 在插件加载时尝试迁移旧版预设配置到数据目录
@@ -439,11 +435,8 @@ class OpenAIChatPlugin(BasePlugin):
         default_preset = load_preset(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME)
         if default_preset is None:
             _log.error('默认预设不存在，请确保数据目录中存在 presents/default/ 目录及其配置文件')
-            # 设置`is_configured`为False
-            self.config['is_configured'] = False
-
-        # 检查并修剪所有现有会话，确保符合新的配置限制
-        self._trim_all_conversations()
+            # 设置`IsConfigured`为False
+            self.config['IsConfigured'] = False
 
     def _assistant_message_to_history_dict(self, assistant_message) -> dict:
         """将 API 返回的 assistant 消息转为可写入 messages 历史的 dict（含 tool_calls）。
@@ -513,41 +506,6 @@ class OpenAIChatPlugin(BasePlugin):
         _log.info(f'已更新 {conversation_dict} 中 {session_id} 的提示词')
         return True
 
-    def _trim_conversation_if_needed(self, conversation):
-        """检查会话长度，如果超过限制则删除最早的消息（保护最近的对话）
-
-        :param conversation: 会话列表
-        :return: None
-        """
-        while len(conversation) > self.config['max_conversations']:
-            # 找到最早的非system消息的索引
-            earliest_non_system_index = next((i for i, msg in enumerate(conversation) if msg['role'] != 'system'),
-                                             None)  # 找到最早的非system消息索引
-
-            if earliest_non_system_index is not None:
-                del conversation[earliest_non_system_index]  # 删除最早的非system消息
-            else:
-                conversation.pop(1)  # 一般来说不会出现全是system消息的情况，如果出现则删除第二条消息（保留第一条system消息）
-
-    def _trim_all_conversations(self):
-        """检查并修剪所有现有会话，确保符合新的配置限制
-
-        :return: None
-        """
-        # 检查群组会话
-        for group_id, conversation in self.data['data']['group_conversations'].items():
-            original_length = len(conversation)
-            self._trim_conversation_if_needed(conversation)
-            if len(conversation) < original_length:
-                _log.info(f'群组 {group_id} 的会话已从 {original_length} 条消息修剪到 {len(conversation)} 条消息')
-
-        # 检查用户会话
-        for user_id, conversation in self.data['data']['user_conversations'].items():
-            original_length = len(conversation)
-            self._trim_conversation_if_needed(conversation)
-            if len(conversation) < original_length:
-                _log.info(f'用户 {user_id} 的会话已从 {original_length} 条消息修剪到 {len(conversation)} 条消息')
-
     async def _handle_message(self, event: GroupMessage | PrivateMessage | BaseMessage):
         """处理消息事件
 
@@ -560,23 +518,23 @@ class OpenAIChatPlugin(BasePlugin):
             return
 
         # 检查是否已配置插件
-        if not self.config['is_configured']:
+        if not self.config['IsConfigured']:
             _log.warning('插件未配置，请先配置插件后再使用')
             return
 
         client = OpenAI(
-            api_key=self.config['api_key'],
-            base_url=self.config['base_url']
+            api_key=self.config['ApiKey'],
+            base_url=self.config['BaseUrl']
         )
 
         user_message = f'{event.sender.nickname}({event.sender.user_id}): {event.raw_message}' if self.config[
-            'insert_userdata_as_prefix'] else event.raw_message
+            'InsertUserdataAsPrefix'] else event.raw_message
 
         if event.message_type == 'group':  # 群消息
             conversation_dict = 'group_conversations'
 
             # 检查是否必须@机器人才能触发对话
-            if self.config['must_at_bot']:
+            if self.config['MustAtBot']:
                 _at_bot = False
                 for msg in event.message:
                     if 'at' in msg['type'] and msg['data']['qq'] == config.bt_uin:
@@ -596,10 +554,6 @@ class OpenAIChatPlugin(BasePlugin):
                 self.data['data'][conversation_dict][event.group_id] = default_conversations.copy()
                 self._set_preset_name(conversation_dict, event.group_id, DEFAULT_PRESENT_NAME)
 
-            # 在添加用户消息前检查会话长度
-            conversation = self.data['data'][conversation_dict][event.group_id]
-            self._trim_conversation_if_needed(conversation)
-
             self.data['data'][conversation_dict][event.group_id].append({'role': 'user', 'content': user_message})
             _log.info(
                 f'[群组 {event.group_id}] 用户输入: {user_message[:200]}{"..." if len(user_message) > 200 else ""}')
@@ -613,10 +567,6 @@ class OpenAIChatPlugin(BasePlugin):
                 self.data['data'][conversation_dict][event.user_id] = default_conversations.copy()
                 self._set_preset_name(conversation_dict, event.user_id, DEFAULT_PRESENT_NAME)
 
-            # 在添加用户消息前检查会话长度
-            conversation = self.data['data'][conversation_dict][event.user_id]
-            self._trim_conversation_if_needed(conversation)
-
             # 添加用户消息到会话
             self.data['data'][conversation_dict][event.user_id].append({'role': 'user', 'content': user_message})
             _log.info(
@@ -626,17 +576,17 @@ class OpenAIChatPlugin(BasePlugin):
             current_retries_times = 0
 
             # 如果启用了内置函数调用功能，则在模型想要调用工具时会循环执行工具调用并获取结果，直到模型不再想要调用工具或达到最大重试次数为止
-            while current_retries_times < self.config['max_retries_times']:
+            while current_retries_times < self.config['MaxRetriesTimes']:
                 response = client.chat.completions.create(
-                    model=self.config['model'],
+                    model=self.config['Model'],
                     messages=self.data['data'][conversation_dict][
                         event.group_id if event.message_type == 'group' else event.user_id],
-                    tools=tools if self.config['enable_builtin_function_calling'] else None,
-                    tool_choice='auto' if self.config['enable_builtin_function_calling'] else 'none',
+                    tools=tools.tools if self.config['EnableBuiltinFunctionCalling'] else None,
+                    tool_choice='auto' if self.config['EnableBuiltinFunctionCalling'] else 'none',
                 )
 
                 _log.debug(
-                    f'请求尝试：{current_retries_times + 1}/{self.config["max_retries_times"]}，'
+                    f'请求尝试：{current_retries_times + 1}/{self.config["MaxRetriesTimes"]}，'
                     f'模型回复: {response.choices[0].message.content}, '
                     f'finish_reason: {response.choices[0].finish_reason}, '
                     f'tool_calls: {response.choices[0].message.tool_calls}'
@@ -648,7 +598,7 @@ class OpenAIChatPlugin(BasePlugin):
                     break
 
                 # 检查模型是否想要调用工具
-                if self.config['enable_builtin_function_calling']:
+                if self.config['EnableBuiltinFunctionCalling']:
                     if response.choices[0].message.tool_calls:
                         current_retries_times += 1
                         thinking_content = (response.choices[0].message.content or '').strip()
@@ -683,13 +633,22 @@ class OpenAIChatPlugin(BasePlugin):
                             preset_memory_path = os.path.join(
                                 self.work_space.path.as_posix(), 'presents', preset_name
                             )
-                            if tool_name == 'get_system_time_tool':
-                                # 这个工具不需要权限
-                                result = get_system_time_tool()
-                            elif tool_name == 'memory_access_tool':
-                                if not self.config['allow_access_memory']:  # 如果不允许访问记忆功能，则拒绝工具调用请求并返回错误信息
-                                    result = _generate_error_message(
-                                        '`allow_access_memory` 配置未启用，无法使用记忆功能')
+
+                            # 以下工具不需要权限，直接可调用
+                            if tool_name == 'get_system_time':
+                                result = tools.get_system_time()
+                            elif tool_name == 'get_environment_info':
+                                result = tools.get_environment_info(event)
+                            elif tool_name == 'get_stranger_info':
+                                result = await tools.get_stranger_info(self.api, **tool_args)
+                            elif tool_name == 'get_group_info':
+                                result = await tools.get_group_info(self.api, **tool_args)
+
+                            # 以下工具需要配置权限才能调用
+                            elif tool_name == 'access_memory':
+                                if not self.config['AllowAccessMemory']:  # 如果不允许访问记忆功能，则拒绝工具调用请求并返回错误信息
+                                    result = tools._generate_tool_payload(
+                                        'error', '`AllowAccessMemory` 配置未启用，无法使用记忆功能')
                                     _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许访问记忆功能')
                                 else:
                                     # 来源由会话决定
@@ -697,10 +656,10 @@ class OpenAIChatPlugin(BasePlugin):
                                     tool_args['from_group'] = (
                                         event.group_id if event.message_type == 'group' else -1
                                     )
-                                    result = memory_access_tool(preset_memory_path, **tool_args)
+                                    result = tools.access_memory(preset_memory_path, **tool_args)
                             else:
                                 _log.warning(f'未知工具调用请求: {tool_name}')
-                                result = _generate_error_message(f'未知工具: {tool_name}')
+                                result = tools._generate_tool_payload('error', f'未知工具: {tool_name}')
 
                             _log.info(
                                 f'[{"群组" if event.message_type == "group" else "用户"} {session_id}] 工具调用: '
@@ -737,11 +696,6 @@ class OpenAIChatPlugin(BasePlugin):
             self.data['data'][conversation_dict][
                 event.group_id if event.message_type == 'group' else event.user_id].append(
                 {'role': 'assistant', 'content': reply_message})
-
-            # 添加AI回复后再次检查会话长度
-            conversation = self.data['data'][conversation_dict][
-                event.group_id if event.message_type == 'group' else event.user_id]
-            self._trim_conversation_if_needed(conversation)
         except Exception as e:
             _log.error(f'API 调用失败: {e.__class__.__name__}: {e}')
             await event.reply('抱歉，插件出现内部错误，请稍后再试')
