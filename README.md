@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.1.4-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.1.6-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -14,8 +14,6 @@
 - 🔄 **会话管理**：支持重置和切换对话配置
 - 🎯 **精确控制**：支持@机器人触发和用户名前缀
 - 📝 **命令系统**：完整的命令控制界面
-- 🧠 **智能会话管理**：自动控制会话长度，保护最近对话
-- ⚡ **内存优化**：动态修剪超长会话，提升性能
 
 ## 📋 系统要求
 
@@ -49,24 +47,24 @@ git submodule add https://github.com/Yang-qwq/openai_chat_plugin.git plugins/ope
 
 ```bash
 # 设置OpenAI API Key（强烈建议私聊发送）
-/cfg OpenAIChatPlugin.api_key sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+/cfg OpenAIChatPlugin.ApiKey sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # 设置OpenAI API Base URL（可选）
-/cfg OpenAIChatPlugin.base_url https://api.openai.com/v1
+/cfg OpenAIChatPlugin.BaseUrl https://api.openai.com/v1
 
 # 设置使用的模型
-/cfg OpenAIChatPlugin.model gpt-3.5-turbo
+/cfg OpenAIChatPlugin.Model gpt-3.5-turbo
 
 # 设置是否必须@机器人才能触发对话
-/cfg OpenAIChatPlugin.must_at_bot true
+/cfg OpenAIChatPlugin.MustAtBot true
 
 # 设置是否在消息前添加用户名前缀（需要在prompt中声明）
 # 开启之后，发给机器人的消息会自动添加用户名前缀
 # 例如`User(ID): 你好`，则会在消息前添加`User(ID): `作为前缀
-/cfg OpenAIChatPlugin.insert_userdata_as_prefix false
+/cfg OpenAIChatPlugin.InsertUserdataAsPrefix false
 
 # 标记配置完成
-/cfg OpenAIChatPlugin.is_configured true
+/cfg OpenAIChatPlugin.IsConfigured true
 ```
 
 ### 2. 配置文件设置
@@ -88,52 +86,65 @@ your_editor data/openai_chat_plugin/presents/default/prompt.md
 
 ### 命令系统
 
-#### 设置配置文件
+#### 用户命令
 
 ```bash
-# 为当前环境设置配置文件
+# 为当前环境设置预设
 /chat set-present programmer
 
-# 为指定群组设置配置文件
-/chat set-present programmer group:1919810
-
-# 为指定用户设置配置文件
-/chat set-present translator user:114514
-```
-
-#### 重置会话
-
-```bash
 # 重置当前环境会话
 /chat reset
 
-# 重置指定群组会话
-/chat reset group:1919810
-
-# 重置指定用户会话
-/chat reset user:114514
-```
-
-#### 获取帮助
-
-```bash
 # 显示帮助信息
 /chat help
 ```
 
+#### 管理员命令
+
+```bash
+# 为当前环境设置预设
+/chat-admin set-present programmer
+
+# 为指定群组设置预设
+/chat-admin set-present programmer group:1919810
+
+# 为指定用户设置预设
+/chat-admin set-present programmer user:114514
+
+# 重置当前环境会话
+/chat-admin reset
+
+# 重置指定群组会话
+/chat-admin reset group:1919810
+
+# 重置指定用户会话
+/chat-admin reset user:114514
+
+# 批量更新所有会话的提示词（保留对话历史）
+/chat-admin update-prompt all
+
+# 更新指定群组/用户的提示词
+/chat-admin update-prompt group:1919810
+/chat-admin update-prompt user:114514
+
+# 显示帮助信息
+/chat-admin help
+```
+
 ## 🔧 配置项说明
 
-| 配置项                               | 类型      | 默认值                       | 说明                       |
-|-----------------------------------|---------|---------------------------|--------------------------|
-| `api_key`                         | string  | -                         | OpenAI API密钥             |
-| `model`                           | string  | openai/gpt-4o-mini        | 使用的AI模型                  |
-| `base_url`                        | string  | https://api.openai.com/v1 | API基础URL                 |
-| `must_at_bot`                     | boolean | True                      | 群聊中是否必须@机器人              |
-| `insert_userdata_as_prefix`       | boolean | False                     | 是否插入用户信息作为前缀             |
-| `max_conversations`               | integer | 51                        | 每个会话的最大消息数               |
-| `enable_builtin_function_calling` | boolean | False                     | 是否启用内置函数调用功能             |
-| `allow_access_memory`             | boolean | False                     | 是否允许访问会话记忆（内置函数调用功能需要开启） |
-| `is_configured`                   | boolean | False                     | 插件是否已配置                  |
+| 配置项                            | 类型      | 默认值                       | 说明                         |
+|--------------------------------|---------|---------------------------|----------------------------|
+| `ApiKey`                       | string  | -                         | OpenAI API密钥               |
+| `Model`                        | string  | openai/gpt-4o-mini        | 使用的AI模型                    |
+| `BaseUrl`                      | string  | https://api.openai.com/v1 | API基础URL                   |
+| `MustAtBot`                    | boolean | True                      | 群聊中是否必须@机器人                |
+| `InsertUserdataAsPrefix`       | boolean | False                     | 是否插入用户信息作为前缀               |
+| `EnableBuiltinFunctionCalling` | boolean | False                     | 是否启用内置函数调用功能               |
+| `AllowAccessMemory`            | boolean | False                     | 是否允许访问会话记忆（内置函数调用功能需要开启）   |
+| `AllowWebRequests`             | boolean | False                     | 是否允许AI进行网络请求（内置函数调用功能需要开启） |
+| `MaxRetriesTimes`              | integer | 15                        | 工具调用轮次的最大重试次数              |
+| `IsConfigured`                 | boolean | False                     | 插件是否已配置                    |
 
 ## 🎯 高级功能
 
@@ -162,44 +173,22 @@ data/openai_chat_plugin/
 - 私聊会话独立存储
 - 支持会话重置和配置切换
 
-### 智能会话管理
-
-插件具备智能的会话长度控制功能：
-
-- **自动修剪**：当会话长度超过 `max_conversations` 限制时，自动删除最早的非system消息
-- **保护最近对话**：优先保留最近的对话内容，删除最早的历史消息
-- **配置自适应**：支持动态调整最大消息数，插件会自动清理超长会话
-- **双重检查**：在添加新消息前后都进行长度检查，确保会话始终符合限制
-- **主动清理**：插件加载时会自动检查并清理所有超长会话
-
-**工作原理**：
-
-1. 插件启动时检查所有现有会话
-2. 删除最早的非system消息（保留预设配置）
-3. 持续删除直到会话长度符合限制
-4. 记录详细的修剪日志便于调试
-
 ## 🐛 故障排除
 
 ### 常见问题
 
 1. **插件未响应**
-    - 检查 `is_configured` 是否设置为 `true`
+    - 检查 `IsConfigured` 是否设置为 `true`
     - 确认API Key是否正确
     - 检查网络连接
 
 2. **群聊中@机器人无响应**
-    - 确认 `must_at_bot` 设置
+    - 确认 `MustAtBot` 设置
     - 检查机器人QQ号是否正确
 
-3. **配置文件不存在错误**
-    - 检查 `config.yaml` 中的 `presents` 配置
-    - 确认配置文件名称拼写正确
-
-4. **会话长度异常**
-    - 检查 `max_conversations` 配置值是否合理
-    - 查看日志确认自动修剪功能是否正常工作
-    - 确认预设配置中的system消息数量
+3. **预设不存在错误**
+    - 确认 `data/openai_chat_plugin/presents/` 目录下存在对应预设
+    - 确认预设名称拼写正确
 
 ### 日志查看
 
@@ -211,6 +200,15 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.1.6
+
+- ⚙️ **配置项命名规范化**：所有配置项改为 PascalCase（如 `ApiKey`、`IsConfigured`），与 NcatBot 其他插件保持一致
+- 🗑️ **移除会话长度限制**：彻底移除 `max_conversations` 配置及所有自动修剪/清理机制，会话历史将完整保留
+- 注：由于修剪会话会导致部分平台缓存计费功能失效，故目前直接删除，之后会发布修复
+- ✅ **支持更多函数调用**： 现在机器人可以初步感知聊天环境了
+- ⚙️ **统一工具返回值生成**：将工具调用的错误处理重构为一个统一的函数，简化了代码结构并提升了可维护性
+- ⚙️ **统一工具调用接口**：对所有工具调用进行标准化处理，提高了代码的一致性和可读性
 
 ### v0.1.5
 
