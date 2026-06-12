@@ -15,7 +15,14 @@ def load_preset(work_space: os.PathLike | str, present_name: str):
     :return: 会话列表（包含system消息），如果预设不存在则返回None
     """
     try:
-        preset_dir = os.path.join(work_space, "presents", present_name)
+        allowed_base = os.path.realpath(os.path.join(work_space, "presents"))
+        preset_dir = os.path.realpath(os.path.join(work_space, "presents", present_name))
+
+        # 安全检查：确保 preset_dir 在 allowed_base 目录下
+        if not preset_dir.startswith(allowed_base):
+            _log.warning(f"路径遍历攻击被阻止: {present_name}")
+            return None
+
         config_path = os.path.join(preset_dir, "config.yaml")
         prompt_path = os.path.join(preset_dir, "prompt.md")
 

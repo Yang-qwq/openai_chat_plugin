@@ -50,7 +50,7 @@ USER_HELP_TEXT = '''OpenAI Chat Plugin 用户命令帮助：
 
 class OpenAIChatPlugin(BasePlugin):
     name = 'OpenAIChatPlugin'  # 插件名
-    version = '0.1.6'  # 插件版本
+    version = '0.1.7'  # 插件版本
 
     async def admin_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
         """处理管理员命令事件
@@ -438,6 +438,12 @@ class OpenAIChatPlugin(BasePlugin):
             # 设置`IsConfigured`为False
             self.config['IsConfigured'] = False
 
+        # 创建默认OpenAI客户端
+        self._default_client = OpenAI(
+            api_key=self.config['ApiKey'],
+            base_url=self.config['BaseUrl']
+        )
+
     def _assistant_message_to_history_dict(self, assistant_message) -> dict:
         """将 API 返回的 assistant 消息转为可写入 messages 历史的 dict（含 tool_calls）。
 
@@ -522,11 +528,6 @@ class OpenAIChatPlugin(BasePlugin):
             _log.warning('插件未配置，请先配置插件后再使用')
             return
 
-        client = OpenAI(
-            api_key=self.config['ApiKey'],
-            base_url=self.config['BaseUrl']
-        )
-
         user_message = f'{event.sender.nickname}({event.sender.user_id}): {event.raw_message}' if self.config[
             'InsertUserdataAsPrefix'] else event.raw_message
 
@@ -577,7 +578,7 @@ class OpenAIChatPlugin(BasePlugin):
 
             # 如果启用了内置函数调用功能，则在模型想要调用工具时会循环执行工具调用并获取结果，直到模型不再想要调用工具或达到最大重试次数为止
             while current_retries_times < self.config['MaxRetriesTimes']:
-                response = client.chat.completions.create(
+                response = self._default_client.chat.completions.create(
                     model=self.config['Model'],
                     messages=self.data['data'][conversation_dict][
                         event.group_id if event.message_type == 'group' else event.user_id],
@@ -629,11 +630,6 @@ class OpenAIChatPlugin(BasePlugin):
                             tool_name = tool_call.function.name
                             tool_args = json.loads(tool_call.function.arguments)
 
-                            # 记忆文件保存到预设目录 presents/xxx/memory.json
-                            preset_memory_path = os.path.join(
-                                self.work_space.path.as_posix(), 'presents', preset_name
-                            )
-
                             # 以下工具不需要权限，直接可调用
                             if tool_name == 'get_system_time':
                                 result = tools.get_system_time()
@@ -656,7 +652,11 @@ class OpenAIChatPlugin(BasePlugin):
                                     tool_args['from_group'] = (
                                         event.group_id if event.message_type == 'group' else -1
                                     )
-                                    result = tools.access_memory(preset_memory_path, **tool_args)
+                                    result = tools.access_memory(
+                                        os.path.join(
+                                            self.work_space.path.as_posix(), 'presents', preset_name
+                                        ), **tool_args
+                                    )
                             else:
                                 _log.warning(f'未知工具调用请求: {tool_name}')
                                 result = tools._generate_tool_payload('error', f'未知工具: {tool_name}')
