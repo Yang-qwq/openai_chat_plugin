@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.1.6-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.1.7-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -200,6 +200,11 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.1.7
+
+- 🛠️ **漏洞修复**：修复了上个版本出现的[路径穿越漏洞](https://github.com/Yang-qwq/openai_chat_plugin/issues/10)
+- 🛠️ **性能修复**：持久化OpenAI客户端实例，避免重复创建导致的性能问题(https://github.com/Yang-qwq/openai_chat_plugin/issues/12)
 
 ### v0.1.6
 

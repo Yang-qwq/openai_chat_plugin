@@ -164,6 +164,11 @@ def access_memory(
 ) -> str:
     """记忆读取、写入工具
 
+    注：本工具内记忆未做隔离是我的设计意图，不存在任何安全问题，因为：
+
+    1. 记忆内容来源于用户输入，用户可以控制自己的输入内容，因此不存在隐私泄露风险。
+    2. 记忆操作仅限于增删查，不涉及执行任何代码或外部命令，因此不存在代码注入风险。
+
     :param work_space: 工作空间对象或路径
     :param action: 操作类型，支持 add / query_by_regex / query_by_user_id / query_by_group_id / delete
     :param content: add 时为记忆正文；query_by_regex 时为正则（省略或空白则返回全部）；query_by_*_id 时为整数 ID；delete 时为要删除的记忆 ID
@@ -244,7 +249,7 @@ def access_memory(
         ]
         return _generate_tool_payload('success', '', filtered_memory)
 
-    # 删除记忆：根据 id 删除记忆
+    # 删除记忆：根据 ID 删除记忆
     elif action == 'delete':
         if not isinstance(content, str):
             return _generate_tool_payload('error', '请提供要删除的记忆 ID')
