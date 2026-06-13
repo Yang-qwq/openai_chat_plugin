@@ -10,10 +10,10 @@ name = "pypi"
 
 [packages]
 openai = "*"
-ncatbot = "==3.8.10.*"
 pyyaml = "*"
 beautifulsoup4 = "*"
 markdownify = "*"
+ncatbot = "==3.8.10.post5"
 
 [dev-packages]
 isort = "*"
