@@ -24,11 +24,11 @@ v0.1.4+ 记忆数据结构（列表中的每一项是一个 dict）：
 import json
 import os
 import re
-from datetime import datetime, timezone
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
-from ncatbot.core import BotAPI, BaseMessage, GroupMessage, PrivateMessage
+from ncatbot.core import BaseMessage, BotAPI, GroupMessage, PrivateMessage
 from ncatbot.utils.logger import get_log
 
 __all__ = ['tools', '_generate_tool_payload', 'access_memory', 'get_environment_info', 'get_stranger_info', 'get_system_time']
