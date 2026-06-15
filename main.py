@@ -2,6 +2,7 @@
 import json
 import os
 import shlex
+import traceback
 
 from ncatbot.core import BaseMessage, GroupMessage, PrivateMessage
 from ncatbot.plugin import BasePlugin, CompatibleEnrollment
@@ -9,7 +10,7 @@ from ncatbot.utils import config
 from ncatbot.utils.logger import get_log
 from openai import OpenAI
 
-from . import tools
+from . import tools, exceptions
 from .present_manager import get_preset_display_name, load_preset
 from .update import is_need_update, update_data
 
@@ -47,10 +48,12 @@ USER_HELP_TEXT = '''OpenAI Chat Plugin 用户命令帮助：
 /chat help
 '''
 
+# 省略文本长度
+OMITTED_TEXT_LENGTH = 100
 
 class OpenAIChatPlugin(BasePlugin):
     name = 'OpenAIChatPlugin'  # 插件名
-    version = '0.1.7'  # 插件版本
+    version = '0.1.8'  # 插件版本
 
     async def admin_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
         """处理管理员命令事件
@@ -517,6 +520,7 @@ class OpenAIChatPlugin(BasePlugin):
 
         :param event: 事件对象
         :return: None
+        :raises exceptions.TooManyToolCallsException: 当连续工具调用次数达到上限时抛出
         """
 
         # 检查消息是否以命令前缀开头，如果是则跳过聊天处理
@@ -557,7 +561,7 @@ class OpenAIChatPlugin(BasePlugin):
 
             self.data['data'][conversation_dict][event.group_id].append({'role': 'user', 'content': user_message})
             _log.info(
-                f'[群组 {event.group_id}] 用户输入: {user_message[:200]}{"..." if len(user_message) > 200 else ""}')
+                f'[群组 {event.group_id}] 用户输入: {user_message[:OMITTED_TEXT_LENGTH]}{"..." if len(user_message) > 200 else ""}')
         else:
             conversation_dict = 'user_conversations'
             if event.user_id not in self.data['data'][conversation_dict]:  # 私聊消息
@@ -571,7 +575,7 @@ class OpenAIChatPlugin(BasePlugin):
             # 添加用户消息到会话
             self.data['data'][conversation_dict][event.user_id].append({'role': 'user', 'content': user_message})
             _log.info(
-                f'[用户 {event.user_id}] 用户输入: {user_message[:200]}{"..." if len(user_message) > 200 else ""}')
+                f'[用户 {event.user_id}] 用户输入: {user_message[:OMITTED_TEXT_LENGTH]}{"..." if len(user_message) > OMITTED_TEXT_LENGTH else ""}')
 
         try:
             current_retries_times = 0
@@ -607,7 +611,7 @@ class OpenAIChatPlugin(BasePlugin):
                             _session_id = event.group_id if event.message_type == 'group' else event.user_id
                             _log.info(
                                 f'[{"群组" if event.message_type == "group" else "用户"} {_session_id}] '
-                                f'AI思考/中间内容: {thinking_content[:200]}{"..." if len(thinking_content) > 200 else ""}'
+                                f'AI思考/中间内容: {thinking_content[:OMITTED_TEXT_LENGTH]}{"..." if len(thinking_content) > OMITTED_TEXT_LENGTH else ""}'
                             )
 
                         # 完整 assistant 轮次（含 tool_calls）必须先于各条 tool 消息写入历史
@@ -663,8 +667,8 @@ class OpenAIChatPlugin(BasePlugin):
 
                             _log.info(
                                 f'[{"群组" if event.message_type == "group" else "用户"} {session_id}] 工具调用: '
-                                f'{tool_name}({json.dumps(tool_args, ensure_ascii=False)[:100]}) -> '
-                                f'{str(result)[:100]}{"..." if len(str(result)) > 100 else ""}'
+                                f'{tool_name}({json.dumps(tool_args, ensure_ascii=False)[:OMITTED_TEXT_LENGTH]}) -> '
+                                f'{str(result)[:OMITTED_TEXT_LENGTH]}{"..." if len(str(result)) > OMITTED_TEXT_LENGTH else ""}'
                             )
 
                             # 将工具调用结果添加到会话中，供模型后续生成回复时参考
@@ -678,15 +682,12 @@ class OpenAIChatPlugin(BasePlugin):
             reply_message = last_msg.content or ''
             # 最后一轮 API 仍在请求工具时 while 已无法继续，content 往往为空，避免 reply(None)
             if last_msg.tool_calls and not reply_message.strip():
-                reply_message = '抱歉，连续工具调用次数已达上限，本轮未能完成回复，请简化问题或稍后再试'
-                _log.warning(
-                    '工具调用轮数已达到配置上限'
-                )
+                raise exceptions.TooManyToolCallsException('抱歉，连续工具调用次数已达上限')
 
             session_id = event.group_id if event.message_type == 'group' else event.user_id
             _log.info(
                 f'[{"群组" if event.message_type == "group" else "用户"} {session_id}] AI回复: '
-                f'{reply_message[:200]}{"..." if len(reply_message) > 200 else ""}'
+                f'{reply_message[:OMITTED_TEXT_LENGTH]}{"..." if len(reply_message) > OMITTED_TEXT_LENGTH else ""}'
             )
 
             # 回复消息
@@ -696,9 +697,17 @@ class OpenAIChatPlugin(BasePlugin):
             self.data['data'][conversation_dict][
                 event.group_id if event.message_type == 'group' else event.user_id].append(
                 {'role': 'assistant', 'content': reply_message})
+        except exceptions.TooManyToolCallsException as e:
+            await event.reply(e.__str__())
+
         except Exception as e:
             _log.error(f'API 调用失败: {e.__class__.__name__}: {e}')
+            _log.error(traceback.format_exc())
             await event.reply('抱歉，插件出现内部错误，请稍后再试')
+
+            # 当debug开启时向用户输出错误
+            # if config.debug:
+            #     await event.reply(traceback.format_exc())
 
     @bot.group_event()
     async def on_group_message(self, event: GroupMessage):
