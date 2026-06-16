@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
-import yaml
 
+import yaml
 from ncatbot.utils.logger import get_log
 
 _log = get_log("openai_chat_plugin.present_manager")

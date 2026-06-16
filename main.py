@@ -10,7 +10,7 @@ from ncatbot.utils import config
 from ncatbot.utils.logger import get_log
 from openai import OpenAI
 
-from . import tools, exceptions
+from . import exceptions, tools
 from .present_manager import get_preset_display_name, load_preset
 from .update import is_need_update, update_data
 
