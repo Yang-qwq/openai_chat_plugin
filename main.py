@@ -10,8 +10,8 @@ from ncatbot.utils.logger import get_log
 from openai import OpenAI
 
 from . import exceptions, tools
-from .command_handler import OpenAICommandHandlerMixin, DEFAULT_PRESENT_NAME
-from .present_manager import load_preset
+from .command_handler import DEFAULT_PRESENT_NAME, OpenAICommandHandlerMixin
+from .present_manager import Present
 from .update import is_need_update, update_data
 
 bot = CompatibleEnrollment  # 兼容回调函数注册器
@@ -112,6 +112,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, BasePlugin):
             _log.debug('检测到默认预设已存在，跳过创建默认预设')
         else:
             # 创建默认预设
+            # 之后可能会改
             default_preset_dir = os.path.join(self.work_space.path.as_posix(), 'presents', DEFAULT_PRESENT_NAME)
             os.makedirs(default_preset_dir, exist_ok=True)
 
@@ -143,8 +144,8 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, BasePlugin):
             _log.error(f'迁移预设数据失败：{e}')
 
         # 检查默认预设是否存在
-        default_preset = load_preset(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME)
-        if default_preset is None:
+        default_present = Present()
+        if not default_present.load(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME):
             _log.error('默认预设不存在，请确保数据目录中存在 presents/default/ 目录及其配置文件')
             # 设置`IsConfigured`为False
             self.config['IsConfigured'] = False
@@ -214,11 +215,11 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, BasePlugin):
 
             # 检查群会话是否存在
             if event.group_id not in self.data['data'][conversation_dict]:
-                default_conversations = load_preset(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME)
-                if default_conversations is None:
+                default_present = Present()
+                if not default_present.load(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME):
                     _log.error('默认预设不存在，无法初始化会话')
                     return
-                self.data['data'][conversation_dict][event.group_id] = default_conversations.copy()
+                self.data['data'][conversation_dict][event.group_id] = default_present.to_conversations()
                 self._set_preset_name(conversation_dict, event.group_id, DEFAULT_PRESENT_NAME)
 
             self.data['data'][conversation_dict][event.group_id].append({'role': 'user', 'content': user_message})
@@ -227,11 +228,11 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, BasePlugin):
         else:
             conversation_dict = 'user_conversations'
             if event.user_id not in self.data['data'][conversation_dict]:  # 私聊消息
-                default_conversations = load_preset(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME)
-                if default_conversations is None:
+                default_present = Present()
+                if not default_present.load(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME):
                     _log.error('默认预设不存在，无法初始化会话')
                     return
-                self.data['data'][conversation_dict][event.user_id] = default_conversations.copy()
+                self.data['data'][conversation_dict][event.user_id] = default_present.to_conversations()
                 self._set_preset_name(conversation_dict, event.user_id, DEFAULT_PRESENT_NAME)
 
             # 添加用户消息到会话
@@ -282,7 +283,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, BasePlugin):
                             event.group_id if event.message_type == 'group' else event.user_id
                         ].append(self._assistant_message_to_history_dict(assistant_msg))
 
-                        # 可选：将调用工具前的正文发到 QQ
+                        # 可选：将调用工具前的正文发送
                         if assistant_msg.content:
                             if event.message_type == 'group':
                                 await self.api.post_group_msg(event.group_id, assistant_msg.content)

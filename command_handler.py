@@ -4,7 +4,7 @@ import shlex
 from ncatbot.core import BaseMessage, GroupMessage, PrivateMessage
 from ncatbot.utils.logger import get_log
 
-from .present_manager import get_preset_display_name, load_preset
+from .present_manager import Present
 
 _log = get_log('openai_chat_plugin')
 
@@ -73,12 +73,13 @@ class OpenAICommandHandlerMixin:
                     target = command[3]
 
                 if target is None:
-                    conversations = load_preset(self.work_space.path.as_posix() + '/', present_name)
-                    if conversations is None:
+                    present = Present()
+                    if not present.load(self.work_space.path.as_posix() + '/', present_name):
                         await event.reply_text(f'预设 {present_name} 不存在')
                         return
 
-                    display_name = get_preset_display_name(self.work_space.path.as_posix() + '/', present_name)
+                    conversations = present.to_conversations()
+                    display_name = present.get_display_name()
 
                     if event.message_type == 'group':
                         self.data['data']['group_conversations'][event.group_id] = conversations.copy()
@@ -89,12 +90,13 @@ class OpenAICommandHandlerMixin:
 
                     await event.reply_text(f'已设置当前预设为: {present_name}({display_name})')
                 else:
-                    conversations = load_preset(self.work_space.path.as_posix() + '/', present_name)
-                    if conversations is None:
+                    present = Present()
+                    if not present.load(self.work_space.path.as_posix() + '/', present_name):
                         await event.reply_text(f'预设 {present_name} 不存在')
                         return
 
-                    display_name = get_preset_display_name(self.work_space.path.as_posix() + '/', present_name)
+                    conversations = present.to_conversations()
+                    display_name = present.get_display_name()
 
                     try:
                         if target.startswith('group:'):
@@ -121,38 +123,38 @@ class OpenAICommandHandlerMixin:
                 if target is None:
                     if event.message_type == 'group':
                         preset_name = self._get_preset_name('group_conversations', event.group_id)
-                        preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
-                        if preset_conversations is None:
+                        preset = Present()
+                        if not preset.load(self.work_space.path.as_posix() + '/', preset_name):
                             await event.reply_text(f'预设 {preset_name} 不存在，无法重置会话')
                             return
-                        self.data['data']['group_conversations'][event.group_id] = preset_conversations.copy()
+                        self.data['data']['group_conversations'][event.group_id] = preset.to_conversations()
                     else:
                         preset_name = self._get_preset_name('user_conversations', event.user_id)
-                        preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
-                        if preset_conversations is None:
+                        preset = Present()
+                        if not preset.load(self.work_space.path.as_posix() + '/', preset_name):
                             await event.reply_text(f'预设 {preset_name} 不存在，无法重置会话')
                             return
-                        self.data['data']['user_conversations'][event.user_id] = preset_conversations.copy()
+                        self.data['data']['user_conversations'][event.user_id] = preset.to_conversations()
                     await event.reply_text('已重置当前会话')
                 else:
                     try:
                         if target.startswith('group:'):
                             group_id = int(target.split(':')[1])
                             preset_name = self._get_preset_name('group_conversations', group_id)
-                            preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
-                            if preset_conversations is None:
+                            preset = Present()
+                            if not preset.load(self.work_space.path.as_posix() + '/', preset_name):
                                 await event.reply_text(f'预设 {preset_name} 不存在，无法重置会话')
                                 return
-                            self.data['data']['group_conversations'][group_id] = preset_conversations.copy()
+                            self.data['data']['group_conversations'][group_id] = preset.to_conversations()
                             await event.reply_text(f'已重置群组 {group_id} 的会话')
                         elif target.startswith('user:'):
                             user_id = int(target.split(':')[1])
                             preset_name = self._get_preset_name('user_conversations', user_id)
-                            preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
-                            if preset_conversations is None:
+                            preset = Present()
+                            if not preset.load(self.work_space.path.as_posix() + '/', preset_name):
                                 await event.reply_text(f'预设 {preset_name} 不存在，无法重置会话')
                                 return
-                            self.data['data']['user_conversations'][user_id] = preset_conversations.copy()
+                            self.data['data']['user_conversations'][user_id] = preset.to_conversations()
                             await event.reply_text(f'已重置用户 {user_id} 的会话')
                         else:
                             await event.reply_text('目标格式错误，请使用 group:<id> 或 user:<id>')
@@ -246,12 +248,13 @@ class OpenAICommandHandlerMixin:
 
                 present_name = command[2]
 
-                conversations = load_preset(self.work_space.path.as_posix() + '/', present_name)
-                if conversations is None:
+                present = Present()
+                if not present.load(self.work_space.path.as_posix() + '/', present_name):
                     await event.reply_text(f'预设 {present_name} 不存在')
                     return
 
-                display_name = get_preset_display_name(self.work_space.path.as_posix() + '/', present_name)
+                conversations = present.to_conversations()
+                display_name = present.get_display_name()
                 session_id = event.group_id if event.message_type == 'group' else event.user_id
                 self.data['data'][conversation_dict][session_id] = conversations.copy()
                 self._set_preset_name(conversation_dict, session_id, present_name)
@@ -260,12 +263,12 @@ class OpenAICommandHandlerMixin:
             elif command[1] == 'reset':
                 session_id = event.group_id if event.message_type == 'group' else event.user_id
                 preset_name = self._get_preset_name(conversation_dict, session_id)
-                preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
-                if preset_conversations is None:
+                preset = Present()
+                if not preset.load(self.work_space.path.as_posix() + '/', preset_name):
                     await event.reply_text(f'预设 {preset_name} 不存在，无法重置会话')
                     return
 
-                self.data['data'][conversation_dict][session_id] = preset_conversations.copy()
+                self.data['data'][conversation_dict][session_id] = preset.to_conversations()
                 await event.reply_text('已重置当前会话')
                 return
 
@@ -306,11 +309,12 @@ class OpenAICommandHandlerMixin:
         if conversations is None:
             return False
         preset_name = self._get_preset_name(conversation_dict, session_id)
-        preset_template = load_preset(self.work_space.path.as_posix() + '/', preset_name)
-        if preset_template is None:
+        preset = Present()
+        if not preset.load(self.work_space.path.as_posix() + '/', preset_name):
             _log.error(f'预设 {preset_name} 不存在，无法更新 {conversation_dict} {session_id} 的提示词')
             return False
-        if len(preset_template) == 0 or preset_template[0]['role'] != 'system':
+        preset_template = preset.to_conversations()
+        if not preset_template or preset_template[0]['role'] != 'system':
             _log.warning(f'预设 {preset_name} 没有有效的 system 消息，跳过 {conversation_dict} {session_id}')
             return False
         new_system = {'role': 'system', 'content': preset_template[0]['content']}
