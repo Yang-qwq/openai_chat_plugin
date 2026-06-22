@@ -22,7 +22,7 @@ OMITTED_TEXT_LENGTH = 100
 
 class OpenAIChatPlugin(OpenAICommandHandlerMixin, BasePlugin):
     name = 'OpenAIChatPlugin'  # 插件名
-    version = '0.1.8'  # 插件版本
+    version = '0.1.9'  # 插件版本
 
     async def on_load(self):
         self.register_config(
