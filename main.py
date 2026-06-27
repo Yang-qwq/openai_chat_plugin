@@ -156,6 +156,10 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, BasePlugin):
             base_url=self.config['BaseUrl']
         )
 
+        # 准备历史信息查记录kv
+        if self.config['EnableBuiltinFunctionCalling']:
+            self.temp_history_messages_kv = {}
+
     def _assistant_message_to_history_dict(self, assistant_message) -> dict:
         """将 API 返回的 assistant 消息转为可写入 messages 历史的 dict（含 tool_calls）。
 
@@ -360,6 +364,9 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, BasePlugin):
             self.data['data'][conversation_dict][
                 event.group_id if event.message_type == 'group' else event.user_id].append(
                 {'role': 'assistant', 'content': reply_message})
+
+            # 保存持久化文件
+            self.data.save()
         except exceptions.TooManyToolCallsException as e:
             await event.reply(e.__str__())
 
@@ -374,8 +381,30 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, BasePlugin):
 
     @bot.group_event()
     async def on_group_message(self, event: GroupMessage):
-        """处理群消息事件"""
+        """处理群消息事件
+
+        :param event:
+        :return:
+        """
         await self._handle_message(event)
+
+    # @bot.group_event()
+    # async def on_group_message(self, event: GroupMessage):
+    #     """记录
+    #
+    #     :param event:
+    #     :return:
+    #     """
+    #     if self.config['EnableBuiltinFunctionCalling']:
+    #         # 记录消息历史
+    #         if not str(event.group_id) in self.temp_history_messages_kv:
+    #             # 如果不存在群记录，则新建该key
+    #             self.temp_history_messages_kv[str(event.group_id)] = []
+    #         self.temp_history_messages_kv[str(event.group_id)].append(event)
+    #
+    #         # 长度是否超过限制，超过则删除最早的消息
+    #         if len(self.temp_history_messages_kv[str(event.group_id)]) > 1000:
+    #             self.temp_history_messages_kv[str(event.group_id)].pop(0)
 
     @bot.private_event()
     async def on_private_message(self, event: BaseMessage):
