@@ -31,7 +31,8 @@ from typing import Any
 from ncatbot.core import BaseMessage, BotAPI, GroupMessage, PrivateMessage
 from ncatbot.utils.logger import get_log
 
-__all__ = ['tools', '_generate_tool_payload', 'access_memory', 'get_environment_info', 'get_stranger_info', 'get_system_time']
+__all__ = ['tools', '_generate_tool_payload', 'access_memory', 'get_environment_info', 'get_stranger_info',
+           'query_missing_message_context', 'get_system_time']
 
 _log = get_log('openai_chat_plugin.tools')
 
@@ -63,7 +64,7 @@ tools = [
         }
     },
     {
-      'type': 'function',
+        'type': 'function',
         'function': {
             'name': 'get_environment_info',
             'description': 'Get current chat environment',
@@ -92,22 +93,34 @@ tools = [
         }
     },
     {
-            'type': 'function',
-            'function': {
-                'name': 'get_group_info',
-                'description': 'Get group information (include group_id, group_name, member_count etc.)',
-                'parameters': {
-                    'type': 'object',
-                    'properties': {
-                        'group_id': {
-                            'type': 'integer',
-                            'description': 'The group ID'
-                        }
-                    },
-                    'required': ['group_id']
-                }
+        'type': 'function',
+        'function': {
+            'name': 'get_group_info',
+            'description': 'Get group information (include group_id, group_name, member_count etc.)',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'group_id': {
+                        'type': 'integer',
+                        'description': 'The group ID'
+                    }
+                },
+                'required': ['group_id']
             }
-        },
+        }
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'query_missing_message_context',
+            'description': 'Query the missing message context between single chat messages (only for group chats)',
+            'parameters': {
+                'type': 'object',
+                'properties': {},
+                'required': []
+            }
+        }
+    },
     {
         'type': 'function',
         'function': {
@@ -273,7 +286,7 @@ def access_memory(
     return _generate_tool_payload('error', '无效的操作类型')
 
 
-def get_environment_info(event: GroupMessage | PrivateMessage | BaseMessage) -> str:
+async def get_environment_info(event: GroupMessage | PrivateMessage | BaseMessage) -> str:
     """获取当前聊天环境信息
 
     :param event: GroupMessage | PrivateMessage | BaseMessage 消息
@@ -294,6 +307,7 @@ def get_environment_info(event: GroupMessage | PrivateMessage | BaseMessage) -> 
     }
 
     return _generate_tool_payload('success', '', environment)
+
 
 async def get_stranger_info(api: BotAPI, user_id: int) -> str:
     """获取用户信息
@@ -319,7 +333,20 @@ async def get_group_info(api: BotAPI, group_id: int) -> str:
     return _generate_tool_payload('success', '', data)
 
 
-def get_system_time() -> str:
+async def query_missing_message_context(temp_history_messages_kv: dict, group_id: int) -> str:
+    """查询忽略的消息上下文（仅限群聊）
+
+    :param temp_history_messages_kv: 外部对话临时存储
+    :param group_id: 群ID
+    :return: str, json字符串
+    """
+    try:
+        missing_context = temp_history_messages_kv[str(group_id)]
+    except Exception as e:
+        return _generate_tool_payload('error', f'查询消息上下文时出错: {e}')
+    return _generate_tool_payload('success', f'已获取{len(missing_context)}条消息', missing_context)
+
+async def get_system_time() -> str:
     """获取多种格式的系统时间
 
     :return: str, json字符串，包含多种格式的系统时间
