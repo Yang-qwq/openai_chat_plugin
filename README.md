@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.1.8-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.1.9-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -133,18 +133,18 @@ your_editor data/openai_chat_plugin/presents/default/prompt.md
 
 ## 🔧 配置项说明
 
-| 配置项                            | 类型      | 默认值                       | 说明                         |
-|--------------------------------|---------|---------------------------|----------------------------|
-| `ApiKey`                       | string  | -                         | OpenAI API密钥               |
-| `Model`                        | string  | openai/gpt-4o-mini        | 使用的AI模型                    |
-| `BaseUrl`                      | string  | https://api.openai.com/v1 | API基础URL                   |
-| `MustAtBot`                    | boolean | True                      | 群聊中是否必须@机器人                |
-| `InsertUserdataAsPrefix`       | boolean | False                     | 是否插入用户信息作为前缀               |
-| `EnableBuiltinFunctionCalling` | boolean | False                     | 是否启用内置函数调用功能               |
+| 配置项                         | 类型    | 默认值                    | 说明                                               |
+|--------------------------------|---------|---------------------------|----------------------------------------------------|
+| `ApiKey`                       | string  | -                         | OpenAI API密钥                                     |
+| `Model`                        | string  | openai/gpt-4o-mini        | 使用的AI模型                                       |
+| `BaseUrl`                      | string  | https://api.openai.com/v1 | API基础URL                                         |
+| `MustAtBot`                    | boolean | True                      | 群聊中是否必须@机器人                              |
+| `InsertUserdataAsPrefix`       | boolean | False                     | 是否插入用户信息作为前缀                           |
+| `EnableBuiltinFunctionCalling` | boolean | False                     | 是否启用内置函数调用功能                           |
 | `AllowAccessMemory`            | boolean | False                     | 是否允许访问会话记忆（内置函数调用功能需要开启）   |
 | `AllowWebRequests`             | boolean | False                     | 是否允许AI进行网络请求（内置函数调用功能需要开启） |
-| `MaxRetriesTimes`              | integer | 15                        | 工具调用轮次的最大重试次数              |
-| `IsConfigured`                 | boolean | False                     | 插件是否已配置                    |
+| `MaxRetriesTimes`              | integer | 15                        | 工具调用轮次的最大重试次数                         |
+| `IsConfigured`                 | boolean | False                     | 插件是否已配置                                     |
 
 ## 🎯 高级功能
 
@@ -200,6 +200,12 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.1.9
+
+- 🛠️ **精简代码**：删除部分迁移逻辑
+- ✅ **支持更多函数调用**： 机器人可以获取上下文信息与系统时间等内容了
+- 🛠️ **新增~~Present~~ Preset类**：替代原~~present~~ `preset_manager.py`中的函数
 
 ### v0.1.8
 

@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import json
 import os
-import shlex
 import traceback
 
 from ncatbot.core import BaseMessage, GroupMessage, PrivateMessage
@@ -11,310 +10,19 @@ from ncatbot.utils.logger import get_log
 from openai import OpenAI
 
 from . import exceptions, tools
-from .present_manager import get_preset_display_name, load_preset
+from .command_handler import DEFAULT_PRESENT_NAME, OpenAICommandHandlerMixin
+from .present_manager import Present
 from .update import is_need_update, update_data
 
 bot = CompatibleEnrollment  # 兼容回调函数注册器
 _log = get_log('openai_chat_plugin')  # 日志记录器
 
-DEFAULT_PRESENT_NAME = 'default'  # 默认预设名称
-
-ADMIN_HELP_TEXT = '''OpenAI Chat Plugin 管理员命令帮助：
-
-/chat-admin set-present <name> [group:<id>|user:<id>] - 设置预设（管理员功能）
-/chat-admin reset [group:<id>|user:<id>] - 重置会话（管理员功能）
-/chat-admin update-prompt [group:<id>|user:<id>|all(default)] - 更新指定用户的提示词，不清除会话记录（管理员功能）
-/chat-admin help - 显示此帮助信息
-
-示例：
-/chat-admin set-present MyPresent
-/chat-admin set-present MyPresent group:1919810
-/chat-admin set-present MyPresent user:114514
-/chat-admin reset
-/chat-admin reset group:1919810
-/chat-admin reset user:114514
-
-注意：这些命令仅限管理员使用，可以跨群聊设置预设'''
-
-USER_HELP_TEXT = '''OpenAI Chat Plugin 用户命令帮助：
-
-/chat set-present <name> - 设置预设（仅限当前用户/群组）
-/chat reset - 重置当前会话
-/chat help - 显示此帮助信息
-
-示例：
-/chat set-present MyPresent
-/chat reset
-/chat help
-'''
-
 # 省略文本长度
 OMITTED_TEXT_LENGTH = 100
 
-class OpenAIChatPlugin(BasePlugin):
+class OpenAIChatPlugin(OpenAICommandHandlerMixin, BasePlugin):
     name = 'OpenAIChatPlugin'  # 插件名
-    version = '0.1.8'  # 插件版本
-
-    async def admin_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
-        """处理管理员命令事件
-
-        :param event: 事件对象
-        :return:
-        """
-        # 替换消息中的转义符，如\\n -> \n
-        replaced_message = event.raw_message.replace('\\n', '\n')
-
-        # 解析命令
-        command = shlex.split(replaced_message)
-
-        # 检测是否为管理员命令
-        if command[0] != '/chat-admin':
-            return
-
-        # 检测命令长度
-        # 如/chat-admin
-        if len(command) == 1:
-            # 显示帮助信息
-            await event.reply_text(ADMIN_HELP_TEXT)
-            return
-
-        elif len(command) > 1:
-            # 功能：选择多预设（管理员功能）
-            # 例如：/chat-admin set-present <name> [group:<id>|user:<id>]
-            if command[1] == 'set-present':
-                if len(command) < 3:
-                    await event.reply_text('请提供预设名称')
-                    return
-
-                present_name = command[2]
-                target = None
-
-                # 检查是否指定了目标
-                if len(command) > 3:
-                    target = command[3]
-
-                # 设置预设
-                if target is None:  # 没有指定目标，使用默认配置
-                    conversations = load_preset(self.work_space.path.as_posix() + '/', present_name)
-                    if conversations is None:
-                        await event.reply_text(f'预设 {present_name} 不存在')
-                        return
-
-                    display_name = get_preset_display_name(self.work_space.path.as_posix() + '/', present_name)
-
-                    if event.message_type == 'group':
-                        self.data['data']['group_conversations'][event.group_id] = conversations.copy()
-                        self._set_preset_name('group_conversations', event.group_id, present_name)
-                    else:
-                        self.data['data']['user_conversations'][event.user_id] = conversations.copy()
-                        self._set_preset_name('user_conversations', event.user_id, present_name)
-
-                    await event.reply_text(f'已设置当前预设为: {present_name}({display_name})')
-                else:  # 指定了目标
-                    conversations = load_preset(self.work_space.path.as_posix() + '/', present_name)
-                    if conversations is None:
-                        await event.reply_text(f'预设 {present_name} 不存在')
-                        return
-
-                    display_name = get_preset_display_name(self.work_space.path.as_posix() + '/', present_name)
-
-                    try:
-                        if target.startswith('group:'):
-                            group_id = int(target.split(':')[1])
-                            self.data['data']['group_conversations'][group_id] = conversations.copy()
-                            self._set_preset_name('group_conversations', group_id, present_name)
-                            await event.reply_text(f'已为群组 {group_id} 设置预设: {present_name}({display_name})')
-                        elif target.startswith('user:'):
-                            user_id = int(target.split(':')[1])
-                            self.data['data']['user_conversations'][user_id] = conversations.copy()
-                            self._set_preset_name('user_conversations', user_id, present_name)
-                            await event.reply_text(f'已为用户 {user_id} 设置预设: {present_name}({display_name})')
-                        else:
-                            await event.reply_text('目标格式错误，请使用 group:<id> 或 user:<id>')
-                    except (ValueError, IndexError):
-                        await event.reply_text('目标格式错误，请使用 group:<id> 或 user:<id>')
-
-            # 功能：重置会话（管理员功能）
-            # 例如：/chat-admin reset [group:<id>|user:<id>]
-            elif command[1] == 'reset':
-                target = None
-
-                # 检查是否指定了目标
-                if len(command) > 2:
-                    target = command[2]
-
-                if target is None:
-                    # 重置当前会话，加载该会话记录的预设
-                    if event.message_type == 'group':
-                        preset_name = self._get_preset_name('group_conversations', event.group_id)
-                        preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
-                        if preset_conversations is None:
-                            await event.reply_text(f'预设 {preset_name} 不存在，无法重置会话')
-                            return
-                        self.data['data']['group_conversations'][event.group_id] = preset_conversations.copy()
-                    else:
-                        preset_name = self._get_preset_name('user_conversations', event.user_id)
-                        preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
-                        if preset_conversations is None:
-                            await event.reply_text(f'预设 {preset_name} 不存在，无法重置会话')
-                            return
-                        self.data['data']['user_conversations'][event.user_id] = preset_conversations.copy()
-                    await event.reply_text('已重置当前会话')
-                else:
-                    try:
-                        if target.startswith('group:'):
-                            group_id = int(target.split(':')[1])
-                            preset_name = self._get_preset_name('group_conversations', group_id)
-                            preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
-                            if preset_conversations is None:
-                                await event.reply_text(f'预设 {preset_name} 不存在，无法重置会话')
-                                return
-                            self.data['data']['group_conversations'][group_id] = preset_conversations.copy()
-                            await event.reply_text(f'已重置群组 {group_id} 的会话')
-                        elif target.startswith('user:'):
-                            user_id = int(target.split(':')[1])
-                            preset_name = self._get_preset_name('user_conversations', user_id)
-                            preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
-                            if preset_conversations is None:
-                                await event.reply_text(f'预设 {preset_name} 不存在，无法重置会话')
-                                return
-                            self.data['data']['user_conversations'][user_id] = preset_conversations.copy()
-                            await event.reply_text(f'已重置用户 {user_id} 的会话')
-                        else:
-                            await event.reply_text('目标格式错误，请使用 group:<id> 或 user:<id>')
-                    except (ValueError, IndexError):
-                        await event.reply_text('目标格式错误，请使用 group:<id> 或 user:<id>')
-
-            # 功能：更新指定 prompt（从磁盘重新加载 system，保留对话历史）
-            elif command[1] == 'update-prompt':
-                _log.info('正在批量更新所有会话的提示词...')
-                target = None
-                if len(command) > 2:
-                    target = command[2]
-
-                if target is None or target.lower() == 'all':
-                    updated = 0
-                    for group_id in self.data['data']['group_conversations']:
-                        if self._refresh_system_prompt_in_session('group_conversations', group_id):
-                            updated += 1
-                    for user_id in self.data['data']['user_conversations']:
-                        if self._refresh_system_prompt_in_session('user_conversations', user_id):
-                            updated += 1
-                    _log.info(f'已批量更新提示词，成功处理 {updated} 个会话')
-                    await event.reply_text(f'已批量更新提示词，成功处理 {updated} 个会话')
-                else:
-                    try:
-                        if target.startswith('group:'):
-                            group_id = int(target.split(':')[1])
-                            if group_id not in self.data['data']['group_conversations']:
-                                _log.warning(f'群组 {group_id} 暂无会话记录，无法更新提示词')
-                                await event.reply_text(f'群组 {group_id} 暂无会话记录')
-                                return
-                            if self._refresh_system_prompt_in_session('group_conversations', group_id):
-                                _log.info(f'已更新群组 {group_id} 的提示词')
-                                await event.reply_text(f'已更新群组 {group_id} 的提示词')
-                            else:
-                                _log.error(f'未能更新群组 {group_id} 的提示词（预设不存在、无有效 system 或 prompt 为空）')
-                                await event.reply_text(
-                                    f'未能更新群组 {group_id} 的提示词（预设不存在、无有效 system 或 prompt 为空）')
-                        elif target.startswith('user:'):
-                            user_id = int(target.split(':')[1])
-                            if user_id not in self.data['data']['user_conversations']:
-                                _log.warning(f'用户 {user_id} 暂无会话记录，无法更新提示词')
-                                await event.reply_text(f'用户 {user_id} 暂无会话记录')
-                                return
-                            if self._refresh_system_prompt_in_session('user_conversations', user_id):
-                                _log.info(f'已更新用户 {user_id} 的提示词')
-                                await event.reply_text(f'已更新用户 {user_id} 的提示词')
-                            else:
-                                _log.error(f'未能更新用户 {user_id} 的提示词（预设不存在、无有效 system 或 prompt 为空）')
-                                await event.reply_text(
-                                    f'未能更新用户 {user_id} 的提示词（预设不存在、无有效 system 或 prompt 为空）')
-                        else:
-                            await event.reply_text('目标格式错误，请使用 group:<id>、user:<id> 或 all')
-                    except (ValueError, IndexError):
-                        await event.reply_text('目标格式错误，请使用 group:<id>、user:<id> 或 all')
-
-            # 功能：显示管理员帮助信息
-            elif command[1] == 'help':
-                await event.reply_text(ADMIN_HELP_TEXT)
-                return
-
-            else:
-                await event.reply_text('未知管理员命令，请使用 /chat-admin help 查看帮助信息')
-
-    async def user_command_handler(self, event: BaseMessage | GroupMessage | PrivateMessage):
-        """处理用户命令事件
-
-        :param event: 事件对象
-        :return:
-        """
-
-        # 替换消息中的转义符，如\\n -> \n
-        replaced_message = event.raw_message.replace('\\n', '\n')
-
-        # 解析命令
-        command = shlex.split(replaced_message)
-
-        # 检测是否为用户命令
-        if command[0] != '/chat':
-            return
-
-        # 检测命令长度
-        # 如/chat
-        if len(command) == 1:
-            # 显示帮助信息
-            await event.reply_text(USER_HELP_TEXT)
-            return
-
-        elif len(command) > 1:
-            if event.message_type == 'group':  # 群消息
-                conversation_dict = 'group_conversations'
-            else:
-                conversation_dict = 'user_conversations'
-
-            # 功能：选择预设（仅限当前用户/群组）
-            # 例如：/chat set-present <name>
-            if command[1] == 'set-present':
-                if len(command) < 3:
-                    await event.reply_text('请提供预设名称')
-                    return
-
-                present_name = command[2]
-
-                # 设置预设（仅限当前用户/群组）
-                conversations = load_preset(self.work_space.path.as_posix() + '/', present_name)
-                if conversations is None:
-                    await event.reply_text(f'预设 {present_name} 不存在')
-                    return
-
-                display_name = get_preset_display_name(self.work_space.path.as_posix() + '/', present_name)
-                session_id = event.group_id if event.message_type == 'group' else event.user_id
-                self.data['data'][conversation_dict][session_id] = conversations.copy()
-                self._set_preset_name(conversation_dict, session_id, present_name)
-                await event.reply_text(f'已设置当前预设为: {present_name}({display_name})')
-
-            # 功能：重置当前会话
-            # 例如：/chat reset
-            elif command[1] == 'reset':
-                # 重置当前会话，加载该会话记录的预设
-                session_id = event.group_id if event.message_type == 'group' else event.user_id
-                preset_name = self._get_preset_name(conversation_dict, session_id)
-                preset_conversations = load_preset(self.work_space.path.as_posix() + '/', preset_name)
-                if preset_conversations is None:
-                    await event.reply_text(f'预设 {preset_name} 不存在，无法重置会话')
-                    return
-
-                self.data['data'][conversation_dict][session_id] = preset_conversations.copy()
-                await event.reply_text('已重置当前会话')
-                return
-
-            # 功能：显示帮助信息
-            elif command[1] == 'help':
-                await event.reply_text(USER_HELP_TEXT)
-
-            else:
-                await event.reply_text('未知命令，请使用 /chat help 查看帮助信息')
+    version = '0.1.9'  # 插件版本
 
     async def on_load(self):
         self.register_config(
@@ -352,6 +60,9 @@ class OpenAIChatPlugin(BasePlugin):
         self.register_config('MaxRetriesTimes',
                              description='当启用内置函数调用功能时，模型想要调用工具后重新生成回复的最大重试次数',
                              value_type='int', default=15)
+        self.register_config('MaxConversationCacheStoreAmount',
+                             description='最大对话缓存存储数量，用户AI获取非唤醒时错过的上下文消息时使用，超过该数量的最早消息将被丢弃',
+                             value_type='int', default=1000)
         self.register_config(
             'IsConfigured', description='插件是否已配置',
             value_type='bool',
@@ -404,6 +115,7 @@ class OpenAIChatPlugin(BasePlugin):
             _log.debug('检测到默认预设已存在，跳过创建默认预设')
         else:
             # 创建默认预设
+            # 之后可能会改
             default_preset_dir = os.path.join(self.work_space.path.as_posix(), 'presents', DEFAULT_PRESENT_NAME)
             os.makedirs(default_preset_dir, exist_ok=True)
 
@@ -435,8 +147,8 @@ class OpenAIChatPlugin(BasePlugin):
             _log.error(f'迁移预设数据失败：{e}')
 
         # 检查默认预设是否存在
-        default_preset = load_preset(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME)
-        if default_preset is None:
+        default_present = Present()
+        if not default_present.load(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME):
             _log.error('默认预设不存在，请确保数据目录中存在 presents/default/ 目录及其配置文件')
             # 设置`IsConfigured`为False
             self.config['IsConfigured'] = False
@@ -446,6 +158,10 @@ class OpenAIChatPlugin(BasePlugin):
             api_key=self.config['ApiKey'],
             base_url=self.config['BaseUrl']
         )
+
+        # 准备历史信息查记录kv
+        if self.config['EnableBuiltinFunctionCalling']:
+            self.temp_history_messages_kv = {}
 
     def _assistant_message_to_history_dict(self, assistant_message) -> dict:
         """将 API 返回的 assistant 消息转为可写入 messages 历史的 dict（含 tool_calls）。
@@ -469,51 +185,14 @@ class OpenAIChatPlugin(BasePlugin):
             ]
         return entry
 
-    def _get_preset_name(self, conversation_dict: str, session_id: int) -> str:
-        """获取会话当前使用的预设名称
+    async def _build_user_message(self, event: GroupMessage | PrivateMessage | BaseMessage) -> str:
+        """构建用户消息，若配置了`InsertUserdataAsPrefix`，则在消息前添加用户名和用户ID作为前缀
 
-        :param conversation_dict: 'group_conversations' 或 'user_conversations'
-        :param session_id: 群组ID或用户ID
-        :return: 预设名称，若无记录则返回默认预设
+        :param event: 消息事件
+        :return: 构建后的用户消息
         """
-        key = 'group_preset_names' if conversation_dict == 'group_conversations' else 'user_preset_names'
-        return self.data['data'][key].get(session_id, DEFAULT_PRESENT_NAME)
-
-    def _set_preset_name(self, conversation_dict: str, session_id: int, preset_name: str) -> None:
-        """记录会话使用的预设名称
-
-        :param conversation_dict: 'group_conversations' 或 'user_conversations'
-        :param session_id: 群组ID或用户ID
-        :param preset_name: 预设名称
-        """
-        key = 'group_preset_names' if conversation_dict == 'group_conversations' else 'user_preset_names'
-        self.data['data'][key][session_id] = preset_name
-
-    def _refresh_system_prompt_in_session(self, conversation_dict: str, session_id: int) -> bool:
-        """从磁盘预设更新会话中的 system 提示词，保留 user / assistant 等其余消息
-
-        :param conversation_dict: 'group_conversations' 或 'user_conversations'
-        :param session_id: 群组ID或用户ID
-        :return: 是否成功更新
-        """
-        conversations = self.data['data'][conversation_dict].get(session_id)
-        if conversations is None:
-            return False
-        preset_name = self._get_preset_name(conversation_dict, session_id)
-        preset_template = load_preset(self.work_space.path.as_posix() + '/', preset_name)
-        if preset_template is None:
-            _log.error(f'预设 {preset_name} 不存在，无法更新 {conversation_dict} {session_id} 的提示词')
-            return False
-        if len(preset_template) == 0 or preset_template[0]['role'] != 'system':
-            _log.warning(f'预设 {preset_name} 没有有效的 system 消息，跳过 {conversation_dict} {session_id}')
-            return False
-        new_system = {'role': 'system', 'content': preset_template[0]['content']}
-        if len(conversations) > 0 and conversations[0]['role'] == 'system':
-            conversations[0] = new_system
-        else:
-            conversations.insert(0, new_system)
-        _log.info(f'已更新 {conversation_dict} 中 {session_id} 的提示词')
-        return True
+        return f'{event.sender.nickname}({event.sender.user_id}): {event.raw_message}' if self.config[
+            'InsertUserdataAsPrefix'] else event.raw_message
 
     async def _handle_message(self, event: GroupMessage | PrivateMessage | BaseMessage):
         """处理消息事件
@@ -532,8 +211,7 @@ class OpenAIChatPlugin(BasePlugin):
             _log.warning('插件未配置，请先配置插件后再使用')
             return
 
-        user_message = f'{event.sender.nickname}({event.sender.user_id}): {event.raw_message}' if self.config[
-            'InsertUserdataAsPrefix'] else event.raw_message
+        user_message = await self._build_user_message(event)
 
         if event.message_type == 'group':  # 群消息
             conversation_dict = 'group_conversations'
@@ -552,11 +230,11 @@ class OpenAIChatPlugin(BasePlugin):
 
             # 检查群会话是否存在
             if event.group_id not in self.data['data'][conversation_dict]:
-                default_conversations = load_preset(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME)
-                if default_conversations is None:
+                default_present = Present()
+                if not default_present.load(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME):
                     _log.error('默认预设不存在，无法初始化会话')
                     return
-                self.data['data'][conversation_dict][event.group_id] = default_conversations.copy()
+                self.data['data'][conversation_dict][event.group_id] = default_present.to_conversations()
                 self._set_preset_name(conversation_dict, event.group_id, DEFAULT_PRESENT_NAME)
 
             self.data['data'][conversation_dict][event.group_id].append({'role': 'user', 'content': user_message})
@@ -565,11 +243,11 @@ class OpenAIChatPlugin(BasePlugin):
         else:
             conversation_dict = 'user_conversations'
             if event.user_id not in self.data['data'][conversation_dict]:  # 私聊消息
-                default_conversations = load_preset(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME)
-                if default_conversations is None:
+                default_present = Present()
+                if not default_present.load(self.work_space.path.as_posix() + '/', DEFAULT_PRESENT_NAME):
                     _log.error('默认预设不存在，无法初始化会话')
                     return
-                self.data['data'][conversation_dict][event.user_id] = default_conversations.copy()
+                self.data['data'][conversation_dict][event.user_id] = default_present.to_conversations()
                 self._set_preset_name(conversation_dict, event.user_id, DEFAULT_PRESENT_NAME)
 
             # 添加用户消息到会话
@@ -620,7 +298,7 @@ class OpenAIChatPlugin(BasePlugin):
                             event.group_id if event.message_type == 'group' else event.user_id
                         ].append(self._assistant_message_to_history_dict(assistant_msg))
 
-                        # 可选：将调用工具前的正文发到 QQ
+                        # 可选：将调用工具前的正文发送
                         if assistant_msg.content:
                             if event.message_type == 'group':
                                 await self.api.post_group_msg(event.group_id, assistant_msg.content)
@@ -636,13 +314,15 @@ class OpenAIChatPlugin(BasePlugin):
 
                             # 以下工具不需要权限，直接可调用
                             if tool_name == 'get_system_time':
-                                result = tools.get_system_time()
+                                result = await tools.get_system_time()
                             elif tool_name == 'get_environment_info':
-                                result = tools.get_environment_info(event)
+                                result = await tools.get_environment_info(event)
                             elif tool_name == 'get_stranger_info':
                                 result = await tools.get_stranger_info(self.api, **tool_args)
                             elif tool_name == 'get_group_info':
                                 result = await tools.get_group_info(self.api, **tool_args)
+                            elif tool_name == 'query_missing_message_context':
+                                result = await tools.query_missing_message_context(self.temp_history_messages_kv, event.group_id)
 
                             # 以下工具需要配置权限才能调用
                             elif tool_name == 'access_memory':
@@ -697,11 +377,13 @@ class OpenAIChatPlugin(BasePlugin):
             self.data['data'][conversation_dict][
                 event.group_id if event.message_type == 'group' else event.user_id].append(
                 {'role': 'assistant', 'content': reply_message})
+
+            # 保存持久化文件
+            self.data.save()
         except exceptions.TooManyToolCallsException as e:
             await event.reply(e.__str__())
 
         except Exception as e:
-            _log.error(f'API 调用失败: {e.__class__.__name__}: {e}')
             _log.error(traceback.format_exc())
             await event.reply('抱歉，插件出现内部错误，请稍后再试')
 
@@ -711,8 +393,35 @@ class OpenAIChatPlugin(BasePlugin):
 
     @bot.group_event()
     async def on_group_message(self, event: GroupMessage):
-        """处理群消息事件"""
+        """处理群消息事件
+
+        :param event:
+        :return:
+        """
         await self._handle_message(event)
+
+    @bot.group_event()
+    async def on_group_message(self, event: GroupMessage):
+        """记录
+
+        :param event:
+        :return:
+        """
+        if event.raw_message.strip().startswith('/'):
+            return
+
+        if self.config['EnableBuiltinFunctionCalling']:
+            # 记录消息历史
+            if not str(event.group_id) in self.temp_history_messages_kv:
+                # 如果不存在群记录，则新建该key
+                self.temp_history_messages_kv[str(event.group_id)] = []
+            self.temp_history_messages_kv[str(event.group_id)].append(await self._build_user_message(event))
+            _log.debug(f'[群组 {event.group_id}:{event.user_id}] 记录消息：{event.raw_message[:100]}{"..." if len(event.raw_message) > 100 else ""}')
+
+            # 长度是否超过限制，超过则删除最早的消息
+            if len(self.temp_history_messages_kv[str(event.group_id)]) > self.config['MaxConversationCacheStoreAmount']:
+                self.temp_history_messages_kv[str(event.group_id)].pop(0)
+                _log.debug(f'[群组 {event.group_id}] 超过最大缓存存储数量，已删除最早的消息记录')
 
     @bot.private_event()
     async def on_private_message(self, event: BaseMessage):

@@ -58,7 +58,7 @@ def is_need_update(plugin: Any) -> bool:
 
     判断依据：
 
-    v0.0.x -> v0.1.0 的迁移需要满足以下条件：
+    （已删除）v0.0.x -> v0.1.0 的迁移需要满足以下条件：
     - 全局配置中存在 openai_chat_plugin.presents；
     - 且数据目录下尚未为所有预设生成对应的 config.yaml 与 prompt.md。
 
@@ -70,16 +70,6 @@ def is_need_update(plugin: Any) -> bool:
     :return: bool
     """
     preset_need_update = False
-
-    # 如果全局配置中没有预设数据，则先只判断记忆格式
-    if config.plugins_config is not None:
-        plugin_cfg = config.plugins_config.get('openai_chat_plugin') or {}
-        presents = plugin_cfg.get('presents') or {}
-
-        # 如果配置中没有预设数据，也不需要更新
-        if presents:
-            presents_dir = os.path.join(plugin.work_space.path.as_posix(), 'presents')
-            preset_need_update = _should_create_files(presents_dir, presents)
 
     memory_need_update = _should_update_memory_format(plugin)
     return preset_need_update or memory_need_update
