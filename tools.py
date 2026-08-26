@@ -28,11 +28,19 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from ncatbot.core import BaseMessage, BotAPI, GroupMessage, PrivateMessage
+from ncatbot.api.qq import QQAPIClient
+from ncatbot.event.qq import GroupMessageEvent, MessageEvent
 from ncatbot.utils.logger import get_log
 
-__all__ = ['tools', '_generate_tool_payload', 'access_memory', 'get_environment_info', 'get_stranger_info',
-           'query_missing_message_context', 'get_system_time']
+__all__ = [
+    '_generate_tool_payload',
+    'access_memory',
+    'get_environment_info',
+    'get_stranger_info',
+    'get_system_time',
+    'query_missing_message_context',
+    'tools',
+]
 
 _log = get_log('openai_chat_plugin.tools')
 
@@ -286,17 +294,17 @@ def access_memory(
     return _generate_tool_payload('error', '无效的操作类型')
 
 
-async def get_environment_info(event: GroupMessage | PrivateMessage | BaseMessage) -> str:
+async def get_environment_info(event: MessageEvent) -> str:
     """获取当前聊天环境信息
 
-    :param event: GroupMessage | PrivateMessage | BaseMessage 消息
+    :param event: MessageEvent 消息事件
     :return:
     """
     # 假定group_id不存在
     group_id = None
 
     # 如果是群消息，则提取group_id
-    if isinstance(event, GroupMessage):
+    if isinstance(event, GroupMessageEvent):
         group_id = event.group_id
 
     environment = {
@@ -309,28 +317,39 @@ async def get_environment_info(event: GroupMessage | PrivateMessage | BaseMessag
     return _generate_tool_payload('success', '', environment)
 
 
-async def get_stranger_info(api: BotAPI, user_id: int) -> str:
+def _to_jsonable(data: Any) -> Any:
+    """将 API 返回对象转换为可 JSON 序列化的结构
+
+    v5 的查询 API 返回 pydantic model，需经 model_dump() 转换。
+
+    :param data: API 返回数据（pydantic model 或原生结构）
+    :return: 可 JSON 序列化的数据
+    """
+    return data.model_dump() if hasattr(data, 'model_dump') else data
+
+
+async def get_stranger_info(api: QQAPIClient, user_id: int) -> str:
     """获取用户信息
 
-    :param api: BotAPI
+    :param api: QQ 平台 API 客户端（self.api.qq）
     :param user_id: 用户ID
     :return: str, json字符串，包含用户信息
     """
-    data = await api.get_stranger_info(user_id)
+    data = await api.query.get_stranger_info(user_id)
 
-    return _generate_tool_payload('success', '', data)
+    return _generate_tool_payload('success', '', _to_jsonable(data))
 
 
-async def get_group_info(api: BotAPI, group_id: int) -> str:
+async def get_group_info(api: QQAPIClient, group_id: int) -> str:
     """获取群聊信息
 
-    :param api: BotAPI
+    :param api: QQ 平台 API 客户端（self.api.qq）
     :param group_id: 群ID
     :return: str, json字符串，包含群聊信息
     """
-    data = await api.get_group_info(group_id)
+    data = await api.query.get_group_info(group_id)
 
-    return _generate_tool_payload('success', '', data)
+    return _generate_tool_payload('success', '', _to_jsonable(data))
 
 
 async def query_missing_message_context(temp_history_messages_kv: dict, group_id: int) -> str:

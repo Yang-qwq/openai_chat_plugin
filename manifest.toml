@@ -1,0 +1,12 @@
+name = "OpenAIChatPlugin"
+version = "0.2.0"
+main = "main.py"
+entry_class = "OpenAIChatPlugin"
+author = "Yang-qwq"
+description = "OpenAI 对话插件：多预设管理、函数调用（Function Calling）、会话持久化"
+
+[pip_dependencies]
+openai = ">=1.95.1"
+PyYAML = ">=6.0.3"
+beautifulsoup4 = ">=4.14.3"
+markdownify = ">=1.2.2"
