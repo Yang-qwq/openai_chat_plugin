@@ -2,11 +2,11 @@
 """
 数据迁移/更新实现模块
 
-1) 预设配置迁移（旧版 global config -> `presents/` 目录）
-2) 记忆格式迁移（旧 memory.json -> v0.1.4+ memory.json）
+1) 记忆格式迁移（旧 memory.json -> v0.1.4+ memory.json）
+2) 4.x -> 5.x 运行时数据一次性迁移（旧 data/openai_chat_plugin/ -> 插件 workspace）
 
-预设数据结构（v1.0+）：
-openai_chat_plugin/
+预设数据结构：
+<workspace>/
 | -- presents/
     | -- <present_name>/  # 每个预设一个目录，目录名即预设名
         | -- config.yaml  # 本预设的配置文件
@@ -19,61 +19,128 @@ import os
 import shutil
 import time
 import uuid
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any
 
-import yaml
-from ncatbot.utils import config
 from ncatbot.utils.logger import get_log
 
 _log = get_log('openai_chat_plugin.update')
 
-
-def _should_create_files(presents_dir: str, presents: Dict[str, Dict[str, Any]]) -> bool:
-    """判断当前文件结构是否需要创建/更新。
-
-    :param presents_dir: 预设数据目录路径
-    :param presents: 来自全局配置的预设数据字典
-    :return: bool
-    """
-    if not presents:
-        return False
-
-    # 如果总目录都不存在，肯定需要更新
-    if not os.path.exists(presents_dir):
-        return True
-
-    # 任意一个预设缺少目录或核心文件时认为需要更新
-    for name in presents.keys():
-        present_dir = os.path.join(presents_dir, name)
-        config_path = os.path.join(present_dir, 'config.yaml')
-        prompt_path = os.path.join(present_dir, 'prompt.md')
-        if not (os.path.exists(present_dir) and os.path.isfile(config_path) and os.path.isfile(prompt_path)):
-            return True
-
-    return False
+# v5 DataMixin 持久化的四个会话数据键
+_DATA_KEYS = ('group_conversations', 'user_conversations', 'group_preset_names', 'user_preset_names')
 
 
 def is_need_update(plugin: Any) -> bool:
-    """判断是否需要执行数据迁移。
+    """判断是否需要执行记忆格式迁移。
 
-    判断依据：
-
-    （已删除）v0.0.x -> v0.1.0 的迁移需要满足以下条件：
-    - 全局配置中存在 openai_chat_plugin.presents；
-    - 且数据目录下尚未为所有预设生成对应的 config.yaml 与 prompt.md。
-
-    v0.1.0 -> v0.1.4 的迁移需要满足以下条件：
+    判断依据（v0.1.0 -> v0.1.4 的迁移）：
     - 预设目录下存在 legacy memory.json；
     - 且 memory.json 中存在 legacy 数据。
 
-    :param plugin:
+    :param plugin: 插件实例
     :return: bool
     """
-    preset_need_update = False
+    return _should_update_memory_format(plugin)
 
-    memory_need_update = _should_update_memory_format(plugin)
-    return preset_need_update or memory_need_update
 
+def update_data(plugin: Any) -> None:
+    """执行记忆格式迁移：将各预设目录下的 memory.json 升级到 v0.1.4+ 结构。
+
+    注：4.x 时代的"全局配置 presents 迁移"依赖的 config.plugins_config API 已在
+    NcatBot 5 中移除，该逻辑随之删除；对应场景由 migrate_legacy_workspace 覆盖。
+
+    :param plugin: 插件实例
+    :return: None
+    """
+    memory_migrated_any = _migrate_memory_files(plugin)
+    if memory_migrated_any:
+        _log.info('已完成 openai_chat_plugin 记忆格式升级')
+
+
+def _legacy_workspace_dir() -> Path:
+    """返回 4.x 版本的插件数据目录（相对运行目录）
+
+    4.x 时代 register_config / self.data 均持久化到 data/openai_chat_plugin/ 下。
+
+    :return: 旧版数据目录 Path
+    """
+    return Path('data') / 'openai_chat_plugin'
+
+
+def migrate_legacy_workspace(plugin: Any) -> bool:
+    """一次性将 4.x 运行时数据迁移到 v5 新位置，成功后旧目录改名备份。
+
+    - 旧 presents/ 目录整目录复制到新 workspace/presents/（目标已存在则跳过）；
+    - 旧 openai_chat_plugin.json 中 `data` 键下的会话数据迁入新 data.json
+      （新数据已有 `data` 键则跳过，避免覆盖）；
+    - 迁移完成后旧目录改名为 openai_chat_plugin.migrated.bak 防止重复执行。
+
+    幂等性：任一步骤的目标已存在时自动跳过，重复调用无副作用。
+
+    :param plugin: 插件实例（需具有 workspace / data / _save_data）
+    :return: 是否发生了实际迁移
+    """
+    legacy_dir = _legacy_workspace_dir()
+    if not legacy_dir.is_dir():
+        return False
+
+    migrated_any = False
+
+    # 1) presents 目录复制
+    legacy_presents = legacy_dir / 'presents'
+    new_presents = Path(plugin.workspace) / 'presents'
+    if legacy_presents.is_dir() and not new_presents.exists():
+        shutil.copytree(legacy_presents, new_presents)
+        migrated_any = True
+        _log.info(f'预设目录已迁移至新工作区: {new_presents}')
+    elif legacy_presents.is_dir():
+        _log.debug('新工作区已存在 presents 目录，跳过旧预设复制')
+
+    # 2) 会话数据迁移（只认 `data` 键；`config` 键属于旧版配置体系，不再迁移）
+    legacy_data_file = legacy_dir / 'openai_chat_plugin.json'
+    if legacy_data_file.is_file() and 'data' not in plugin.data:
+        try:
+            with open(legacy_data_file, 'r', encoding='utf-8') as f:
+                legacy_content = json.load(f)
+            legacy_data = legacy_content.get('data') if isinstance(legacy_content, dict) else None
+            if isinstance(legacy_data, dict):
+                conversations = {
+                    key: legacy_data[key] for key in _DATA_KEYS if isinstance(legacy_data.get(key), dict)
+                }
+                if conversations:
+                    plugin.data['data'] = {key: {} for key in _DATA_KEYS}
+                    plugin.data['data'].update(conversations)
+                    plugin._save_data()
+                    migrated_any = True
+                    _log.info(
+                        f'会话数据已迁移至新 data.json'
+                        f'（群会话 {len(conversations.get("group_conversations", {}))} 个，'
+                        f'用户会话 {len(conversations.get("user_conversations", {}))} 个）')
+                else:
+                    _log.debug('旧数据文件中未发现有效的会话数据，跳过会话迁移')
+        except Exception as e:
+            _log.error(f'读取旧版数据文件失败，跳过会话迁移: {e}')
+    elif legacy_data_file.is_file():
+        _log.debug('新 data.json 已存在会话数据，跳过旧会话迁移')
+
+    # 3) 旧目录改名备份，防止重复迁移
+    if migrated_any:
+        backup_dir = legacy_dir.with_name('openai_chat_plugin.migrated.bak')
+        if backup_dir.exists():
+            # 备份目录已存在时追加时间戳，避免覆盖
+            backup_dir = legacy_dir.with_name(f'openai_chat_plugin.migrated.bak.{int(time.time())}')
+        try:
+            legacy_dir.rename(backup_dir)
+            _log.info(f'旧版数据目录已重命名为 {backup_dir.name}（保留备份，可手动删除）')
+        except Exception as e:
+            _log.warning(f'旧版数据目录改名失败（不影响迁移结果，下次启动将跳过已迁移项）: {e}')
+
+    return migrated_any
+
+
+# ----------------------------------------------------------------------
+# 记忆格式迁移（v0.1.0 -> v0.1.4+）
+# ----------------------------------------------------------------------
 
 def _memory_entry_is_legacy(item: Any) -> bool:
     """检查单项记忆是否为旧版记忆格式
@@ -84,7 +151,7 @@ def _memory_entry_is_legacy(item: Any) -> bool:
 
     新版 memory.json 结构要求：参见tools.py
 
-    :param item:
+    :param item: 单条记忆数据
     """
     if not isinstance(item, dict):
         return False
@@ -100,19 +167,16 @@ def _memory_entry_is_legacy(item: Any) -> bool:
         return True
 
     # content 也应为字符串
-    if not isinstance(item.get('content'), str):
-        return True
-
-    return False
+    return not isinstance(item.get('content'), str)
 
 
 def _should_update_memory_format(plugin: Any) -> bool:
     """检测 presents 目录下是否存在 legacy memory.json。
 
-    :param plugin:
+    :param plugin: 插件实例
     :return: bool
     """
-    presents_dir = os.path.join(plugin.work_space.path.as_posix(), 'presents')
+    presents_dir = os.path.join(str(plugin.workspace), 'presents')
     if not os.path.isdir(presents_dir):
         return False
 
@@ -126,11 +190,12 @@ def _should_update_memory_format(plugin: Any) -> bool:
                 _log.debug(f'{name}/memory.json 不存在，跳过该文件的记忆格式检查')
                 continue
 
+            memory_data = None
             try:
                 with open(memory_file, 'r', encoding='utf-8') as f:
                     memory_data = json.load(f)
             except PermissionError:
-                _log.error('权限不足，无法读取文件：{memory_file}，跳过该文件的记忆格式检查')
+                _log.error(f'权限不足，无法读取文件：{memory_file}，跳过该文件的记忆格式检查')
             except json.decoder.JSONDecodeError:
                 _log.error(f'{name}/memory.json 不是有效的 JSON 文件，无法进行记忆格式检查')
 
@@ -145,7 +210,7 @@ def _should_update_memory_format(plugin: Any) -> bool:
 def _migrate_memory_file(preset_memory_file: str) -> bool:
     """将 legacy memory.json 迁移到 v0.1.4+ 格式。
 
-    :param preset_memory_file:
+    :param preset_memory_file: memory.json 文件路径
     :return: bool
     """
     if not os.path.exists(preset_memory_file):
@@ -160,7 +225,7 @@ def _migrate_memory_file(preset_memory_file: str) -> bool:
     if not any(_memory_entry_is_legacy(x) for x in memory_data):
         return False
 
-    migrated: List[Dict[str, Any]] = []
+    migrated: list[dict[str, Any]] = []
     for item in memory_data:
         if not isinstance(item, dict):
             continue
@@ -192,128 +257,13 @@ def _migrate_memory_file(preset_memory_file: str) -> bool:
     return True
 
 
-def _build_prompt(conversations: Any) -> str:
-    """
-    从 conversations 列表中提取 system 消息并构造 prompt 文本。
-
-    - 如果存在多条 system 消息，则使用分隔线拼接；
-    - 如果不存在 system 消息，则返回空字符串。
-    """
-    if not isinstance(conversations, list):
-        return ''
-
-    system_contents = []
-    for msg in conversations:
-        if not isinstance(msg, dict):
-            continue
-        if msg.get('role') != 'system':
-            continue
-        content = msg.get('content')
-        if isinstance(content, str) and content.strip():
-            system_contents.append(content.strip())
-
-    if not system_contents:
-        return ''
-
-    if len(system_contents) == 1:
-        return system_contents[0]
-
-    separator = '\n\n---\n\n'
-    return separator.join(system_contents)
-
-
-def _write_present_files(presents_dir: str, name: str, present_cfg: Dict[str, Any]) -> None:
-    """
-    为单个预设生成/更新目录及文件。
-    """
-    present_dir = os.path.join(presents_dir, name)
-    os.makedirs(present_dir, exist_ok=True)
-
-    display_name = present_cfg.get('display_name', name)
-    conversations = present_cfg.get('conversations') or []
-
-    # 写入 config.yaml
-    config_content = yaml.safe_dump({
-        'version': 1,
-        'display_name': display_name
-    }, allow_unicode=True)
-    config_path = os.path.join(present_dir, 'config.yaml')
-    with open(config_path, 'w', encoding='utf-8') as f:
-        f.write(config_content)
-
-    # 写入 prompt.md（仅包含 system 提示词）
-    prompt_text = _build_prompt(conversations)
-    prompt_path = os.path.join(present_dir, 'prompt.md')
-    with open(prompt_path, 'w', encoding='utf-8') as f:
-        f.write(prompt_text)
-
-
-def update_data(plugin: Any) -> None:
-    """执行数据迁移：
-    - 为每个预设创建独立目录；
-    - 为每个预设写入 config.yaml 与 prompt.md；
-    - 将各预设目录下的 memory.json 升级到 v0.1.4+ 结构；
-    - 日志提醒用户删除旧的配置文件片段。
-
-    :param plugin:
-    :return: None
-    """
-    # 1) 预设迁移：global config -> presents/
-    preset_migrated_any = _migrate_presents_from_global_config(plugin)
-    if preset_migrated_any:
-        # 迁移完成后提醒用户清理旧配置
-        _log.info(
-            '已将 openai_chat_plugin 预设迁移到数据目录的 `presents/` 中，'
-            '请删除全局配置文件中 `plugins_config.openai_chat_plugin.presents` 相关旧配置，以避免混淆'
-        )
-
-    # 2) 记忆迁移：legacy memory.json -> v0.1.4+ memory.json
-    memory_migrated_any = _migrate_memory_files(plugin)
-    if memory_migrated_any:
-        _log.info('已完成 openai_chat_plugin 记忆格式升级')
-
-
-def _migrate_presents_from_global_config(plugin: Any) -> bool:
-    """将旧版全局 config 中的 openai_chat_plugin.presents 迁移到 presents/ 目录。
-
-    :param plugin:
-    :return: bool
-    """
-    presents: Dict[str, Dict[str, Any]] = {}
-    if config.plugins_config is not None:
-        plugin_cfg = config.plugins_config.get('openai_chat_plugin') or {}
-        presents = plugin_cfg.get('presents') or {}
-
-    if not presents:
-        _log.debug('未在配置中发现 openai_chat_plugin 预设，无需迁移预设数据')
-        return False
-
-    presents_dir = os.path.join(plugin.work_space.path.as_posix() + '/', 'presents')
-    if not _should_create_files(presents_dir, presents):
-        _log.debug('检测到预设数据目录已存在且完整，跳过预设迁移')
-        return False
-
-    os.makedirs(presents_dir, exist_ok=True)
-    preset_migrated_any = False
-
-    for name, present_cfg in presents.items():
-        try:
-            _write_present_files(presents_dir, name, present_cfg or {})
-            preset_migrated_any = True
-            _log.info(f'预设 `{name}` 已迁移至数据目录')
-        except Exception as exc:  # 保守起见，避免单个预设失败中断全部迁移
-            _log.error(f'迁移预设 `{name}` 时发生错误：{exc}')
-
-    return preset_migrated_any
-
-
 def _migrate_memory_files(plugin: Any) -> bool:
     """扫描 presents/<present_name>/memory.json 并进行 legacy -> v0.1.4+ 迁移。
 
-    :param plugin:
+    :param plugin: 插件实例
     :return: bool
     """
-    presents_dir = os.path.join(plugin.work_space.path.as_posix(), 'presents')
+    presents_dir = os.path.join(str(plugin.workspace), 'presents')
     if not os.path.isdir(presents_dir):
         return False
 

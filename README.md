@@ -1,10 +1,10 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.1.9-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
-一个基于新版OpenAI SDK的智能聊天插件，为NcatBot提供强大的AI对话功能。
+一个基于新版OpenAI SDK的智能聊天插件，为NcatBot 5提供强大的AI对话功能。
 
 ## ✨ 功能特性
 
@@ -14,11 +14,12 @@
 - 🔄 **会话管理**：支持重置和切换对话配置
 - 🎯 **精确控制**：支持@机器人触发和用户名前缀
 - 📝 **命令系统**：完整的命令控制界面
+- 🔐 **权限体系**：RBAC 全局管理员 + 群主/群管理自动放行
 
 ## 📋 系统要求
 
-- Python 3.8+
-- NcatBot 框架
+- Python 3.10+
+- NcatBot 5.x 框架
 - OpenAI API Key
 
 ## 🚀 安装方法
@@ -29,52 +30,47 @@
 
 ```bash
 # 克隆插件到plugins目录
-git clone https://github.com/Yang-qwq/openai_chat_plugin.git plugins/openai_chat_plugin
+git clone https://github.com/Yang-qwq/openai_chat_plugin.git plugins/OpenAIChatPlugin
 ```
 
 ### 方法二：Git Submodule
 
 ```bash
 cd /path/to/ncatbot/
-git submodule add https://github.com/Yang-qwq/openai_chat_plugin.git plugins/openai_chat_plugin
+git submodule add https://github.com/Yang-qwq/openai_chat_plugin.git plugins/OpenAIChatPlugin
 ```
 
 ## ⚙️ 配置说明
 
 ### 1. 基础配置
 
-在NcatBot启动后，依次执行以下配置命令：
+v0.2.0 起插件迁移到 NcatBot 5，配置统一保存在**全局 config.yaml** 的 `plugin.plugin_configs.OpenAIChatPlugin` 部分（也可通过 WebUI 修改）。首次启动后编辑全局 config.yaml：
 
-```bash
-# 设置OpenAI API Key（强烈建议私聊发送）
-/cfg OpenAIChatPlugin.ApiKey sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-# 设置OpenAI API Base URL（可选）
-/cfg OpenAIChatPlugin.BaseUrl https://api.openai.com/v1
-
-# 设置使用的模型
-/cfg OpenAIChatPlugin.Model gpt-3.5-turbo
-
-# 设置是否必须@机器人才能触发对话
-/cfg OpenAIChatPlugin.MustAtBot true
-
-# 设置是否在消息前添加用户名前缀（需要在prompt中声明）
-# 开启之后，发给机器人的消息会自动添加用户名前缀
-# 例如`User(ID): 你好`，则会在消息前添加`User(ID): `作为前缀
-/cfg OpenAIChatPlugin.InsertUserdataAsPrefix false
-
-# 标记配置完成
-/cfg OpenAIChatPlugin.IsConfigured true
+```yaml
+plugin:
+  plugin_configs:
+    OpenAIChatPlugin:
+      ApiKey: sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # 强烈建议仅在本地/私密环境填写
+      BaseUrl: https://api.openai.com/v1               # 可选
+      Model: openai/gpt-4o-mini                        # 可选
+      MustAtBot: true                                  # 群聊是否必须@机器人
+      InsertUserdataAsPrefix: false                    # 是否在消息前添加用户名前缀
+      IsConfigured: true                               # 标记配置完成
 ```
 
-### 2. 配置文件设置
+修改后重启机器人生效。
 
-在v0.1.0版本即之后的版本中，你无需在config.yaml中编辑预设，插件会在`data/openai_chat_plugin/presents/`目录中自动创建和管理预设配置文件。
+### 2. 预设文件设置
 
-想要编辑预设配置，可以直接编辑对应的`prompt.md`文件，或者使用命令行设置：
+插件会在插件工作区（`data/OpenAIChatPlugin/presents/`）目录中自动创建和管理预设配置文件。
+
+> 从 v0.1.x 升级：首次启动时会自动将旧目录 `data/openai_chat_plugin/` 中的会话数据与预设迁移到新位置，
+> 旧目录会被重命名为 `data/openai_chat_plugin.migrated.bak` 作为备份。
+
+想要编辑预设配置，可以直接编辑对应的`prompt.md`文件：
 
 ```bash
-your_editor data/openai_chat_plugin/presents/default/prompt.md
+your_editor data/OpenAIChatPlugin/presents/default/prompt.md
 ```
 
 ## 📖 使用指南
@@ -100,6 +96,8 @@ your_editor data/openai_chat_plugin/presents/default/prompt.md
 ```
 
 #### 管理员命令
+
+需要**全局管理员**（机器人 owner 或 `/chatrbac` 授权）或**本群群主/群管理**身份（受 `EnableGroupOwnerAutoAuth` 开关控制，默认开启）：
 
 ```bash
 # 为当前环境设置预设
@@ -131,6 +129,24 @@ your_editor data/openai_chat_plugin/presents/default/prompt.md
 /chat-admin help
 ```
 
+#### 全局管理员管理命令
+
+仅限**全局管理员**（含机器人 owner）使用，群主/群管理身份不可越权调用：
+
+```bash
+# 授予全局管理员权限（支持 @ 成员或纯数字）
+/chatrbac grant 888888
+
+# 撤销全局管理员权限
+/chatrbac revoke 888888
+
+# 查看全局管理员列表
+/chatrbac list
+
+# 显示帮助信息
+/chatrbac help
+```
+
 ## 🔧 配置项说明
 
 | 配置项                         | 类型    | 默认值                    | 说明                                               |
@@ -144,6 +160,8 @@ your_editor data/openai_chat_plugin/presents/default/prompt.md
 | `AllowAccessMemory`            | boolean | False                     | 是否允许访问会话记忆（内置函数调用功能需要开启）   |
 | `AllowWebRequests`             | boolean | False                     | 是否允许AI进行网络请求（内置函数调用功能需要开启） |
 | `MaxRetriesTimes`              | integer | 15                        | 工具调用轮次的最大重试次数                         |
+| `MaxConversationCacheStoreAmount` | integer | 1000                    | 最大对话缓存存储数量                               |
+| `EnableGroupOwnerAutoAuth`     | boolean | True                      | 群主/群管理自动放行本群管理员命令                  |
 | `IsConfigured`                 | boolean | False                     | 插件是否已配置                                     |
 
 ## 🎯 高级功能
@@ -153,7 +171,8 @@ your_editor data/openai_chat_plugin/presents/default/prompt.md
 插件支持创建多个对话预设，每个预设可以有不同的系统提示词：
 
 ```
-data/openai_chat_plugin/
+data/OpenAIChatPlugin/
+| -- data.json            <-- 会话数据（自动持久化）
 | -- presents/
     | -- default/
         | -- config.yaml
@@ -187,8 +206,12 @@ data/openai_chat_plugin/
     - 检查机器人QQ号是否正确
 
 3. **预设不存在错误**
-    - 确认 `data/openai_chat_plugin/presents/` 目录下存在对应预设
+    - 确认 `data/OpenAIChatPlugin/presents/` 目录下存在对应预设
     - 确认预设名称拼写正确
+
+4. **管理员命令提示权限不足**
+    - 确认使用者为机器人 owner 或已通过 `/chatrbac grant` 授权
+    - 群内使用可依赖群主/群管理身份（检查 `EnableGroupOwnerAutoAuth` 是否开启）
 
 ### 日志查看
 
@@ -200,6 +223,15 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.2.0
+
+- 🚀 **迁移到 NcatBot 5**：全面适配 NcatBotPlugin / registrar 装饰器注册 / api.qq 多平台 API
+- 🛠️ **漏洞修复**：修复 v0.1.x 中重复定义的群消息处理器相互覆盖、导致群聊 AI 对话失效的问题
+- 🔐 **权限体系重构**：`/chat-admin` 改为三层权限体系（RBAC 全局管理员 + 群主/群管理自动放行 + 默认拒绝）；新增 `/chatrbac` 命令管理全局管理员
+- ⚙️ **配置方式变更**：配置统一保存到全局 config.yaml 的 `plugin_configs.OpenAIChatPlugin`（原 `/cfg` 命令不再可用）
+- 📦 **数据自动迁移**：首次启动自动将旧版 `data/openai_chat_plugin/` 的会话数据与预设迁移到新位置，旧目录保留为 `.migrated.bak` 备份
+- 🧰 **工具适配**：查询类工具适配 v5 pydantic 返回值；回复消息不再 @ 发送者（与旧版行为一致）
 
 ### v0.1.9
 
