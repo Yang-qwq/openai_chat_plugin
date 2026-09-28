@@ -174,6 +174,36 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         return f'{event.sender.nickname}({event.sender.user_id}): {event.raw_message}' if self.get_config(
             'InsertUserdataAsPrefix') else event.raw_message
 
+    def _is_trpg_session_active(self, event: MessageEvent, is_group: bool) -> bool:
+        """查询 NcatBotTRPG 是否在该会话中开团，用于避免 @机器人 时重复回复
+
+        通过框架的跨插件访问接口 `self.get_plugin()` 获取 NcatBotTRPG 实例；
+        插件不存在、未提供查询方法或查询异常时返回 False，不影响本插件独立工作。
+
+        :param event: 消息事件
+        :param is_group: 是否群消息
+        :return: 跑团是否进行中
+        """
+        try:
+            trpg = self.get_plugin('NcatBotTRPG')
+        except Exception as e:
+            _log.warning(f'访问 NcatBotTRPG 插件失败: {e}')
+            return False
+        if trpg is None:
+            return False
+        try:
+            if is_group:
+                checker = getattr(trpg, 'is_group_session_active', None)
+                if callable(checker) and checker(event.group_id):
+                    return True
+            else:
+                checker = getattr(trpg, 'is_user_session_active', None)
+                if callable(checker) and checker(event.user_id):
+                    return True
+        except Exception as e:
+            _log.warning(f'查询 NcatBotTRPG 会话状态失败: {e}')
+        return False
+
     async def _handle_message(self, event: MessageEvent):
         """处理消息事件
 
@@ -190,6 +220,11 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         # 检查是否已配置插件
         if not self.get_config('IsConfigured'):
             _log.warning('插件未配置，请先配置插件后再使用')
+            return
+
+        # 与 NcatBotTRPG 协调：该会话跑团进行中时，消息交由跑团插件接管，避免重复回复
+        if self._is_trpg_session_active(event, is_group):
+            _log.info('该会话跑团进行中，跳过 OpenAI 对话处理（交由 NcatBotTRPG 接管）')
             return
 
         user_message = await self._build_user_message(event)
