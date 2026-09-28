@@ -218,3 +218,7 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 - 回复统一 `at_sender=False`（保留旧版不 @ 发送者的行为）
 - 记忆功能需要 `AllowAccessMemory` 配置和 `EnableBuiltinFunctionCalling` 同时开启
 - QQ API 一律经 `self.api.qq.*` 访问（如 `post_group_msg(group_id, text=...)`、`query.get_stranger_info(...)`）
+- **与 NcatBotTRPG 协调**：`_handle_message()` 在分发前调用 `_is_trpg_session_active()`，若目标会话
+  跑团进行中（`self.get_plugin('NcatBotTRPG')` 的 `is_group_session_active` / `is_user_session_active` 为真）
+  则跳过对话回复，避免 @机器人 时两个插件重复回复；NcatBotTRPG 不存在时自动跳过该检查（保持独立可用）。
+  相关测试见 `tests/test_trpg_coordination.py`
