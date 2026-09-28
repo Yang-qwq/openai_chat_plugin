@@ -187,7 +187,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         try:
             trpg = self.get_plugin('NcatBotTRPG')
         except Exception as e:
-            _log.warning(f'访问 NcatBotTRPG 插件失败: {e}')
+            _log.debug(f'访问 NcatBotTRPG 插件失败: {e}')
             return False
         if trpg is None:
             return False
@@ -201,7 +201,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                 if callable(checker) and checker(event.user_id):
                     return True
         except Exception as e:
-            _log.warning(f'查询 NcatBotTRPG 会话状态失败: {e}')
+            _log.debug(f'查询 NcatBotTRPG 会话状态失败: {e}')
         return False
 
     async def _handle_message(self, event: MessageEvent):
@@ -219,12 +219,12 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
 
         # 检查是否已配置插件
         if not self.get_config('IsConfigured'):
-            _log.warning('插件未配置，请先配置插件后再使用')
+            # _log.warning('插件未配置，请先配置插件后再使用')
             return
 
         # 与 NcatBotTRPG 协调：该会话跑团进行中时，消息交由跑团插件接管，避免重复回复
         if self._is_trpg_session_active(event, is_group):
-            _log.info('该会话跑团进行中，跳过 OpenAI 对话处理（交由 NcatBotTRPG 接管）')
+            _log.debug('该会话跑团进行中，跳过 OpenAI 对话处理（交由 NcatBotTRPG 接管）')
             return
 
         user_message = await self._build_user_message(event)
