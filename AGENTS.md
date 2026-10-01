@@ -14,7 +14,7 @@ OpenAIChatPlugin/
 ├── __init__.py          # 导出 OpenAIChatPlugin
 ├── main.py              # 插件入口：init_defaults、RBAC 注册、消息处理、事件回调
 ├── command_handler.py   # 命令 Mixin：/chat、/chat-admin、/chatrbac + 三层权限校验
-├── present_manager.py   # 预设管理：Present 类（config.yaml + prompt.md）
+├── preset_manager.py   # 预设管理：Preset 类（config.yaml + prompt.md）
 ├── tools.py             # Function Calling 工具定义与实现（记忆、环境、网络等）
 ├── update.py            # 数据迁移：4.x 工作区数据迁移、记忆格式升级
 ├── exceptions.py        # 自定义异常（TooManyToolCallsException）
@@ -29,16 +29,16 @@ OpenAIChatPlugin/
 flowchart TB
     Main["main.py: OpenAIChatPlugin"]
     Main-->|"继承"|Cmd["command_handler.py: OpenAICommandHandlerMixin<br/>命令分发中心"]
-    Main-->|"调用"|PM["present_manager.py: Present<br/>预设加载/解析"]
+    Main-->|"调用"|PM["preset_manager.py: Preset<br/>预设加载/解析"]
     Main-->|"调用"|Tools["tools.py<br/>Function Calling 工具"]
     Main-->|"调用"|Upd["update.py<br/>数据迁移"]
 
     Cmd-->|"预设操作"|PM
 
     subgraph Preset["预设数据目录（workspace = data/OpenAIChatPlugin/）"]
-        Config["presents/&lt;name&gt;/config.yaml<br/>display_name 等元信息"]
-        Prompt["presents/&lt;name&gt;/prompt.md<br/>system 提示词"]
-        Memory["presents/&lt;name&gt;/memory.json<br/>记忆数据（可选）"]
+        Config["presets/&lt;name&gt;/config.yaml<br/>display_name 等元信息"]
+        Prompt["presets/&lt;name&gt;/prompt.md<br/>system 提示词"]
+        Memory["presets/&lt;name&gt;/memory.json<br/>记忆数据（可选）"]
     end
 
     PM-->Preset
@@ -60,8 +60,8 @@ flowchart LR
         Cmd1["/chat"]-->UserCmd["user_command_handler()"]
         Cmd2["/chat-admin"]-->PermCheck["首行 _check_admin()<br/>（RBAC 或本群群主/群管理）"]-->AdminCmd["admin_command_handler()"]
         Cmd3["/chatrbac"]-->StrictCheck["_check_global_admin()<br/>（仅 RBAC，防提权）"]-->RbacCmd["on_rbac()"]
-        UserCmd-->|"set-present/reset"|PM["present_manager.py<br/>Present.load()"]
-        AdminCmd-->|"set-present/reset/update-prompt"|PM
+        UserCmd-->|"set-preset/reset"|PM["preset_manager.py<br/>Preset.load()"]
+        AdminCmd-->|"set-preset/reset/update-prompt"|PM
     end
 ```
 
@@ -102,8 +102,8 @@ classDiagram
         -_assistant_message_to_history_dict(assistant_message) dict
     }
 
-    class Present {
-        +load(workspace_path, present_name) bool
+    class Preset {
+        +load(workspace_path, preset_name) bool
         +get_display_name() str
         +get_prompt() str
         +to_conversations() list
@@ -111,7 +111,7 @@ classDiagram
 
     NcatBotPlugin <|-- OpenAIChatPlugin : 继承
     OpenAICommandHandlerMixin <|-- OpenAIChatPlugin : Mixin
-    OpenAIChatPlugin ..> Present : 使用
+    OpenAIChatPlugin ..> Preset : 使用
     OpenAIChatPlugin ..> tools : 使用
 ```
 
@@ -123,10 +123,10 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 
 | 命令 | 权限 | 说明 |
 |------|------|------|
-| `/chat set-present <name>` | 所有人 | 设置当前会话预设 |
+| `/chat set-preset <name>` | 所有人 | 设置当前会话预设 |
 | `/chat reset` | 所有人 | 重置当前会话 |
 | `/chat help` | 所有人 | 用户帮助 |
-| `/chat-admin set-present <name> [group:\|user:<id>]` | 三层校验 | 跨群/用户设置预设 |
+| `/chat-admin set-preset <name> [group:\|user:<id>]` | 三层校验 | 跨群/用户设置预设 |
 | `/chat-admin reset [group:\|user:<id>]` | 三层校验 | 跨群/用户重置会话 |
 | `/chat-admin update-prompt [target\|all]` | 三层校验 | 重载 system 提示词（保留历史） |
 | `/chatrbac grant\|revoke\|list <qq>` | **仅全局管理员** | 管理 RBAC 全局管理员 |
@@ -174,8 +174,9 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 ## 数据迁移（update.py）
 
 - `migrate_legacy_workspace(plugin)`：一次性将旧版 `data/openai_chat_plugin/`（4.x 运行时数据）迁移到新位置
-  （presents 整目录复制 + 旧 json `data` 键迁入 data.json），完成后旧目录改名 `.migrated.bak`；幂等，失败不阻塞加载
-- `is_need_update` / `update_data`：legacy memory.json → v0.1.4+ 格式升级
+  （旧 `presents/` 整目录复制到新 `presets/` + 旧 json `data` 键迁入 data.json），完成后旧目录改名 `.migrated.bak`；幂等，失败不阻塞加载
+- `migrate_presents_dir(plugin)`：将旧工作区中拼写错误的 `presents/` 目录重命名为 `presets/`；幂等，失败不阻塞加载
+- `needs_memory_migration` / `migrate_memory_format`：legacy memory.json → v0.1.4+ 格式升级
 - 4.x 时代依赖 `config.plugins_config` 的全局配置预设迁移已在 v5 中删除（API 不存在）
 
 ## 新增命令指南
@@ -212,8 +213,8 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 
 ## 注意事项
 
-- 预设目录结构：`<workspace>/presents/<present_name>/` 下包含 `config.yaml` 和 `prompt.md`
-- `Present.to_conversations()` 返回 `[]`（空 prompt）或 `[{"role": "system", "content": "..."}]`
+- 预设目录结构：`<workspace>/presets/<preset_name>/` 下包含 `config.yaml` 和 `prompt.md`
+- `Preset.to_conversations()` 返回 `[]`（空 prompt）或 `[{"role": "system", "content": "..."}]`
 - `_handle_message()` 对以 `/` 开头的消息直接跳过，不调用 API
 - 回复统一 `at_sender=False`（保留旧版不 @ 发送者的行为）
 - 记忆功能需要 `AllowAccessMemory` 配置和 `EnableBuiltinFunctionCalling` 同时开启

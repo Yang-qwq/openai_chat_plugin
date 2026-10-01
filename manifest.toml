@@ -1,5 +1,5 @@
 name = "OpenAIChatPlugin"
-version = "0.2.0"
+version = "0.2.1"
 main = "main.py"
 entry_class = "OpenAIChatPlugin"
 author = "Yang-qwq"

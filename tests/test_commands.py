@@ -45,23 +45,23 @@ async def test_chat_unknown_subcommand(tmp_path, monkeypatch):
         h.assert_api("send_private_msg").with_text("未知命令")
 
 
-async def test_chat_set_present_not_exist(tmp_path, monkeypatch):
-    """/chat set-present 指定不存在的预设时返回错误提示"""
+async def test_chat_set_preset_not_exist(tmp_path, monkeypatch):
+    """/chat set-preset 指定不存在的预设时返回错误提示"""
     monkeypatch.chdir(tmp_path)
     async with _harness() as h:
-        await h.inject(private_message("/chat set-present nosuch", user_id=ROOT_QQ))
+        await h.inject(private_message("/chat set-preset nosuch", user_id=ROOT_QQ))
         await h.settle()
         h.assert_api("send_private_msg").with_text("预设 nosuch 不存在")
 
 
-async def test_chat_set_present_and_reset(tmp_path, monkeypatch):
-    """/chat set-present 设置默认预设成功，/chat reset 重置会话成功"""
+async def test_chat_set_preset_and_reset(tmp_path, monkeypatch):
+    """/chat set-preset 设置默认预设成功，/chat reset 重置会话成功"""
     monkeypatch.chdir(tmp_path)
     async with _harness() as h:
         plugin = h.get_plugin(PLUGIN_NAME)
 
         # 设置预设（默认预设由 on_load 自动创建）
-        await h.inject(group_message("/chat set-present default", group_id=GROUP_ID, user_id=ROOT_QQ))
+        await h.inject(group_message("/chat set-preset default", group_id=GROUP_ID, user_id=ROOT_QQ))
         await h.settle()
         h.assert_api("send_group_msg").with_text("已设置当前预设为: default")
         assert plugin.data["data"]["group_preset_names"][GROUP_ID] == "default"

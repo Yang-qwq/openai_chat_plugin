@@ -14,11 +14,16 @@ from openai import OpenAI
 from . import exceptions, tools
 from .command_handler import (
     ADMIN_PERMISSION,
-    DEFAULT_PRESENT_NAME,
+    DEFAULT_PRESET_NAME,
     OpenAICommandHandlerMixin,
 )
-from .present_manager import Present
-from .update import is_need_update, migrate_legacy_workspace, update_data
+from .preset_manager import Preset
+from .update import (
+    migrate_legacy_workspace,
+    migrate_memory_format,
+    migrate_presents_dir,
+    needs_memory_migration,
+)
 
 _log = get_log('openai_chat_plugin')  # 日志记录器
 
@@ -33,7 +38,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
     """
 
     name = 'OpenAIChatPlugin'  # 插件名（须与 manifest.toml 一致）
-    version = '0.2.0'  # 插件版本（须与 manifest.toml 一致）
+    version = '0.2.1'  # 插件版本（须与 manifest.toml 一致）
     author = 'Yang-qwq'
     description = 'OpenAI 对话插件：多预设管理、函数调用（Function Calling）、会话持久化'
 
@@ -86,6 +91,15 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
 
         workspace_path = str(self.workspace)
 
+        # ---- 修正旧版工作区预设目录拼写 presents/ -> presets/（失败不阻塞加载） ----
+        try:
+            if migrate_presents_dir(self):
+                _log.info('已将预设目录 presents/ 重命名为 presets/')
+            else:
+                _log.debug('预设目录无需重命名')
+        except Exception as e:
+            _log.error(f'重命名预设目录失败：{e}')
+
         # ---- 一次性迁移旧版 4.x 运行时数据到 v5 新位置（失败不阻塞加载） ----
         try:
             if migrate_legacy_workspace(self):
@@ -97,22 +111,22 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
 
         # ---- 记忆格式升级迁移（legacy memory.json -> v0.1.4+，失败不阻塞加载） ----
         try:
-            if is_need_update(self):
+            if needs_memory_migration(self):
                 _log.info('检测到需要升级的记忆格式，正在迁移数据...')
-                update_data(self)
+                migrate_memory_format(self)
             else:
                 _log.debug('未检测到需要迁移的数据，跳过记忆格式升级')
         except Exception as e:
             _log.error(f'迁移记忆数据失败：{e}')
 
         # ---- 检查/创建默认预设 ----
-        default_config_path = os.path.join(workspace_path, 'presents', DEFAULT_PRESENT_NAME, 'config.yaml')
-        default_prompt_path = os.path.join(workspace_path, 'presents', DEFAULT_PRESENT_NAME, 'prompt.md')
+        default_config_path = os.path.join(workspace_path, 'presets', DEFAULT_PRESET_NAME, 'config.yaml')
+        default_prompt_path = os.path.join(workspace_path, 'presets', DEFAULT_PRESET_NAME, 'prompt.md')
         if os.path.exists(default_config_path) and os.path.exists(default_prompt_path):
             _log.debug('检测到默认预设已存在，跳过创建默认预设')
         else:
             # 创建默认预设目录及空 prompt.md，用户可自行编辑添加 system 提示词
-            default_preset_dir = os.path.join(workspace_path, 'presents', DEFAULT_PRESENT_NAME)
+            default_preset_dir = os.path.join(workspace_path, 'presets', DEFAULT_PRESET_NAME)
             os.makedirs(default_preset_dir, exist_ok=True)
 
             if not os.path.exists(default_config_path):
@@ -131,9 +145,9 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                 '中设置 ApiKey / Model / BaseUrl 并将 IsConfigured 置为 true')
 
         # 检查默认预设是否存在
-        default_present = Present()
-        if not default_present.load(workspace_path, DEFAULT_PRESENT_NAME):
-            _log.error('默认预设不存在，请确保数据目录中存在 presents/default/ 目录及其配置文件')
+        default_preset = Preset()
+        if not default_preset.load(workspace_path, DEFAULT_PRESET_NAME):
+            _log.error('默认预设不存在，请确保数据目录中存在 presets/default/ 目录及其配置文件')
             # 设置`IsConfigured`为False并持久化
             self.set_config('IsConfigured', False)
 
@@ -250,12 +264,12 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
 
         # 检查会话是否存在，不存在则用默认预设初始化
         if session_id not in self.data['data'][conversation_dict]:
-            default_present = Present()
-            if not default_present.load(str(self.workspace), DEFAULT_PRESENT_NAME):
+            default_preset = Preset()
+            if not default_preset.load(str(self.workspace), DEFAULT_PRESET_NAME):
                 _log.error('默认预设不存在，无法初始化会话')
                 return
-            self.data['data'][conversation_dict][session_id] = default_present.to_conversations()
-            self._set_preset_name(conversation_dict, session_id, DEFAULT_PRESENT_NAME)
+            self.data['data'][conversation_dict][session_id] = default_preset.to_conversations()
+            self._set_preset_name(conversation_dict, session_id, DEFAULT_PRESET_NAME)
 
         # 添加用户消息到会话
         self.data['data'][conversation_dict][session_id].append({'role': 'user', 'content': user_message})
@@ -344,7 +358,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                                     tool_args['from_user'] = event.user_id
                                     tool_args['from_group'] = event.group_id if is_group else -1
                                     result = tools.access_memory(
-                                        os.path.join(str(self.workspace), 'presents', preset_name), **tool_args
+                                        os.path.join(str(self.workspace), 'presets', preset_name), **tool_args
                                     )
                             else:
                                 _log.warning(f'未知工具调用请求: {tool_name}')
