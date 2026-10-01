@@ -61,6 +61,6 @@ async def test_default_preset_created(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     async with _harness() as h:
         plugin = h.get_plugin(PLUGIN_NAME)
-        present_dir = plugin.workspace / "presents" / "default"
-        assert (present_dir / "config.yaml").is_file()
-        assert (present_dir / "prompt.md").is_file()
+        preset_dir = plugin.workspace / "presets" / "default"
+        assert (preset_dir / "config.yaml").is_file()
+        assert (preset_dir / "prompt.md").is_file()

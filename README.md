@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.2.1-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -62,15 +62,17 @@ plugin:
 
 ### 2. 预设文件设置
 
-插件会在插件工作区（`data/OpenAIChatPlugin/presents/`）目录中自动创建和管理预设配置文件。
+插件会在插件工作区（`data/OpenAIChatPlugin/presets/`）目录中自动创建和管理预设配置文件。
 
 > 从 v0.1.x 升级：首次启动时会自动将旧目录 `data/openai_chat_plugin/` 中的会话数据与预设迁移到新位置，
 > 旧目录会被重命名为 `data/openai_chat_plugin.migrated.bak` 作为备份。
+>
+> 从早期 v0.2.x 升级：若工作区仍存在拼写错误的 `presents/` 目录，首次启动会自动重命名为 `presets/`。
 
 想要编辑预设配置，可以直接编辑对应的`prompt.md`文件：
 
 ```bash
-your_editor data/OpenAIChatPlugin/presents/default/prompt.md
+your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 ```
 
 ## 📖 使用指南
@@ -86,7 +88,7 @@ your_editor data/OpenAIChatPlugin/presents/default/prompt.md
 
 ```bash
 # 为当前环境设置预设
-/chat set-present programmer
+/chat set-preset programmer
 
 # 重置当前环境会话
 /chat reset
@@ -101,13 +103,13 @@ your_editor data/OpenAIChatPlugin/presents/default/prompt.md
 
 ```bash
 # 为当前环境设置预设
-/chat-admin set-present programmer
+/chat-admin set-preset programmer
 
 # 为指定群组设置预设
-/chat-admin set-present programmer group:1919810
+/chat-admin set-preset programmer group:1919810
 
 # 为指定用户设置预设
-/chat-admin set-present programmer user:114514
+/chat-admin set-preset programmer user:114514
 
 # 重置当前环境会话
 /chat-admin reset
@@ -173,7 +175,7 @@ your_editor data/OpenAIChatPlugin/presents/default/prompt.md
 ```
 data/OpenAIChatPlugin/
 | -- data.json            <-- 会话数据（自动持久化）
-| -- presents/
+| -- presets/
     | -- default/
         | -- config.yaml
         | -- prompt.md  <-- 系统提示词文件
@@ -206,7 +208,7 @@ data/OpenAIChatPlugin/
     - 检查机器人QQ号是否正确
 
 3. **预设不存在错误**
-    - 确认 `data/OpenAIChatPlugin/presents/` 目录下存在对应预设
+    - 确认 `data/OpenAIChatPlugin/presets/` 目录下存在对应预设
     - 确认预设名称拼写正确
 
 4. **管理员命令提示权限不足**
@@ -224,6 +226,12 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 
 ## 📝 更新日志
 
+### v0.2.1
+
+- 🛠️ **预设管理重构**：`present_manager.py` 重命名为 `preset_manager.py`，新增 `Preset` 类统一加载 `config.yaml` 与 `prompt.md`
+- 🛠️ **修正拼写**：预设目录 `presents/` 统一为 `presets/`，首次启动自动重命名旧目录；命令 `/chat set-present` 更名为 `/chat set-preset`
+- 📦 **迁移逻辑重构**：拆分 4.x 工作区数据迁移与记忆格式升级，迁移失败不再阻塞插件加载
+
 ### v0.2.0
 
 - 🚀 **迁移到 NcatBot 5**：全面适配 NcatBotPlugin / registrar 装饰器注册 / api.qq 多平台 API
@@ -237,7 +245,7 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 
 - 🛠️ **精简代码**：删除部分迁移逻辑
 - ✅ **支持更多函数调用**： 机器人可以获取上下文信息与系统时间等内容了
-- 🛠️ **新增~~Present~~ Preset类**：替代原~~present~~ `preset_manager.py`中的函数
+- 🛠️ **修正拼写**：新增 `Preset` 类：替代原 `present_manager.py` 中的函数（`present`/`presents` 已统一修正为 `preset`/`presets`）
 
 ### v0.1.8
 
