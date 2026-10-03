@@ -25,6 +25,8 @@ import json
 import os
 import re
 import uuid
+import httpx
+import markdownify
 from datetime import datetime, timezone
 from typing import Any
 
@@ -138,6 +140,33 @@ tools = [
                 'type': 'object',
                 'properties': {},
                 'required': []
+            }
+        }
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'create_http_request',
+            'description': 'Create an HTTP request and return the response',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'content_format': {
+                        'type': 'string',
+                        'enum': ['json', 'text', 'bytes', 'markdown'],
+                        'description': "The format of the content to be received in the request"
+                    },
+                    'method': {
+                        'type': 'string',
+                        'description': "HTTP method, e.g., 'GET', 'POST', etc."
+                    },
+                    'url': {
+                        'type': 'string',
+                        'description': "The URL to send the request to"
+                    },
+                    # Additional parameters can be added as needed
+                },
+                'required': ['method', 'url']
             }
         }
     }
@@ -377,3 +406,55 @@ async def get_system_time() -> str:
         'iso8601': now.isoformat().replace('+00:00', 'Z'),
         'rfc2822': now.strftime('%a, %d %b %Y %H:%M:%S GMT')
     })
+
+async def create_http_request(content_format: str, method: str, url: str, **kwargs) -> httpx.Response:
+    """创建 HTTP 请求
+
+    :param content_format: 内容格式
+    :param method: HTTP 方法，如 'GET', 'POST' 等
+    :param url: 请求 URL
+    :param kwargs: 其他 httpx.request() 支持的参数
+    :return: httpx.Response 对象
+    """
+    # VALID_CONTENT_TYPE = ['json', 'text', 'markdown']
+    VALID_CONTENT_TYPE = ['json', 'text', 'bytes', 'markdown']
+    if content_format not in VALID_CONTENT_TYPE:
+        return _generate_tool_payload('error', f'不支持的 content_format: {content_format}')
+
+    async with httpx.AsyncClient() as client:
+        response = await client.request(method, url, **kwargs)
+
+        # 检查实际相应内容是否与指定的 content_format 匹配
+        if content_format == 'json':
+            try:
+                response.json()  # 尝试解析为 JSON
+            except ValueError:
+                return _generate_tool_payload('error', '响应内容不是有效的 JSON', {'content': response.text})
+            else:
+                return _generate_tool_payload('success', str(response.status_code) + ' ' + response.reason, response.json())
+        elif content_format == 'text':
+            if not isinstance(response.text, str):
+                return _generate_tool_payload('error', '响应内容不是有效的文本', {'content': response.text})
+            else:
+                return _generate_tool_payload('success', str(response.status_code) + ' ' + response.reason, {'content': response.text})
+        # elif content_format == 'bytes':
+        #     if not isinstance(response.content, bytes):
+        #         return _generate_tool_payload('error', '响应内容不是有效的字节流')
+        #         # return _generate_tool_payload('error', '响应内容不是有效的字节流', {'content': response.content})
+        #     else:
+        #         return _generate_tool_payload('success', str(response.status_code) + ' ' + response.reason, {'content': response.content.hex()})
+        elif content_format == 'markdown':
+            if not isinstance(response.text, str):
+                return _generate_tool_payload('error', '响应内容不是有效的 Markdown 文本', {'content': response.text})
+            else:
+                # 是否为 Markdown 格式
+                if not re.search(r'(^|\n)(#|\*|-|\d+\.)\s', response.text):
+                    # 尝试将html转换为markdown
+                    try:
+                        markdown_text = markdownify.markdownify(response.text, heading_style="ATX")
+                        return _generate_tool_payload('success', str(response.status_code) + ' ' + response.reason, {'content': markdown_text})
+                    except Exception as e:
+                        return _generate_tool_payload('error', f'响应内容不是有效的 Markdown 文本，且转换失败: {e}', {'content': response.text})
+                else:
+                    return _generate_tool_payload('success', str(response.status_code) + ' ' + response.reason, {'content': response.text})
+        # return response

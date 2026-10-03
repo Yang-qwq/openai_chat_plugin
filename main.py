@@ -360,6 +360,14 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                                     result = tools.access_memory(
                                         os.path.join(str(self.workspace), 'presets', preset_name), **tool_args
                                     )
+                            elif tool_name == 'create_http_request':
+                                if not self.get_config('AllowWebRequests'):
+                                    # 如果不允许网络请求功能，则拒绝工具调用请求并返回错误信息
+                                    result = tools._generate_tool_payload(
+                                        'error', '`AllowWebRequests` 配置未启用，无法使用网络请求功能')
+                                    _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许网络请求功能')
+                                else:
+                                    result = await tools.create_http_request(**tool_args)
                             else:
                                 _log.warning(f'未知工具调用请求: {tool_name}')
                                 result = tools._generate_tool_payload('error', f'未知工具: {tool_name}')
