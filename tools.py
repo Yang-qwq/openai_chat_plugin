@@ -153,7 +153,7 @@ tools = [
                 'properties': {
                     'content_format': {
                         'type': 'string',
-                        'enum': ['json', 'text', 'bytes', 'markdown'],
+                        'enum': ['json', 'text', 'markdown'],
                         'description': "The format of the content to be received in the request"
                     },
                     'method': {
@@ -165,6 +165,10 @@ tools = [
                         'description': "The URL to send the request to"
                     },
                     # Additional parameters can be added as needed
+                    'data': {
+                        'type': 'object',
+                        'description': "Optional data to send in the request body (for POST, PUT, etc.)"
+                    }
                 },
                 'required': ['method', 'url']
             }
@@ -422,7 +426,10 @@ async def create_http_request(content_format: str, method: str, url: str, **kwar
         return _generate_tool_payload('error', f'不支持的 content_format: {content_format}')
 
     async with httpx.AsyncClient() as client:
+        _log.info(f'已创建 HTTP 请求 {method} {url}，参数: {kwargs}')
         response = await client.request(method, url, **kwargs)
+
+        _log.info(f'HTTP 请求 {method} {url} 返回状态码 {response.status_code}')
 
         # 检查实际相应内容是否与指定的 content_format 匹配
         if content_format == 'json':
@@ -451,9 +458,11 @@ async def create_http_request(content_format: str, method: str, url: str, **kwar
                 if not re.search(r'(^|\n)(#|\*|-|\d+\.)\s', response.text):
                     # 尝试将html转换为markdown
                     try:
+                        _log.debug('响应内容不是有效的 Markdown 文本，尝试将 HTML 转换为 Markdown')
                         markdown_text = markdownify.markdownify(response.text, heading_style="ATX")
                         return _generate_tool_payload('success', str(response.status_code) + ' ' + response.reason, {'content': markdown_text})
                     except Exception as e:
+                        _log.warning(f'响应内容不是有效的 Markdown 文本，且转换失败: {e}')
                         return _generate_tool_payload('error', f'响应内容不是有效的 Markdown 文本，且转换失败: {e}', {'content': response.text})
                 else:
                     return _generate_tool_payload('success', str(response.status_code) + ' ' + response.reason, {'content': response.text})
