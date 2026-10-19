@@ -321,7 +321,9 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                             self._assistant_message_to_history_dict(assistant_msg))
 
                         # 可选：将调用工具前的正文发送
-                        if assistant_msg.content:
+                        # 仅在正文存在有效内容时发送；「仅空白/空」的中间内容
+                        # （如换行、空格）视为无效，不向用户发出（复用上方已 strip 的 thinking_content）
+                        if thinking_content:
                             if is_group:
                                 await self.api.qq.post_group_msg(event.group_id, text=assistant_msg.content)
                             else:
