@@ -6,7 +6,7 @@
 from pathlib import Path
 
 import pytest
-from ncatbot.testing import PluginTestHarness
+from ncatbot.testing import PluginTestHarness, extract_text
 from ncatbot.testing.factories.qq import private_message
 
 from fake_openai import (
@@ -87,6 +87,58 @@ async def test_tool_call_loop_with_system_time(tmp_path, monkeypatch):
         assert len(assistant_entries) == 1
         assert len(tool_entries) == 1
         assert '"status": "success"' in tool_entries[0]["content"]
+
+
+def _tool_call_responses(intermediate_content, final_reply):
+    """构造「首轮工具调用（带中间正文）→ 二轮最终回复」的响应脚本"""
+    return [
+        FakeResponse(FakeChoice(FakeMessage(
+            content=intermediate_content,
+            tool_calls=[FakeToolCall("call_1", "get_system_time", "{}")],
+        ), "tool_calls")),
+        FakeResponse(FakeChoice(FakeMessage(content=final_reply), "stop")),
+    ]
+
+
+@pytest.mark.parametrize("invalid_content", ["\n", "   ", "\n\t ", ""])
+async def test_invalid_intermediate_content_not_sent(tmp_path, monkeypatch, invalid_content):
+    """模型在请求工具时附带「仅空白/空」的中间正文时，不应向用户发送该无效内容
+
+    仅发送最终回复；即 send_private_msg 只出现一次且为最终正文。
+    （回归：旧代码 `if assistant_msg.content:` 对非空字符串恒为真，
+    导致换行/空格等无效中间内容被当作正文意外发出。）
+    """
+    monkeypatch.chdir(tmp_path)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        plugin.config["EnableBuiltinFunctionCalling"] = True
+        _configure(plugin, _tool_call_responses(invalid_content, "最终回复OK"))
+
+        await h.inject(private_message("现在几点了", user_id=ROOT_QQ))
+        await h.settle()
+
+        # 只能有最终回复这一条对外发送，不能多出一条空白中间内容
+        h.assert_api("send_private_msg").times(1)
+        h.assert_api("send_private_msg").with_text("最终回复OK")
+        texts = [extract_text(c) for c in h.assert_api("send_private_msg").calls]
+        assert all(t.strip() for t in texts), f"出现了空白/空中间内容: {texts!r}"
+
+
+async def test_valid_intermediate_content_still_forwarded(tmp_path, monkeypatch):
+    """模型在请求工具时附带「有效正文」的中间内容时，应正常发送（不受修复影响）"""
+    monkeypatch.chdir(tmp_path)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        plugin.config["EnableBuiltinFunctionCalling"] = True
+        _configure(plugin, _tool_call_responses("我先查一下时间", "最终回复OK"))
+
+        await h.inject(private_message("现在几点了", user_id=ROOT_QQ))
+        await h.settle()
+
+        # 中间有效正文 + 最终回复，各发送一次
+        h.assert_api("send_private_msg").times(2)
+        h.assert_api("send_private_msg").with_text("我先查一下时间")
+        h.assert_api("send_private_msg").with_text("最终回复OK")
 
 
 async def test_memory_tool_blocked_when_disabled(tmp_path, monkeypatch):
