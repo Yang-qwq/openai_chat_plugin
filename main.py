@@ -38,7 +38,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
     """
 
     name = 'OpenAIChatPlugin'  # 插件名（须与 manifest.toml 一致）
-    version = '0.2.1'  # 插件版本（须与 manifest.toml 一致）
+    version = '0.2.2'  # 插件版本（须与 manifest.toml 一致）
     author = 'Yang-qwq'
     description = 'OpenAI 对话插件：多预设管理、函数调用（Function Calling）、会话持久化'
 
@@ -163,7 +163,11 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         :param assistant_message: API 返回的 assistant 消息
         :return: dict, 可写入 messages 历史的 dict（含 tool_calls）
         """
-        entry: dict = {'role': 'assistant', 'content': assistant_message.content}
+        content = assistant_message.content
+        # 部分模型会在正文首尾输出换行/空格，统一去除，避免历史与回复出现多余空白
+        if isinstance(content, str):
+            content = content.strip() or None
+        entry: dict = {'role': 'assistant', 'content': content}
         tcs = assistant_message.tool_calls
         if tcs:
             entry['tool_calls'] = [
@@ -325,15 +329,20 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                         # （如换行、空格）视为无效，不向用户发出（复用上方已 strip 的 thinking_content）
                         if thinking_content:
                             if is_group:
-                                await self.api.qq.post_group_msg(event.group_id, text=assistant_msg.content)
+                                await self.api.qq.post_group_msg(event.group_id, text=thinking_content)
                             else:
-                                await self.api.qq.post_private_msg(event.user_id, text=assistant_msg.content)
+                                await self.api.qq.post_private_msg(event.user_id, text=thinking_content)
 
                         # 处理每个工具调用请求
                         preset_name = self._get_preset_name(conversation_dict, session_id)
+                        vision_messages: list[dict] = []
                         for tool_call in response.choices[0].message.tool_calls:
                             tool_name = tool_call.function.name
-                            tool_args = json.loads(tool_call.function.arguments)
+                            try:
+                                tool_args = json.loads(tool_call.function.arguments or '{}')
+                            except ValueError:
+                                tool_args = {}
+                                _log.warning(f'工具参数不是有效的 JSON: {tool_call.function.arguments}')
 
                             # 以下工具不需要权限，直接可调用
                             if tool_name == 'get_system_time':
@@ -362,20 +371,48 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                                     result = tools.access_memory(
                                         os.path.join(str(self.workspace), 'presets', preset_name), **tool_args
                                     )
+                            elif tool_name == 'create_http_request':
+                                if not self.get_config('AllowWebRequests'):
+                                    # 如果不允许网络请求功能，则拒绝工具调用请求并返回错误信息
+                                    result = tools._generate_tool_payload(
+                                        'error', '`AllowWebRequests` 配置未启用，无法使用网络请求功能')
+                                    _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许网络请求功能')
+                                else:
+                                    result = await tools.create_http_request(**tool_args)
                             else:
                                 _log.warning(f'未知工具调用请求: {tool_name}')
                                 result = tools._generate_tool_payload('error', f'未知工具: {tool_name}')
 
+                            # 图片类工具结果：工具历史只保存摘要，完整 data URL 作为
+                            # 后续 user 视觉消息附加，避免把 base64 正文塞进上下文
+                            vision = tools.extract_vision_payload(result)
+                            history_content = tools._vision_summary_payload(vision) if vision else result
+
                             _log.info(
                                 f'[{"群组" if is_group else "用户"} {session_id}] 工具调用: '
                                 f'{tool_name}({json.dumps(tool_args, ensure_ascii=False)[:OMITTED_TEXT_LENGTH]}) -> '
-                                f'{str(result)[:OMITTED_TEXT_LENGTH]}'
-                                f'{"..." if len(str(result)) > OMITTED_TEXT_LENGTH else ""}'
+                                f'{str(history_content)[:OMITTED_TEXT_LENGTH]}'
+                                f'{"..." if len(str(history_content)) > OMITTED_TEXT_LENGTH else ""}'
                             )
 
                             # 将工具调用结果添加到会话中，供模型后续生成回复时参考
                             self.data['data'][conversation_dict][session_id].append(
-                                {'tool_call_id': tool_call.id, 'role': 'tool', 'name': tool_name, 'content': result})
+                                {'tool_call_id': tool_call.id, 'role': 'tool', 'name': tool_name,
+                                 'content': history_content})
+
+                            if vision:
+                                vision_messages.append({
+                                    'role': 'user',
+                                    'content': [
+                                        {'type': 'text', 'text': '以下是通过工具获取的图片：'},
+                                        {'type': 'image_url', 'image_url': {'url': vision['data_url']}},
+                                    ],
+                                })
+
+                        # 所有 tool 消息追加完毕后，再附加视觉消息（保持 tool_calls 与 tool 的相邻顺序）
+                        for vision_message in vision_messages:
+                            self.data['data'][conversation_dict][session_id].append(vision_message)
+                            _log.debug('已将工具获取的图片作为视觉输入附加到会话')
                     else:
                         break
 
@@ -385,10 +422,15 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                 return
 
             last_msg = response.choices[0].message
-            reply_message = last_msg.content or ''
+            # 模型可能在正文首尾输出换行/空格（日志中常见 "\n\n你好..."），发送前统一去除
+            reply_message = (last_msg.content or '').strip()
             # 最后一轮 API 仍在请求工具时 while 已无法继续，content 往往为空，避免 reply(None)
-            if last_msg.tool_calls and not reply_message.strip():
+            if last_msg.tool_calls and not reply_message:
                 raise exceptions.TooManyToolCallsException('抱歉，连续工具调用次数已达上限')
+            if not reply_message:
+                _log.warning('模型返回了空回复，已跳过发送')
+                self._save_data()
+                return
 
             _log.info(
                 f'[{"群组" if is_group else "用户"} {session_id}] AI回复: '

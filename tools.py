@@ -21,21 +21,29 @@ v0.1.4+ 记忆数据结构（列表中的每一项是一个 dict）：
 ```
 """
 
+import base64
 import json
 import os
 import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
+import httpx
+import markdownify
 from ncatbot.api.qq import QQAPIClient
 from ncatbot.event.qq import GroupMessageEvent, MessageEvent
 from ncatbot.utils.logger import get_log
 
 __all__ = [
     '_generate_tool_payload',
+    '_generate_vision_tool_payload',
     'access_memory',
+    'create_http_request',
+    'extract_vision_payload',
     'get_environment_info',
+    'get_group_info',
     'get_stranger_info',
     'get_system_time',
     'query_missing_message_context',
@@ -43,6 +51,23 @@ __all__ = [
 ]
 
 _log = get_log('openai_chat_plugin.tools')
+
+# ---- HTTP 请求工具限制 ----
+# 允许的 HTTP 方法（大小写不敏感）
+ALLOWED_HTTP_METHODS = {'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'}
+# 允许的请求内容格式
+ALLOWED_CONTENT_FORMATS = {'json', 'text', 'markdown', 'image'}
+# 文本类响应最大字节数，防止模型上下文被超大网页撑爆
+MAX_TEXT_RESPONSE_BYTES = 2 * 1024 * 1024  # 2 MiB
+# 图片响应最大字节数（base64 后约膨胀 4/3）
+MAX_IMAGE_RESPONSE_BYTES = 5 * 1024 * 1024  # 5 MiB
+# 支持交给视觉模型读取的图片 MIME 类型
+ALLOWED_IMAGE_MIME_TYPES = {'image/png', 'image/jpeg', 'image/gif', 'image/webp'}
+# 请求超时（秒）
+DEFAULT_HTTP_TIMEOUT = 15.0
+MAX_HTTP_TIMEOUT = 60.0
+# 默认 transport（None 表示使用 httpx 默认实现；测试中可注入 MockTransport）
+_default_http_transport: httpx.AsyncBaseTransport | None = None
 
 tools = [
     {
@@ -140,6 +165,53 @@ tools = [
                 'required': []
             }
         }
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'create_http_request',
+            'description': 'Create an HTTP request and return the response. '
+                           'Use content_format="image" to fetch an image and view it.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'content_format': {
+                        'type': 'string',
+                        'enum': ['json', 'text', 'markdown', 'image'],
+                        'description': "The format of the content to be received in the request. "
+                                       "Use 'image' to attach a fetched image to the conversation "
+                                       "so it can be seen directly."
+                    },
+                    'method': {
+                        'type': 'string',
+                        'enum': sorted(ALLOWED_HTTP_METHODS),
+                        'description': "HTTP method, e.g., 'GET', 'POST', etc."
+                    },
+                    'url': {
+                        'type': 'string',
+                        'description': "The URL to send the request to (http/https only)"
+                    },
+                    'data': {
+                        'type': 'object',
+                        'description': "Optional JSON data to send in the request body (for POST, PUT, etc.)"
+                    },
+                    'headers': {
+                        'type': 'object',
+                        'description': "Optional HTTP request headers"
+                    },
+                    'params': {
+                        'type': 'object',
+                        'description': "Optional URL query parameters"
+                    },
+                    'timeout': {
+                        'type': 'number',
+                        'description': f"Request timeout in seconds (default {DEFAULT_HTTP_TIMEOUT:g}, "
+                                       f"max {MAX_HTTP_TIMEOUT:g})"
+                    }
+                },
+                'required': ['method', 'url']
+            }
+        }
     }
 ]
 
@@ -173,6 +245,69 @@ def _generate_tool_payload(status: str, message: str = '', data: Any = None) -> 
     if data is not None:
         payload['data'] = data
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _generate_vision_tool_payload(
+        content: bytes,
+        mime_type: str,
+        source: str = '',
+        status_code: int | None = None,
+) -> str:
+    """生成图片类工具返回值的 JSON payload（供主流程转换为视觉消息）
+
+    返回的 ``data.data_url`` 是可直接放进 OpenAI ``image_url`` 的 data URL，
+    主流程会把它附加为一条带图片的 user 消息；写入工具历史时会去掉
+    base64 正文，避免把超大字符串塞进上下文。
+
+    :param content: 图片原始字节
+    :param mime_type: 图片 MIME 类型，如 image/png
+    :param source: 图片来源 URL
+    :param status_code: HTTP 状态码（可选）
+    :return: JSON 字符串
+    """
+    encoded = base64.b64encode(content).decode('ascii')
+    data: dict[str, Any] = {
+        'type': 'image',
+        'mime_type': mime_type,
+        'size': len(content),
+        'source': source,
+        'data_url': f'data:{mime_type};base64,{encoded}',
+    }
+    if status_code is not None:
+        data['status_code'] = status_code
+    return _generate_tool_payload('success', '已获取图片，将作为视觉输入附加到对话中', data)
+
+
+def extract_vision_payload(tool_result: str) -> dict[str, Any] | None:
+    """从工具返回值中提取视觉图片信息。
+
+    :param tool_result: 工具返回的 JSON 字符串
+    :return: 含 data_url / mime_type 等字段的 dict；不是图片 payload 时返回 None
+    """
+    try:
+        payload = json.loads(tool_result)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get('status') != 'success':
+        return None
+    data = payload.get('data')
+    if not isinstance(data, dict) or data.get('type') != 'image':
+        return None
+    data_url = data.get('data_url')
+    if not isinstance(data_url, str) or not data_url.startswith('data:image/'):
+        return None
+    return data
+
+
+def _vision_summary_payload(vision: dict[str, Any]) -> str:
+    """生成写入工具历史的图片摘要 payload（不含 base64 正文）"""
+    data = {
+        'type': 'image',
+        'mime_type': vision.get('mime_type'),
+        'size': vision.get('size'),
+        'source': vision.get('source'),
+    }
+    return _generate_tool_payload('success', '已获取图片，将作为视觉输入附加到对话中', data)
 
 
 def access_memory(
@@ -377,3 +512,207 @@ async def get_system_time() -> str:
         'iso8601': now.isoformat().replace('+00:00', 'Z'),
         'rfc2822': now.strftime('%a, %d %b %Y %H:%M:%S GMT')
     })
+
+def _normalize_http_method(method: object) -> str | None:
+    """规范化并校验 HTTP 方法；非法时返回 None。"""
+    if not isinstance(method, str):
+        return None
+    normalized = method.strip().upper()
+    return normalized if normalized in ALLOWED_HTTP_METHODS else None
+
+
+def _validate_http_url(url: object) -> tuple[str | None, str | None]:
+    """校验请求 URL，返回 (规范化 URL, 错误信息)。"""
+    if not isinstance(url, str) or not url.strip():
+        return None, '请提供非空的 url'
+    normalized = url.strip()
+    parsed = urlparse(normalized)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        return None, '仅支持 http/https 协议的完整 URL'
+    if parsed.username or parsed.password:
+        return None, 'URL 中不允许携带用户名/密码'
+    return normalized, None
+
+
+def _decode_http_text(response: httpx.Response, content: bytes) -> str:
+    """按响应 charset 解码文本（缺少 charset 时回退 utf-8）。"""
+    encoding = response.charset_encoding or 'utf-8'
+    try:
+        return content.decode(encoding, errors='replace')
+    except LookupError:
+        return content.decode('utf-8', errors='replace')
+
+
+def _http_message(response: httpx.Response) -> str:
+    """构造 `200 OK` 形式的状态描述。"""
+    reason = response.reason_phrase or ''
+    return f'{response.status_code} {reason}'.strip()
+
+
+def _markdownify_html(text: str) -> str:
+    """尝试把 HTML 转为 Markdown；失败时抛出异常由调用方处理。"""
+    return markdownify.markdownify(text, heading_style='ATX')
+
+
+async def create_http_request(
+        method: str,
+        url: str,
+        content_format: str = 'text',
+        data: Any = None,
+        headers: dict | None = None,
+        params: dict | None = None,
+        timeout: float | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+        **_extra: Any,
+) -> str:
+    """创建 HTTP 请求并返回适合模型阅读的 JSON payload
+
+    - ``content_format``：json / text / markdown / image
+    - ``image`` 模式下会返回 data URL，主流程会将其转换为视觉消息附加到对话
+    - 文本/网页响应默认限制 2 MiB，图片限制 5 MiB
+    - 所有网络异常、参数错误都会转为 ``status: error`` 的 payload，不向上抛异常
+
+    :param method: HTTP 方法，如 'GET'、'POST'
+    :param url: 请求 URL（仅 http/https）
+    :param content_format: 期望的响应内容格式
+    :param data: 可选的 JSON 请求体（dict/list）
+    :param headers: 可选的请求头
+    :param params: 可选的 URL 查询参数
+    :param timeout: 超时秒数（默认 15，最大 60）
+    :param transport: 可选的自定义 httpx transport（测试用）
+    :param _extra: 忽略模型多传的未知参数
+    :return: json 字符串
+    """
+    normalized_method = _normalize_http_method(method)
+    if normalized_method is None:
+        return _generate_tool_payload('error', f'不支持的 HTTP 方法: {method}')
+
+    normalized_url, url_error = _validate_http_url(url)
+    if url_error:
+        return _generate_tool_payload('error', url_error)
+
+    normalized_format = (content_format or 'text').strip().lower() if isinstance(content_format, str) else ''
+    if normalized_format not in ALLOWED_CONTENT_FORMATS:
+        return _generate_tool_payload(
+            'error', f'不支持的 content_format: {content_format}',
+            {'supported': sorted(ALLOWED_CONTENT_FORMATS)})
+
+    if data is not None and not isinstance(data, (dict, list)):
+        return _generate_tool_payload('error', 'data 必须是 JSON 对象或数组')
+    if headers is not None and not isinstance(headers, dict):
+        return _generate_tool_payload('error', 'headers 必须是对象')
+    if params is not None and not isinstance(params, dict):
+        return _generate_tool_payload('error', 'params 必须是对象')
+
+    try:
+        request_timeout = DEFAULT_HTTP_TIMEOUT if timeout is None else float(timeout)
+    except (TypeError, ValueError):
+        return _generate_tool_payload('error', 'timeout 必须是数字')
+    request_timeout = max(1.0, min(request_timeout, MAX_HTTP_TIMEOUT))
+
+    # 统一转成字符串键值，避免模型传入非字符串导致 httpx 报错
+    request_headers = {str(k): str(v) for k, v in headers.items()} if headers else None
+    request_params = {str(k): str(v) for k, v in params.items()} if params else None
+    request_data = {'json': data} if data is not None else {}
+
+    limit = MAX_IMAGE_RESPONSE_BYTES if normalized_format == 'image' else MAX_TEXT_RESPONSE_BYTES
+    http_transport = transport if transport is not None else _default_http_transport
+
+    _log.info(
+        f'已创建 HTTP 请求 {normalized_method} {normalized_url}，'
+        f'content_format={normalized_format}，超时 {request_timeout:g}s')
+
+    try:
+        async with httpx.AsyncClient(
+                timeout=request_timeout,
+                follow_redirects=True,
+                transport=http_transport,
+        ) as client, client.stream(
+                normalized_method,
+                normalized_url,
+                headers=request_headers,
+                params=request_params,
+                **request_data,
+        ) as response:
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > limit:
+                    _log.warning(f'HTTP 响应内容超过限制（{total} > {limit} 字节）')
+                    return _generate_tool_payload(
+                        'error', f'响应内容过大（超过 {limit} 字节），已中止读取',
+                        {'status_code': response.status_code, 'limit': limit})
+                chunks.append(chunk)
+            content = b''.join(chunks)
+
+            _log.info(
+                f'HTTP 请求 {normalized_method} {normalized_url} 返回状态码 '
+                f'{response.status_code}，{total} 字节')
+            message = _http_message(response)
+            content_type = (response.headers.get('content-type') or '').split(';')[0].strip().lower()
+
+            # 非 2xx：仍然返回响应片段，方便模型判断错误原因
+            if response.status_code >= 400:
+                text = _decode_http_text(response, content)
+                return _generate_tool_payload(
+                    'error', message,
+                    {'status_code': response.status_code, 'content': text[:2000]})
+
+            if normalized_format == 'image':
+                if content_type not in ALLOWED_IMAGE_MIME_TYPES:
+                    return _generate_tool_payload(
+                        'error', f'响应不是受支持的图片类型: {content_type or "unknown"}',
+                        {'status_code': response.status_code,
+                         'supported': sorted(ALLOWED_IMAGE_MIME_TYPES)})
+                if not content:
+                    return _generate_tool_payload('error', '响应图片内容为空')
+                return _generate_vision_tool_payload(
+                    content, content_type, normalized_url, response.status_code)
+
+            text = _decode_http_text(response, content)
+
+            if normalized_format == 'json':
+                try:
+                    parsed = json.loads(text)
+                except ValueError:
+                    return _generate_tool_payload(
+                        'error', '响应内容不是有效的 JSON',
+                        {'status_code': response.status_code, 'content': text[:2000]})
+                return _generate_tool_payload('success', message, parsed)
+
+            if normalized_format == 'text':
+                if not text.strip():
+                    return _generate_tool_payload('error', '响应内容为空',
+                                                  {'status_code': response.status_code})
+                return _generate_tool_payload(
+                    'success', message,
+                    {'status_code': response.status_code, 'content': text})
+
+            # markdown：响应本身是 Markdown 就直接返回，否则尝试把 HTML 转成 Markdown
+            looks_like_html = bool(re.search(
+                r'<\s*(html|head|body|div|p|a|span|table|h[1-6]|ul|ol|li)\b',
+                text, re.IGNORECASE))
+            looks_like_markdown = bool(re.search(r'(^|\n)(#{1,6}\s|\*\s|-\s|\d+\.\s)', text))
+            if looks_like_html or not looks_like_markdown:
+                try:
+                    _log.debug('响应内容不是 Markdown，尝试将 HTML 转换为 Markdown')
+                    text = _markdownify_html(text)
+                except Exception as e:
+                    _log.warning(f'将 HTML 转换为 Markdown 失败: {e}')
+                    return _generate_tool_payload(
+                        'error', f'响应内容不是有效的 Markdown 文本，且转换失败: {e}',
+                        {'status_code': response.status_code, 'content': text[:2000]})
+            return _generate_tool_payload(
+                'success', message,
+                {'status_code': response.status_code, 'content': text})
+
+    except httpx.TimeoutException:
+        _log.warning(f'HTTP 请求超时: {normalized_method} {normalized_url}')
+        return _generate_tool_payload('error', f'请求超时（{request_timeout:g} 秒）')
+    except httpx.HTTPError as e:
+        _log.warning(f'HTTP 请求失败: {normalized_method} {normalized_url}: {e}')
+        return _generate_tool_payload('error', f'HTTP 请求失败: {e}')
+    except Exception as e:
+        _log.error(f'HTTP 请求出现未预期错误: {normalized_method} {normalized_url}: {e}')
+        return _generate_tool_payload('error', f'请求出现未预期错误: {e}')

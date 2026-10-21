@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.2.1-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.2.2-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -15,6 +15,8 @@
 - 🎯 **精确控制**：支持@机器人触发和用户名前缀
 - 📝 **命令系统**：完整的命令控制界面
 - 🔐 **权限体系**：RBAC 全局管理员 + 群主/群管理自动放行
+- 🌐 **网络请求**：AI 可抓取网页（HTML 自动转 Markdown）或调用 JSON API
+- 🖼️ **图片视觉**：AI 可获取图片 URL 并直接“看到”图片内容
 
 ## 📋 系统要求
 
@@ -168,6 +170,37 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 
 ## 🎯 高级功能
 
+### 网络请求与图片视觉
+
+需要同时开启 `EnableBuiltinFunctionCalling` 与 `AllowWebRequests`。开启后模型可以调用
+`create_http_request` 工具：
+
+| `content_format` | 用途 |
+|------------------|------|
+| `text` | 获取纯文本响应 |
+| `markdown` | 抓取网页，HTML 会自动转换为 Markdown |
+| `json` | 调用 JSON API 并返回结构化数据 |
+| `image` | 获取图片并作为视觉输入交给模型阅读 |
+
+示例（模型自动完成，无需手动输入）：
+
+```text
+用户：@机器人 帮我总结 https://example.com/article 的内容
+用户：@机器人 看看 https://example.com/cat.png 这张图里有什么
+
+模型 -> create_http_request(method="GET", url="...", content_format="markdown")
+模型 -> create_http_request(method="GET", url="...", content_format="image")
+```
+
+安全与限制：
+
+- 仅允许 `http/https`，`GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS`
+- 默认超时 15 秒（最大 60 秒）
+- 文本响应上限 2 MiB、图片上限 5 MiB，超出会中止读取
+- 请求失败/参数非法/超时都会以工具错误结果返回，不会中断对话
+- 图片会以 data URL 形式附加到上下文；工具历史只保留摘要，避免 base64 占满上下文
+- 网络请求具有访问内网的潜在风险，请仅在可信环境开启 `AllowWebRequests`
+
 ### 多配置文件支持
 
 插件支持创建多个对话预设，每个预设可以有不同的系统提示词：
@@ -225,6 +258,14 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.2.2
+
+- 🌐 **网络请求工具**：新增 `create_http_request`，支持 text / markdown / json / image，受 `AllowWebRequests` 控制
+- 🖼️ **图片视觉**：获取的图片会作为 `image_url` 视觉消息附加到对话，可直接阅读图片内容
+- 🛡️ **请求防护**：方法/协议白名单、超时、响应大小限制，网络异常统一转为工具错误结果
+- 🧪 **测试**：补齐 HTTP 工具与视觉链路测试，兼容 pytest-asyncio ≥ 1.0
+- 🛠️ **修复空中间正文**：跳过工具调用轮中仅空白的中间正文，避免发送空消息
 
 ### v0.2.1
 

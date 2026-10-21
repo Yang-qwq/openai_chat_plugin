@@ -13,6 +13,7 @@ openai = "*"
 pyyaml = "*"
 beautifulsoup4 = "*"
 markdownify = "*"
+httpx = "*"
 ncatbot = "==3.8.10.post5"
 
 [dev-packages]

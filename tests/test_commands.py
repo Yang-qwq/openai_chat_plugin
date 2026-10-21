@@ -10,7 +10,7 @@ import pytest
 from ncatbot.testing import PluginTestHarness
 from ncatbot.testing.factories.qq import group_message, private_message
 
-pytestmark = pytest.mark.asyncio(mode="strict")
+pytestmark = pytest.mark.asyncio
 
 PLUGINS_DIR = Path(__file__).resolve().parents[2]
 PLUGIN_NAME = "OpenAIChatPlugin"

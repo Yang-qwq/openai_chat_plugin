@@ -3,8 +3,11 @@
 
 运行：python -m pytest tests -v -o "addopts="
 """
+import json
+import sys
 from pathlib import Path
 
+import httpx
 import pytest
 from ncatbot.testing import PluginTestHarness, extract_text
 from ncatbot.testing.factories.qq import private_message
@@ -17,7 +20,7 @@ from fake_openai import (
     FakeToolCall,
 )
 
-pytestmark = pytest.mark.asyncio(mode="strict")
+pytestmark = pytest.mark.asyncio
 
 PLUGINS_DIR = Path(__file__).resolve().parents[2]
 PLUGIN_NAME = "OpenAIChatPlugin"
@@ -58,6 +61,21 @@ async def test_private_chat_reply_and_history(tmp_path, monkeypatch):
         session = plugin.data["data"]["user_conversations"][ROOT_QQ]
         roles = [m["role"] for m in session]
         assert roles == ["user", "assistant"]
+
+
+async def test_reply_strips_leading_and_trailing_whitespace(tmp_path, monkeypatch):
+    """模型正文首尾换行/空格在发送前被去除（日志中常见 "\\n\\n你好"）"""
+    monkeypatch.chdir(tmp_path)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        _configure(plugin, [FakeResponse(FakeChoice(FakeMessage("\n\n  你好！  \n"), "stop"))])
+
+        await h.inject(private_message("你好", user_id=ROOT_QQ))
+        await h.settle()
+
+        h.assert_api("send_private_msg").with_text("你好！")
+        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        assert session[-1] == {"role": "assistant", "content": "你好！"}
 
 
 async def test_tool_call_loop_with_system_time(tmp_path, monkeypatch):
@@ -165,6 +183,88 @@ async def test_memory_tool_blocked_when_disabled(tmp_path, monkeypatch):
         session = plugin.data["data"]["user_conversations"][ROOT_QQ]
         tool_entry = next(m for m in session if m["role"] == "tool")
         assert "AllowAccessMemory" in tool_entry["content"]
+
+
+async def test_web_tool_blocked_when_disabled(tmp_path, monkeypatch):
+    """AllowWebRequests=False 时 create_http_request 工具被拒绝并返回错误 payload"""
+    monkeypatch.chdir(tmp_path)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        plugin.config["EnableBuiltinFunctionCalling"] = True  # AllowWebRequests 默认保持关闭
+        client = _configure(plugin, [
+            FakeResponse(FakeChoice(FakeMessage(
+                content=None,
+                tool_calls=[FakeToolCall(
+                    "call_1", "create_http_request",
+                    '{"method": "GET", "url": "https://example.com", "content_format": "text"}',
+                )],
+            ), "tool_calls")),
+            FakeResponse(FakeChoice(FakeMessage(content="好的"), "stop")),
+        ])
+
+        await h.inject(private_message("帮我访问网页", user_id=ROOT_QQ))
+        await h.settle()
+
+        h.assert_api("send_private_msg").with_text("好的")
+        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        tool_entry = next(m for m in session if m["role"] == "tool")
+        assert "AllowWebRequests" in tool_entry["content"]
+        # 未启用时不应发起任何真实请求（fake 客户端只会收到两轮对话）
+        assert len(client.chat.completions.calls) == 2
+
+
+async def test_web_image_attached_as_vision_message(tmp_path, monkeypatch):
+    """create_http_request(image) 的图片通过 user 视觉消息附加，工具历史不含 base64"""
+    monkeypatch.chdir(tmp_path)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        plugin.config["EnableBuiltinFunctionCalling"] = True
+        plugin.config["AllowWebRequests"] = True
+
+        # 向插件 main 模块中实际使用的 tools 模块注入 MockTransport
+        main_module = sys.modules[plugin.__class__.__module__]
+        png = b"\x89PNG\r\n\x1a\n_fake_png_body"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=png, headers={"content-type": "image/png"})
+
+        monkeypatch.setattr(
+            main_module.tools, "_default_http_transport", httpx.MockTransport(handler))
+
+        client = _configure(plugin, [
+            FakeResponse(FakeChoice(FakeMessage(
+                content=None,
+                tool_calls=[FakeToolCall(
+                    "call_1", "create_http_request",
+                    '{"method": "GET", "url": "https://example.com/a.png", '
+                    '"content_format": "image"}',
+                )],
+            ), "tool_calls")),
+            FakeResponse(FakeChoice(FakeMessage(content="图片里是一只猫"), "stop")),
+        ])
+
+        await h.inject(private_message("看看这张图", user_id=ROOT_QQ))
+        await h.settle()
+
+        h.assert_api("send_private_msg").with_text("图片里是一只猫")
+
+        # 第二轮请求应携带图片（OpenAI vision 格式）
+        second_call_messages = client.chat.completions.calls[1]["messages"]
+        vision_messages = [
+            m for m in second_call_messages
+            if m["role"] == "user" and isinstance(m["content"], list)
+        ]
+        assert len(vision_messages) == 1
+        image_parts = [
+            part for part in vision_messages[0]["content"] if part["type"] == "image_url"
+        ]
+        assert image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
+
+        # 工具历史只保留摘要，不能把 base64 写进上下文
+        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        tool_entry = next(m for m in session if m["role"] == "tool")
+        assert "data:image" not in tool_entry["content"]
+        assert json.loads(tool_entry["content"])["data"]["type"] == "image"
 
 
 async def test_too_many_tool_calls_replies_error(tmp_path, monkeypatch):
