@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from ncatbot.testing import PluginTestHarness
 
-pytestmark = pytest.mark.asyncio(mode="strict")
+pytestmark = pytest.mark.asyncio
 
 # 插件根目录的上一级（仓库 plugins/ 目录，内含本插件 manifest.toml）
 PLUGINS_DIR = Path(__file__).resolve().parents[2]
@@ -27,7 +27,7 @@ def _harness() -> PluginTestHarness:
     )
 
 
-def test_manifest_matches_class_metadata():
+async def test_manifest_matches_class_metadata():
     """manifest.toml 可解析且与入口类元数据一致"""
     manifest = tomllib.loads((PLUGIN_DIR / "manifest.toml").read_text(encoding="utf-8"))
     assert manifest["name"] == PLUGIN_NAME

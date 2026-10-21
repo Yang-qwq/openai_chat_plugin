@@ -14,7 +14,7 @@ from ncatbot.testing.factories.qq import group_message
 
 from fake_openai import make_client
 
-pytestmark = pytest.mark.asyncio(mode="strict")
+pytestmark = pytest.mark.asyncio
 
 PLUGINS_DIR = Path(__file__).resolve().parents[2]
 OPENAI_PLUGIN = "OpenAIChatPlugin"

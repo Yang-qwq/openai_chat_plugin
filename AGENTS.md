@@ -15,7 +15,7 @@ OpenAIChatPlugin/
 ├── main.py              # 插件入口：init_defaults、RBAC 注册、消息处理、事件回调
 ├── command_handler.py   # 命令 Mixin：/chat、/chat-admin、/chatrbac + 三层权限校验
 ├── preset_manager.py   # 预设管理：Preset 类（config.yaml + prompt.md）
-├── tools.py             # Function Calling 工具定义与实现（记忆、环境、网络等）
+├── tools.py             # Function Calling 工具定义与实现（记忆、环境、HTTP 请求、图片视觉等）
 ├── update.py            # 数据迁移：4.x 工作区数据迁移、记忆格式升级
 ├── exceptions.py        # 自定义异常（TooManyToolCallsException）
 ├── requirements.txt     # 依赖：openai, pyyaml, beautifulsoup4, markdownify
@@ -197,10 +197,28 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 - 如果工具需要权限控制，添加 `self.get_config('AllowXxx')` 检查
 - 返回 JSON 字符串结果（查询类 API 返回 pydantic model 时经 `_to_jsonable()` 转换）
 
+## HTTP 请求与图片视觉
+
+`tools.create_http_request` 是唯一受 `AllowWebRequests` 控制的网络出口，只在
+`EnableBuiltinFunctionCalling` 开启时对模型可见：
+
+- `content_format`：`json` / `text` / `markdown` / `image`
+- 仅允许 `http/https`，方法白名单 `GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS`，
+  默认超时 15s（上限 60s），文本响应上限 2 MiB、图片上限 5 MiB
+- `data` 按 JSON 请求体发送；`headers` / `params` 可选；所有异常与非法参数
+  都转为 `status: error` payload，不会向上抛异常中断对话
+- `image` 模式返回 `_generate_vision_tool_payload()` 的 data URL；`main.py`
+  用 `extract_vision_payload()` 识别后：
+  1. 工具历史只写入 `_vision_summary_payload()`（不含 base64）
+  2. 等本轮所有 tool 消息追加完，再追加一条带 `image_url` 的 user 视觉消息
+- 测试用 `httpx.MockTransport` 注入：单测直接传 `transport=`，
+  插件链路测试 monkeypatch `tools._default_http_transport`；禁止真实网络请求
+
 ## 测试要求
 
 - 测试放 `tests/`，用 `ncatbot.testing.PluginTestHarness` + MockAdapter 离线驱动，
-  文件必须 `pytestmark = pytest.mark.asyncio(mode="strict")`
+  文件使用 `pytestmark = pytest.mark.asyncio`（pytest-asyncio ≥ 1.0 默认严格模式，
+  **不能再传 `mode="strict"`**，否则收集阶段直接报错）
 - **必须隔离真实数据**：每个用例 `monkeypatch.chdir(tmp_path)`（RBAC `data/rbac.json` 与插件 workspace 均为相对路径）；
   `conftest.py` 已设置 `NCATBOT_CONFIG_PATH` 指向 `tests/ncatbot_test_config.yaml`（root=123456），
   禁止触碰真实 `config.yaml` / `data/`
