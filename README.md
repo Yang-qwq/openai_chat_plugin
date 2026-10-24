@@ -17,6 +17,7 @@
 - 🔐 **权限体系**：RBAC 全局管理员 + 群主/群管理自动放行
 - 🌐 **网络请求**：AI 可抓取网页（HTML 自动转 Markdown）或调用 JSON API
 - 🖼️ **图片视觉**：AI 可获取图片 URL 并直接“看到”图片内容
+- 👁️ **用户图片识别**：用户发送的图片会被自动下载并交给视觉模型理解（可配置关闭）
 
 ## 📋 系统要求
 
@@ -163,12 +164,31 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 | `EnableBuiltinFunctionCalling` | boolean | False                     | 是否启用内置函数调用功能                           |
 | `AllowAccessMemory`            | boolean | False                     | 是否允许访问会话记忆（内置函数调用功能需要开启）   |
 | `AllowWebRequests`             | boolean | False                     | 是否允许AI进行网络请求（内置函数调用功能需要开启） |
+| `EnableImageRecognition`       | boolean | True                      | 是否识别用户消息中携带的图片并作为视觉输入交给模型（无需开启函数调用） |
 | `MaxRetriesTimes`              | integer | 15                        | 工具调用轮次的最大重试次数                         |
 | `MaxConversationCacheStoreAmount` | integer | 1000                    | 最大对话缓存存储数量                               |
 | `EnableGroupOwnerAutoAuth`     | boolean | True                      | 群主/群管理自动放行本群管理员命令                  |
 | `IsConfigured`                 | boolean | False                     | 插件是否已配置                                     |
 
 ## 🎯 高级功能
+
+### 用户图片识别
+
+默认开启（`EnableImageRecognition: true`）。当用户发送的消息中携带图片时，插件会
+自动识别并下载这些图片，将其作为 OpenAI 视觉输入（`image_url`）附加到对应对话，
+模型即可直接“看到”用户发的图。无需开启 `EnableBuiltinFunctionCalling`。
+
+- 群聊 / 私聊均支持；群聊仍受 `MustAtBot` 约束（需 @机器人）
+- 一条消息携带多张图片时，全部作为独立的视觉输入附加
+- 仅发图片不带文字时，文本部分自动补一句默认说明（如“用户发送了图片，请查看随附图片。”）
+- 文本部分仅取消息中的纯文字（不会把 `[CQ:image,...]` 等消息段标记交给模型）
+- 图片按文件头魔数校验类型，支持 PNG / JPEG / GIF / WEBP / BMP；
+  下载失败、格式不受支持或超过大小上限（5 MiB）的图片会被忽略，不影响文本部分的处理
+- 关闭：在全局 config.yaml 的 `plugin_configs.OpenAIChatPlugin` 中设置
+  `EnableImageRecognition: false`
+
+> 注意：图片识别默认开启即意味着插件会下载用户发送的图片。若不希望插件访问图片
+> 资源（例如仅纯文本对话、或处于受限网络环境），请将 `EnableImageRecognition` 置为 false。
 
 ### 网络请求与图片视觉
 
@@ -261,6 +281,7 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 
 ### 未发布
 
+- 👁️ **用户图片识别**：识别并下载用户消息中携带的图片，作为 `image_url` 视觉输入交给模型（群聊/私聊均支持，多图全部附加）；新增 `EnableImageRecognition` 配置开关（默认开启），支持 PNG/JPEG/GIF/WEBP/BMP，下载失败或格式不受支持时优雅降级为纯文本
 - 🌐 **网络请求工具**：新增 `create_http_request`，支持 text / markdown / json / image，受 `AllowWebRequests` 控制
 - 🖼️ **图片视觉**：获取的图片会作为 `image_url` 视觉消息附加到对话，可直接阅读图片内容
 - 🛡️ **请求防护**：方法/协议白名单、超时、响应大小限制，网络异常统一转为工具错误结果

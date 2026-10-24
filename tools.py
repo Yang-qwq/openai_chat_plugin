@@ -42,6 +42,7 @@ __all__ = [
     'access_memory',
     'create_http_request',
     'extract_vision_payload',
+    'fetch_image_data_url',
     'get_environment_info',
     'get_group_info',
     'get_stranger_info',
@@ -308,6 +309,108 @@ def _vision_summary_payload(vision: dict[str, Any]) -> str:
         'source': vision.get('source'),
     }
     return _generate_tool_payload('success', '已获取图片，将作为视觉输入附加到对话中', data)
+
+
+async def fetch_image_data_url(
+        source: str,
+        transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, Any] | None:
+    """下载图片并转为视觉输入所需的 data URL 信息。
+
+    用于把用户消息中携带的图片（``Image`` 消息段的 url/file）拉取为
+    OpenAI ``image_url`` 可用的 data URL。失败时返回 ``None``，不向上抛异常。
+
+    :param source: 图片地址（http/https URL 或本地文件路径）
+    :param transport: 可选的自定义 httpx transport（测试用）
+    :return: 含 ``data_url`` / ``mime_type`` / ``size`` 的 dict；无法识别/下载失败返回 None
+    """
+    if not isinstance(source, str):
+        return None
+    source = source.strip()
+    if not source:
+        return None
+
+    # 本地文件：直接读取字节（http/https 之外的来源一律按本地路径处理）
+    if not re.match(r'^https?://', source, re.IGNORECASE):
+        if not os.path.isfile(source):
+            _log.debug(f'图片本地文件不存在: {source}')
+            return None
+        try:
+            with open(source, 'rb') as f:
+                content = f.read(MAX_IMAGE_RESPONSE_BYTES + 1)
+        except OSError as e:
+            _log.warning(f'读取本地图片失败: {source}: {e}')
+            return None
+    else:
+        http_transport = transport if transport is not None else _default_http_transport
+        try:
+            async with httpx.AsyncClient(
+                    timeout=DEFAULT_HTTP_TIMEOUT, follow_redirects=True,
+                    transport=http_transport,
+            ) as client, client.stream('GET', source) as response:
+                if response.status_code >= 400:
+                    _log.warning(f'下载图片失败（状态码 {response.status_code}）: {source}')
+                    return None
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > MAX_IMAGE_RESPONSE_BYTES:
+                        _log.warning(f'图片超过大小限制（> {MAX_IMAGE_RESPONSE_BYTES} 字节），已中止读取: {source}')
+                        return None
+                    chunks.append(chunk)
+                content = b''.join(chunks)
+        except httpx.HTTPError as e:
+            _log.warning(f'下载图片失败: {source}: {e}')
+            return None
+        except Exception as e:
+            _log.error(f'下载图片出现未预期错误: {source}: {e}')
+            return None
+
+    if not content:
+        return None
+    if len(content) > MAX_IMAGE_RESPONSE_BYTES:
+        _log.warning(f'图片超过大小限制（{len(content)} > {MAX_IMAGE_RESPONSE_BYTES} 字节）: {source}')
+        return None
+
+    # 依据魔数推断 MIME 类型（不依赖扩展名 / Content-Type）
+    mime_type = _sniff_image_mime(content)
+    if mime_type is None:
+        _log.debug(f'无法识别图片类型（魔数不匹配）: {source}')
+        return None
+
+    encoded = base64.b64encode(content).decode('ascii')
+    return {
+        'type': 'image',
+        'mime_type': mime_type,
+        'size': len(content),
+        'source': source,
+        'data_url': f'data:{mime_type};base64,{encoded}',
+    }
+
+
+def _sniff_image_mime(content: bytes) -> str | None:
+    """按文件头魔数推断图片 MIME 类型；无法识别返回 None。
+
+    :param content: 图片原始字节
+    :return: MIME 类型（如 image/png）或 None
+    """
+    # PNG: 89 50 4E 47 0D 0A 1A 0A
+    if content.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    # JPEG: FF D8 FF
+    if content.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    # GIF: GIF87a / GIF89a
+    if content.startswith((b'GIF87a', b'GIF89a')):
+        return 'image/gif'
+    # WEBP: RIFF....WEBP（RIFF 于 0-3，WEBP 于 8-11）
+    if len(content) >= 12 and content.startswith(b'RIFF') and content[8:12] == b'WEBP':
+        return 'image/webp'
+    # BMP: BM
+    if content.startswith(b'BM'):
+        return 'image/bmp'
+    return None
 
 
 def access_memory(
