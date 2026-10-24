@@ -38,7 +38,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
     """
 
     name = 'OpenAIChatPlugin'  # 插件名（须与 manifest.toml 一致）
-    version = '0.2.2'  # 插件版本（须与 manifest.toml 一致）
+    version = '0.3.0'  # 插件版本（须与 manifest.toml 一致）
     author = 'Yang-qwq'
     description = 'OpenAI 对话插件：多预设管理、函数调用（Function Calling）、会话持久化'
 
@@ -59,6 +59,8 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             'AllowAccessMemory': False,
             # 是否允许AI进行网络请求（内置函数调用功能需要开启）
             'AllowWebRequests': False,
+            # 是否识别并下载用户消息中携带的图片，作为视觉输入交给模型（无需开启函数调用）
+            'EnableImageRecognition': True,
             # 启用内置函数调用功能时，模型调用工具后重新生成回复的最大重试次数
             'MaxRetriesTimes': 15,
             # 最大对话缓存存储数量，用于AI获取非唤醒时错过的上下文消息，超过该数量的最早消息将被丢弃
@@ -192,6 +194,32 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         return f'{event.sender.nickname}({event.sender.user_id}): {event.raw_message}' if self.get_config(
             'InsertUserdataAsPrefix') else event.raw_message
 
+    async def _extract_user_image_visions(self, event: MessageEvent) -> list[dict]:
+        """识别并下载用户消息中携带的图片，返回视觉输入信息列表。
+
+        遍历消息中的 Image 消息段，取其图片地址（``url`` 或 ``file``），经
+        ``tools.fetch_image_data_url`` 下载并校验为 OpenAI ``image_url`` 可用的
+        data URL。下载失败或非受支持格式的图片会被忽略，不影响文本部分的处理。
+
+        :param event: 消息事件
+        :return: 视觉信息 dict 列表（含 data_url / mime_type / size / source）；无图片时为 []
+        """
+        image_segments = event.message.filter_image()
+        if not image_segments:
+            return []
+        visions: list[dict] = []
+        for segment in image_segments:
+            source = segment.url or segment.file
+            if not source:
+                _log.debug('图片消息段缺少可下载地址，已忽略')
+                continue
+            vision = await tools.fetch_image_data_url(source)
+            if vision is None:
+                _log.warning(f'无法识别或下载用户发送的图片，已忽略: {source}')
+                continue
+            visions.append(vision)
+        return visions
+
     def _is_trpg_session_active(self, event: MessageEvent, is_group: bool) -> bool:
         """查询 NcatBotTRPG 是否在该会话中开团，用于避免 @机器人 时重复回复
 
@@ -275,8 +303,32 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             self.data['data'][conversation_dict][session_id] = default_preset.to_conversations()
             self._set_preset_name(conversation_dict, session_id, DEFAULT_PRESET_NAME)
 
+        # 识别用户消息中携带的图片（可配置关闭），作为视觉输入交给模型
+        user_vision_infos: list[dict] = []
+        if self.get_config('EnableImageRecognition'):
+            user_vision_infos = await self._extract_user_image_visions(event)
+
+        # 构建写入会话的用户消息内容：
+        # - 无图片：保持纯文本字符串（与旧行为一致）
+        # - 有图片：转为 OpenAI 多模态列表（文本段 + 一个或多个 image_url 段）
+        if user_vision_infos:
+            # 仅取纯文本段作为文本部分，避免把 [CQ:image,...] 等消息段标记塞给模型；
+            # 仅发图片无文字时给一句默认说明。
+            clean_text = event.message.text.strip()
+            text_part = clean_text or '用户发送了图片，请查看随附图片。'
+            if self.get_config('InsertUserdataAsPrefix'):
+                text_part = f'{event.sender.nickname}({event.sender.user_id}): {text_part}'
+            user_content: str | list[dict] = [{'type': 'text', 'text': text_part}]
+            for vision in user_vision_infos:
+                user_content.append({'type': 'image_url', 'image_url': {'url': vision['data_url']}})
+            _log.info(
+                f'[{"群组" if is_group else "用户"} {session_id}] 识别到 {len(user_vision_infos)} 张用户图片，'
+                f'将作为视觉输入附加到对话')
+        else:
+            user_content = user_message
+
         # 添加用户消息到会话
-        self.data['data'][conversation_dict][session_id].append({'role': 'user', 'content': user_message})
+        self.data['data'][conversation_dict][session_id].append({'role': 'user', 'content': user_content})
         _log.info(
             f'[{"群组" if is_group else "用户"} {session_id}] 用户输入: '
             f'{user_message[:OMITTED_TEXT_LENGTH]}{"..." if len(user_message) > OMITTED_TEXT_LENGTH else ""}')

@@ -51,6 +51,7 @@ flowchart LR
     subgraph In["消息流入"]
         MQ[群/私聊消息]-->Entry["main.py<br/>on_group_message / on_private_message<br/>（跳过 / 命令，群聊记录历史）"]
         Entry-->Handle["_handle_message()"]
+        Handle-->|"识别用户图片<br/>EnableImageRecognition"|Imgs["tools.fetch_image_data_url()<br/>下载 → data URL 视觉信息"]
         Handle-->|"普通消息"|AI["OpenAI API<br/>chat.completions.create"]
         AI-->|"tool_calls?"|Tools["tools.py<br/>执行工具 → 结果追加 → 重试"]
         AI-->|"stop"|Reply["event.reply(text, at_sender=False)<br/>回复消息"]
@@ -99,6 +100,7 @@ classDiagram
         +on_private_message(event) [@qq.on_private_message]
         -_record_group_history(event)
         -_handle_message(event)
+        -_extract_user_image_visions(event) list[dict]
         -_assistant_message_to_history_dict(assistant_message) dict
     }
 
@@ -157,6 +159,7 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 | `EnableBuiltinFunctionCalling` | bool | false | 启用内置函数调用 |
 | `AllowAccessMemory` | bool | false | 允许 AI 访问记忆（需启用函数调用） |
 | `AllowWebRequests` | bool | false | 允许 AI 网络请求（需启用函数调用） |
+| `EnableImageRecognition` | bool | true | 识别并下载用户消息中的图片作为视觉输入（无需函数调用） |
 | `MaxRetriesTimes` | int | 15 | 工具调用最大重试次数 |
 | `MaxConversationCacheStoreAmount` | int | 1000 | 最大对话缓存存储数量 |
 | `IsConfigured` | bool | false | 插件是否已配置 |
@@ -213,6 +216,26 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
   2. 等本轮所有 tool 消息追加完，再追加一条带 `image_url` 的 user 视觉消息
 - 测试用 `httpx.MockTransport` 注入：单测直接传 `transport=`，
   插件链路测试 monkeypatch `tools._default_http_transport`；禁止真实网络请求
+
+## 用户图片识别（视觉输入）
+
+`EnableImageRecognition`（默认 true）开启时，`_handle_message()` 在处理用户消息前
+调用 `_extract_user_image_visions(event)` 识别用户发送的图片：
+
+- 遍历 `event.message.filter_image()`，取每个图片段的 `url`（优先）或 `file` 作为来源
+- 经 `tools.fetch_image_data_url(source)` 下载并校验：
+  - 来源可为 http/https URL 或本地文件路径；本地文件直接读字节
+  - 按文件头**魔数**推断 MIME（`_sniff_image_mime`），支持 PNG / JPEG / GIF / WEBP / BMP；
+    不依赖扩展名 / Content-Type，非受支持格式返回 None
+  - 流式读取，超过 5 MiB（`MAX_IMAGE_RESPONSE_BYTES`）中止；任何异常均返回 None，不向上抛
+- 返回的视觉信息用于把用户消息内容从纯文本字符串升级为 **OpenAI 多模态 list**
+  （`[{'type':'text',...}, {'type':'image_url','image_url':{'url':data_url}}, ...]`），
+  多张图片全部附加；仅发图片无文字时文本部分补默认说明
+- 文本部分取 `event.message.text`（纯文字，避免把 `[CQ:image,...]` 段标记交给模型）
+- 识别关闭或图片下载失败时，用户消息保持纯文本字符串，行为与旧版一致
+- 测试见 `tests/test_image_vision.py`（`fetch_image_data_url`/`_sniff_image_mime` 单测
+  用 `httpx.MockTransport`，对话链路用 `FakeOpenAIClient` + monkeypatch
+  `tools._default_http_transport`），覆盖私聊/群聊 @、多图、关闭、下载失败降级
 
 ## 测试要求
 
