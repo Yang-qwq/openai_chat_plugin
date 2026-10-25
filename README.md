@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.4.1-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -138,9 +138,18 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 /chat-admin update-prompt group:1919810
 /chat-admin update-prompt user:114514
 
+# 查看 / 删除 / 暂停 / 恢复 AI 定时任务
+/chat-admin task list
+/chat-admin task delete daily
+/chat-admin task pause
+/chat-admin task resume
+
 # 显示帮助信息
 /chat-admin help
 ```
+
+> `task` 子命令涉及全局资源（查看他人任务、跨会话删除、全局暂停），仅限**全局管理员**
+> （机器人 owner 或 `/chatrbac` 授权）使用，群主/群管理不可调用。
 
 #### 全局管理员管理命令
 
@@ -178,6 +187,7 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 | `GroupRandomReplyChance`       | number  | 0.02                      | 群聊随机插话概率（0~1），命中后仍由模型决定是否发言 |
 | `ReplaceSystemAsUser`          | boolean | False                     | 把随机插话等临时 system 提示降级为 user，兼容只接受单个 system 的供应商（如智谱 GLM） |
 | `AllowScheduledTasks`          | boolean | False                     | 是否允许 AI 创建/管理定时任务（内置函数调用功能需要开启） |
+| `EnableScheduledTaskExecution` | boolean | True                      | 定时任务执行总开关（kill switch）；关闭后不注册/不执行，记录保留 |
 | `MaxRetriesTimes`              | integer | 15                        | 工具调用轮次的最大重试次数                         |
 | `MaxConversationCacheStoreAmount` | integer | 1000                    | 最大对话缓存存储数量                               |
 | `EnableGroupOwnerAutoAuth`     | boolean | True                      | 群主/群管理自动放行本群管理员命令                  |
@@ -267,16 +277,36 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 
 | action | 说明 |
 |--------|------|
-| `add` | 创建任务，需要 `task_name`、`interval`、`prompt` |
-| `delete` | 删除任务，需要 `task_name` |
-| `list` | 查看本会话的任务与下次执行时间 |
+| `add` | 创建任务（投递到当前会话），需要 `task_name`、`interval`、`prompt` |
+| `delete` | 删除任务，需要 `task_name`；只能删除**当前会话**创建的任务 |
+| `list` | 查看所有会话的任务与下次执行时间 |
 
-- 到点后插件用**当前会话预设** + `prompt` 调一次模型，把生成的回复投递回创建者所在会话
-  （模型无法指定其他群/私聊，避免越权骚扰）
+- 到点后插件用「主会话历史 + 一条内部消息 `[定时任务 <name>] <prompt>`」执行一次完整对话轮次
+  （**支持工具调用**，与普通聊天共用 `EnableBuiltinFunctionCalling` 与各 `AllowXxx` 开关），
+  再把生成的内容投递回创建者会话（模型无法指定其他群/私聊，避免越权骚扰）
+- 投递成功后，整轮消息（内部消息、工具调用轮次、最终 assistant 回复）会一起写入主会话历史；
+  生成或投递失败则整轮不落库，不会在历史里留下半截对话
+- 工具调用前的中间正文也会投递到会话（与普通聊天一致）；任务记录会保存 `creator_id`，
+  供记忆/环境工具识别来源
+- 定时轮与普通聊天共用会话级锁，同一会话的轮次串行执行，避免消息顺序错乱
 - `interval` 支持 `30s`、`2h30m`、`0.5d`、`HH:MM`（每日）、`YYYY-MM-DD HH:MM:SS`（一次性）
-- 任务记录保存在 `data.json` 的 `scheduled_tasks`，重启后自动重新注册
+- **最小间隔写死 60 秒**：间隔任务不足 60 秒会被拒绝，一次性任务也必须距离当前时间不少于
+  60 秒（避免 `0.5s` 之类的高频任务刷屏/耗尽额度）
+- 任务**不做会话隔离**：`list` 能看到其他会话的任务（含目标会话 ID 与提示词），但 `add`
+  只能创建到当前会话、`delete` 只能删除本会话创建的任务，跨会话删除会返回错误
+- 任务记录保存在 `data.json` 的 `scheduled_tasks`，重启后自动重新注册；interval 小于 60 秒
+  的历史记录不会被注册（记录保留，可通过删除清理）
 - 任务名仅允许字母/数字/下划线/连字符（1~32 字符）；同一插件内不可重名
-- 定时任务生成的内容不写入会话历史，避免污染日常对话
+- 连续执行失败 5 次后自动停用（移出调度器并在记录里标记 `disabled`，重启不再注册），
+  避免机器人被踢出群、密钥失效等永久性错误按原间隔无限重试
+- 一次性任务执行后自动清理记录，不会在列表中残留
+- 运维命令（走 `/chat-admin` 三层权限校验）：
+  - `/chat-admin task list`：查看全部任务（所属会话、状态、连续失败次数、下次执行时间）
+  - `/chat-admin task delete <name>`：删除任意任务（可跨会话清理）
+  - `/chat-admin task pause` / `resume`：暂停/恢复执行总开关 `EnableScheduledTaskExecution`，
+    暂停时任务记录保留，恢复后重新注册未停用的任务
+- 同步 OpenAI 请求通过线程池（`asyncio.to_thread`）执行，单请求默认超时 60 秒、重试 1 次，
+  定时任务不会阻塞事件循环
 
 ### 多配置文件支持
 
@@ -335,6 +365,14 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.4.1
+
+- 🛠️ **定时任务重构**：执行轮支持工具调用并写入主会话历史，投递成功才落库；定时轮与普通聊天共用会话级锁，避免消息交错
+- 🔐 **运维命令**：新增 `/chat-admin task list|delete|pause|resume`；`task` 涉及跨会话/全局资源，仅全局管理员可用（防群主提权）
+- ⚙️ **执行总开关**：新增 `EnableScheduledTaskExecution`（默认开启），关闭后不注册/不执行、记录保留
+- 🛡️ **失败保护**：最小调度间隔写死 60 秒；连续失败 5 次自动停用并移出调度器；一次性任务执行后清理记录
+- 🛠️ **稳定性**：OpenAI 请求改在线程池执行避免阻塞事件循环，并收紧单请求超时（60 秒）与重试次数
 
 ### v0.4.0
 

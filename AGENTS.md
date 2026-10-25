@@ -101,6 +101,13 @@ classDiagram
         +on_private_message(event) [@qq.on_private_message]
         -_record_group_history(event)
         -_handle_message(event)
+        -_handle_message_turn(event)
+        -_session_key(event) tuple
+        -_get_session_lock(conversation_dict, session_id) Lock
+        -_ensure_session(conversation_dict, session_id) list
+        -_run_scheduled_task_turn(session_type, session_id, task_name, prompt, creator_id) str
+        -_generate_reply(working, ...) str|None
+        -_post_session_text(session_id, is_group, text)
         -_extract_user_image_visions(event) list[dict]
         -_assistant_message_to_history_dict(assistant_message) dict
     }
@@ -133,6 +140,9 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 | `/chat-admin set-preset <name> [group:\|user:<id>]` | 三层校验 | 跨群/用户设置预设 |
 | `/chat-admin reset [group:\|user:<id>]` | 三层校验 | 跨群/用户重置会话 |
 | `/chat-admin update-prompt [target\|all]` | 三层校验 | 重载 system 提示词（保留历史） |
+| `/chat-admin task list` | **仅全局管理员** | 查看全部定时任务（含状态/失败次数/下次执行） |
+| `/chat-admin task delete <name>` | **仅全局管理员** | 删除任意定时任务（可跨会话清理） |
+| `/chat-admin task pause` / `resume` | **仅全局管理员** | 暂停/恢复定时任务执行（kill switch） |
 | `/chatrbac grant\|revoke\|list <qq>` | **仅全局管理员** | 管理 RBAC 全局管理员 |
 
 ## 权限体系（三层）
@@ -147,7 +157,8 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
    - 受 `EnableGroupOwnerAutoAuth` 开关控制（默认开）
 3. **默认拒绝** — RBAC 服务不可用一律拒绝（fail-closed）
 
-`/chat-admin` 全部子命令走 `_check_admin()`（RBAC 或本群群管理）；`/chatrbac` 只走 `_check_global_admin()`（严格 RBAC，防群主提权）。
+`/chat-admin` 的子命令默认走 `_check_admin()`（RBAC 或本群群管理）；但 `task` 子命令
+涉及跨会话/全局资源，额外要求 `_check_global_admin()`。`/chatrbac` 只走 `_check_global_admin()`（严格 RBAC，防群主提权）。
 
 ## 配置项
 
@@ -167,6 +178,7 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 | `GroupRandomReplyChance` | float | 0.02 | 随机插话概率（0~1），命中后仍由模型决定是否发言 |
 | `ReplaceSystemAsUser` | bool | false | 把随机插话的临时 system 提示降级为 user（兼容 GLM 单 system） |
 | `AllowScheduledTasks` | bool | false | 允许 AI 创建/管理定时任务（需启用函数调用） |
+| `EnableScheduledTaskExecution` | bool | true | 定时任务执行总开关（kill switch），关闭后不注册/不执行 |
 | `MaxRetriesTimes` | int | 15 | 工具调用最大重试次数 |
 | `MaxConversationCacheStoreAmount` | int | 1000 | 最大对话缓存存储数量 |
 | `IsConfigured` | bool | false | 插件是否已配置 |
@@ -180,7 +192,8 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 - 会话数据存储在 `self.data['data']`（四个会话子字典：group/user_conversations、group/user_preset_names），
   由 DataMixin 自动持久化到 `<workspace>/data.json`；中途保存用 `self._save_data()`
 - 另有 `group_nolisten`（群级随机插话开关，group_id -> bool）与 `scheduled_tasks`
-  （AI 定时任务记录，task_name -> {interval, prompt, session_type, session_id, created_at}），
+  （AI 定时任务记录，task_name -> {interval, prompt, session_type, session_id, creator_id,
+  created_at, failures, disabled, disabled_reason}），
   均由 `on_load()` 幂等 `setdefault` 补齐，无需迁移函数
 - v5 事件中 `event.group_id` / `event.user_id` / `event.self_id` 均为 **str**，会话字典键统一为字符串
 
@@ -207,8 +220,8 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 
 - 遵循 OpenAI Function Calling 格式（`type: "function"`, `function.name`, `function.description`, `function.parameters`）
 - 在 `_handle_message()` 的工具分派 `if-elif` 链中添加对应的调用分支
-- 如果工具需要权限控制，添加 `self.get_config('AllowXxx')` 检查，并在
-  `tools.get_available_tools()` 中按开关过滤 schema（双保险，参考定时任务工具）
+- 如果工具需要权限控制，添加 `self.get_config('AllowXxx')` 检查并在分派链返回带提示的
+  error payload；**不要**再按开关过滤 schema（工具始终对模型可见，关闭时由调用结果告知不可用）
 - 需要会话上下文的工具（如投递目标）应由分派链注入 `session_type`/`session_id`，
   不要放进 schema 让模型自由指定
 - 返回 JSON 字符串结果（查询类 API 返回 pydantic model 时经 `_to_jsonable()` 转换）
@@ -288,21 +301,56 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 
 受 `EnableBuiltinFunctionCalling` + `AllowScheduledTasks`（默认关）双重控制：
 
-- 工具 schema 仅在开关开启时通过 `tools.get_available_tools(allow_scheduled_tasks=...)` 暴露；
-  分派链里仍有二次校验（`AllowScheduledTasks` 未开 → error payload）
+- 工具 schema **始终完整暴露**（`tools.tools`，不按开关过滤），让模型知道能力存在；
+  分派链里校验各 `AllowXxx` 开关，关闭时返回带提示的 error payload（如
+  "`AllowScheduledTasks` 配置未启用，当前无法管理定时任务…"）
 - 目标锁定：schema 只有 `action/task_name/interval/prompt`，`session_type`/`session_id`
-  由 `_handle_message` 按当前事件注入，模型无法指定其他群/私聊
+  由 `_handle_message_turn` 按当前事件注入，模型无法指定其他群/私聊
 - 任务名：`^[A-Za-z0-9_\-]{1,32}$`；框架任务名为 `OpenAIChatPlugin:<task_name>`
   （框架任务名全局唯一、`remove_scheduled_task` 也按名删除，前缀避免误删其他插件任务）
+- 最小间隔：`MIN_SCHEDULED_INTERVAL_SECONDS = 60` **写死**（非配置项）。
+  `validate_schedule_interval()` 复用框架 `TimeTaskParser` 解析（保证"插件放行 = 框架可注册"），
+  interval 任务 `< 60s`、一次性任务距当前 `< 60s` 一律拒绝，每日 `HH:MM` 直接放行；
+  框架解析器只支持单一单位（`2h` / `30m`），`2h30m` 这类复合单位由
+  `_normalize_schedule_interval()` 累加换算成 `9000s` 后再交给框架；
+  校验在 `register_scheduled_task()` 内，**工具创建与启动恢复共用同一道闸**
+- 不做会话隔离：`list` 返回所有会话的任务（含 `session_id` / `prompt`，可查看）；
+  `add` 的目标由插件注入只能是当前会话；`delete` 会校验记录的
+  `session_type` + `session_id` 与请求会话一致，跨会话删除返回 error
 - `register_scheduled_task()` 工具创建与启动恢复共用；框架以**返回值**表示成功/失败，
   必须检查，失败不得写入 `data.json`
 - 记录落在 `data['data']['scheduled_tasks']`，`on_load()` 末尾 `_restore_scheduled_tasks()`
-  重新注册；恢复不受 `AllowScheduledTasks` 影响（开关只限制模型管理权限）
-- 回调 `_cron_task_callback()`：`plugin._build_task_messages()`（会话预设 system + prompt）→
-  调模型（无工具）→ `plugin._clean_content()` → `api.qq.post_group_msg/post_private_msg`；
-  空内容不投递；全程 try/except 只记日志（回调跑在调度线程，抛出会阻塞调度）
-- 定时任务结果**不写入**会话历史
-- 测试见 `tests/test_cron_tools.py`（工具可见性/增删查/失败分支/投递/恢复/分派拦截）
+  重新注册；恢复不受 `AllowScheduledTasks` 影响（开关只限制模型管理权限），
+  但 `< 60s` 的旧记录与 `disabled` 记录会被跳过（记录保留）
+- 回调 `_cron_task_callback()` 只负责执行开关、失败计数与清理；实际轮次由
+  `plugin._run_scheduled_task_turn()` 完成：
+  主会话历史 + 内部消息 `[定时任务 <name>] <prompt>` → `_generate_reply()` 完整对话轮次
+  （**支持工具调用**：受 `EnableBuiltinFunctionCalling` 与各 `AllowXxx` 开关控制，
+  `asyncio.to_thread` 执行请求避免阻塞事件循环）→ `api.qq.post_group_msg/post_private_msg` →
+  **投递成功后**才把整轮消息（内部消息、assistant(tool_calls)、tool、最终回复）写入
+  主会话历史并 `_save_data()`（失败整轮不落库，不污染上下文）
+- 工具调用的中间正文（与 tool_calls 同时返回的 content）同样投递到会话，与普通聊天一致；
+  定时轮没有消息事件时，`get_environment_info` 用创建者/会话信息合成结果
+- 任务记录包含 `creator_id`（创建时由 `event.user_id` 注入），供定时轮的
+  `access_memory` / `get_environment_info` 识别来源；旧记录缺失时按未知处理
+- 通用对话轮次 `_generate_reply()` 同时服务普通聊天与定时任务：普通聊天传入主会话列表，
+  定时任务传入"历史副本 + 内部消息"，工具轮次只写副本，成功后才提交
+- 会话级锁：`_handle_message()` 拆成"外层过滤 + 按会话加锁"再调用
+  `_handle_message_turn()`；`_run_scheduled_task_turn()` 使用同一把
+  `_session_locks[(conversation_dict, session_id)]`，保证普通聊天与定时轮次串行、
+  历史顺序一致
+- 失败与停用：记录的 `failures` 连续失败 +1，成功清零；达到
+  `MAX_TASK_CONSECUTIVE_FAILURES = 5` 时标记 `disabled` + `disabled_reason`
+  并移出调度器（不再按原间隔无限重试）；一次性任务执行后（无论成败）清理记录
+- 执行总开关 `EnableScheduledTaskExecution`（默认开）：关闭时不注册/不执行、
+  `manage_cron_tasks` 的 add 直接返回 error；运维命令
+  `/chat-admin task list|delete|pause|resume` 走 `_check_global_admin()`，
+  其中 `delete` 可跨会话清理、`pause` 会移出调度器并持久化开关、`resume` 重新注册
+- 定时任务的内部消息与回复**会写入主会话历史**（与普通聊天共用上下文）
+- 测试见 `tests/test_cron_tools.py`（工具可见性/增删查/失败分支/投递/恢复/分派拦截/
+  最小间隔/跨会话删除/失败自动停用/一次性清理/暂停与恢复/事件循环不被阻塞/
+  主会话历史写入与请求复现/失败不污染历史/同会话串行/定时轮工具循环与工具失败回滚）；
+  `tests/test_gating.py` 覆盖"未启用函数调用时请求不带 tools/tool_choice"
 
 ## 测试要求
 

@@ -35,16 +35,17 @@ import httpx
 import markdownify
 from ncatbot.api.qq import QQAPIClient
 from ncatbot.event.qq import GroupMessageEvent, MessageEvent
+from ncatbot.service.builtin.schedule.parser import TimeTaskParser
 from ncatbot.utils.logger import get_log
 
 __all__ = [
+    'MIN_SCHEDULED_INTERVAL_SECONDS',
     '_generate_tool_payload',
     '_generate_vision_tool_payload',
     'access_memory',
     'create_http_request',
     'extract_vision_payload',
     'fetch_image_data_url',
-    'get_available_tools',
     'get_environment_info',
     'get_group_info',
     'get_stranger_info',
@@ -53,6 +54,7 @@ __all__ = [
     'query_missing_message_context',
     'register_scheduled_task',
     'tools',
+    'validate_schedule_interval',
 ]
 
 _log = get_log('openai_chat_plugin.tools')
@@ -80,6 +82,12 @@ SCHEDULED_TASK_TOOL_NAME = 'manage_cron_tasks'
 SCHEDULED_TASK_PREFIX = 'OpenAIChatPlugin:'
 # 任务名允许的字符与长度（同时作为持久化字典的键）
 _TASK_NAME_RE = re.compile(r'^[A-Za-z0-9_\-]{1,32}$')
+# 最小调度间隔（秒）。写死的下限，防止模型/用户创建高频任务刷屏或耗尽额度；
+# 一次性任务同样要求距离当前时间不少于该秒数
+MIN_SCHEDULED_INTERVAL_SECONDS = 60
+# 连续执行失败达到该次数后自动停用任务，避免永久性错误（被踢出群、密钥失效等）
+# 按原间隔无限重试并刷日志
+MAX_TASK_CONSECUTIVE_FAILURES = 5
 
 tools = [
     {
@@ -229,9 +237,10 @@ tools = [
         'type': 'function',
         'function': {
             'name': SCHEDULED_TASK_TOOL_NAME,
-            'description': 'Manage scheduled tasks of this chat session. '
-                           'A task periodically asks the model with the given prompt, '
-                           'then sends the generated reply back to the current session only. '
+            'description': 'Manage scheduled tasks. New tasks always deliver their '
+                           'generated reply back to the current chat session only. '
+                           'Tasks created in any session are visible via action="list", '
+                           'but only tasks created in the current session can be deleted. '
                            'Use action="add" to create, "delete" to remove, "list" to view tasks.',
             'parameters': {
                 'type': 'object',
@@ -249,7 +258,9 @@ tools = [
                     'interval': {
                         'type': 'string',
                         'description': "When to run, e.g. '30s', '2h30m', '0.5d', 'HH:MM' (daily) "
-                                       "or 'YYYY-MM-DD HH:MM:SS' (one-shot). Required for add."
+                                       "or 'YYYY-MM-DD HH:MM:SS' (one-shot). Required for add. "
+                                       "Minimum interval is 60 seconds; a one-shot time must be at "
+                                       "least 60 seconds in the future."
                     },
                     'prompt': {
                         'type': 'string',
@@ -868,20 +879,6 @@ async def create_http_request(
         return _generate_tool_payload('error', f'请求出现未预期错误: {e}')
 
 
-def get_available_tools(*, allow_scheduled_tasks: bool) -> list[dict]:
-    """返回当前配置下暴露给模型的工具列表。
-
-    定时任务工具默认不对模型可见，只有显式开启 ``AllowScheduledTasks`` 时才加入。
-
-    :param allow_scheduled_tasks: 是否允许模型管理定时任务
-    :return: 工具 schema 列表
-    """
-    if allow_scheduled_tasks:
-        return list(tools)
-    return [tool for tool in tools
-            if tool['function']['name'] != SCHEDULED_TASK_TOOL_NAME]
-
-
 # ======================================================================
 # 四、定时任务工具
 # ======================================================================
@@ -891,46 +888,165 @@ def _scheduled_task_key(task_name: str) -> str:
     return f'{SCHEDULED_TASK_PREFIX}{task_name}'
 
 
+_INTERVAL_UNIT_SECONDS = {'d': 86400, 'h': 3600, 'm': 60, 's': 1}
+# 一次性任务的时间格式（框架支持两种写法）。注意：任务触发时该时间已过，
+# `TimeTaskParser` 会判定为"过期"而解析失败，因此这里用格式判断而不是重新解析
+_ONCE_INTERVAL_RE = re.compile(
+    r'^(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|\d{4}:\d{2}:\d{2}-\d{2}:\d{2}:\d{2})$')
+# 复合单位（如 2h30m）的正则：框架解析器只支持单一单位（2h / 30m），
+# 这里把多段单位累加后统一换算成秒再交给框架
+_INTERVAL_PART_RE = re.compile(r'(\d+(?:\.\d+)?)([dhms])', re.IGNORECASE)
+_COMPOSITE_INTERVAL_RE = re.compile(r'(?:\d+(?:\.\d+)?[dhms])+', re.IGNORECASE)
+
+
+def _normalize_schedule_interval(interval: Any) -> tuple[str, dict] | None:
+    """解析 interval，并返回可直接交给框架的规范化结果。
+
+    优先复用框架的 ``TimeTaskParser``（保证语义一致）；框架只支持单一单位，
+    因此 ``2h30m`` 这类复合单位由插件自行累加换算成秒（``9000s``）。
+
+    :param interval: 调度时间参数（字符串或数字）
+    :return: ``(交给框架的 interval, 解析结果)``；无法解析时返回 None
+    """
+    text = str(interval)
+    try:
+        return text, TimeTaskParser.parse(text)
+    except (TypeError, ValueError):
+        pass
+
+    if _COMPOSITE_INTERVAL_RE.fullmatch(text):
+        total = sum(float(num) * _INTERVAL_UNIT_SECONDS[unit.lower()]
+                    for num, unit in _INTERVAL_PART_RE.findall(text))
+        if total > 0:
+            return f'{int(total)}s', {'type': 'interval', 'value': total}
+    return None
+
+
+def _resolve_schedule_interval(interval: Any) -> tuple[str | None, str | None]:
+    """解析并校验调度时间参数。
+
+    :param interval: 调度时间参数（字符串或数字）
+    :return: ``(交给框架的 interval, 错误文案)``，合法时错误文案为 None
+    """
+    parsed = _normalize_schedule_interval(interval)
+    if parsed is None:
+        return None, (f'interval 格式非法或一次性时间已过期: {interval}，支持 '
+                      f'30s / 2h30m / 0.5d / HH:MM / YYYY-MM-DD HH:MM:SS')
+    normalized, config = parsed
+    if config['type'] == 'daily':
+        return normalized, None
+    # 'interval' 的 value 是间隔秒数，'once' 的 value 是距离当前的秒数
+    seconds = float(config['value'])
+    if seconds < MIN_SCHEDULED_INTERVAL_SECONDS:
+        return None, (f'interval 不能小于 {MIN_SCHEDULED_INTERVAL_SECONDS} 秒'
+                      f'（当前约 {int(seconds)} 秒）')
+    return normalized, None
+
+
+def validate_schedule_interval(interval: Any) -> str | None:
+    """校验调度时间参数是否满足最小间隔要求。
+
+    解析失败、一次性任务时间已过期、间隔小于 ``MIN_SCHEDULED_INTERVAL_SECONDS``
+    都视为非法；每日任务（``HH:MM``）天然大于下限，直接放行。
+
+    :param interval: 调度时间参数（字符串或数字）
+    :return: 错误文案；合法时返回 None
+    """
+    return _resolve_schedule_interval(interval)[1]
+
+
 def register_scheduled_task(plugin, task_name: str, interval: str, prompt: str,
                             session_type: str, session_id: str) -> bool:
     """向框架注册一个定时任务（工具创建与启动恢复共用）。
 
+    注册前统一做最小间隔校验，因此工具创建与重启恢复走同一道闸；
+    历史记录中不合规的 interval 不会注册到调度器。
+
     :param plugin: 插件实例（需具备 add_scheduled_task）
     :param task_name: 任务名（不含插件前缀）
-    :param interval: 调度时间参数，交给框架解析
+    :param interval: 调度时间参数（复合单位会被规范化后交给框架）
     :param prompt: 每次执行时发给模型的提示
     :param session_type: 'group' 或 'private'
     :param session_id: 投递目标会话 ID
     :return: 是否注册成功（框架以返回值而非异常表示失败）
     """
+    normalized, error = _resolve_schedule_interval(interval)
+    if error:
+        _log.warning(f'定时任务 {task_name} 注册失败: {error}')
+        return False
     return plugin.add_scheduled_task(
         _scheduled_task_key(task_name),
-        interval,
+        normalized,
         callback=partial(
             _cron_task_callback, plugin, task_name, prompt, session_type, session_id),
     )
 
 
-def _build_task_messages(plugin, session_type: str, session_id: str, prompt: str) -> list[dict]:
-    """构造定时任务的请求消息（优先复用插件侧的预设装配逻辑）。
+def _task_records(plugin) -> dict:
+    """读取定时任务记录字典（缺失时补建，保持与其他会话数据结构一致）。"""
+    return plugin.data.setdefault('data', {}).setdefault('scheduled_tasks', {})
 
-    :param plugin: 插件实例
-    :param session_type: 'group' 或 'private'
-    :param session_id: 会话 ID
-    :param prompt: 任务提示
-    :return: OpenAI 消息列表
+
+def _get_task_record(plugin, task_name: str) -> dict | None:
+    """读取单个任务记录，非 dict（损坏）时返回 None。"""
+    record = _task_records(plugin).get(task_name)
+    return record if isinstance(record, dict) else None
+
+
+def _is_once_task(record: dict) -> bool:
+    """判断记录是否为一次性任务（``YYYY-MM-DD HH:MM:SS``）。
+
+    任务触发时目标时间已过，``TimeTaskParser`` 会判定为过期而解析失败，
+    因此这里只按格式判断，避免执行后无法识别、记录清理不掉。
     """
-    builder = getattr(plugin, '_build_task_messages', None)
-    if callable(builder):
-        return builder(session_type, session_id, prompt)
-    return [{'role': 'user', 'content': prompt}]
+    return bool(_ONCE_INTERVAL_RE.match(str(record.get('interval', '')).strip()))
+
+
+def _drop_task_record(plugin, task_name: str) -> None:
+    """删除任务记录并持久化（记录不存在时不写盘）。"""
+    if _task_records(plugin).pop(task_name, None) is None:
+        return
+    plugin._save_data()
+
+
+def _record_task_success(plugin, task_name: str) -> None:
+    """执行成功：清零连续失败计数（仅有失败历史时才写盘）。"""
+    record = _get_task_record(plugin, task_name)
+    if not record or not record.get('failures'):
+        return
+    record['failures'] = 0
+    plugin._save_data()
+
+
+def _record_task_failure(plugin, task_name: str, reason: str) -> None:
+    """执行失败：累计连续失败次数，达到上限后自动停用并移出调度器。"""
+    record = _get_task_record(plugin, task_name)
+    if record is None:
+        return
+    failures = int(record.get('failures', 0) or 0) + 1
+    record['failures'] = failures
+    if failures >= MAX_TASK_CONSECUTIVE_FAILURES and not record.get('disabled'):
+        record['disabled'] = True
+        record['disabled_reason'] = reason
+        plugin.remove_scheduled_task(_scheduled_task_key(task_name))
+        _log.error(
+            f'定时任务 {task_name} 连续失败 {failures} 次，已自动停用: {reason}')
+    plugin._save_data()
 
 
 async def _cron_task_callback(plugin, task_name: str, prompt: str,
                               session_type: str, session_id: str) -> None:
-    """定时任务触发：用会话预设生成回复并投递到创建者会话。
+    """定时任务触发：把内部消息写入主会话历史并投递模型生成的回复。
 
-    任何异常都只记录日志、不向上抛（回调运行在调度线程，抛出会阻塞调度）。
+    实际的一轮对话由 ``plugin._run_scheduled_task_turn()`` 完成（共用会话历史、
+    按会话加锁、不带工具、成功才落库）。这里只负责执行开关、失败计数与清理。
+
+    任何异常都只记录日志、不向上抛（回调运行在框架 worker 线程，
+    异常会被 ``TaskExecutor`` 捕获并记录，不会影响调度线程）。
+
+    失败会累计到记录的 ``failures`` 字段，连续失败达到
+    ``MAX_TASK_CONSECUTIVE_FAILURES`` 次后自动停用；一次性任务执行后
+    无论成功失败都会清理记录（框架已自动移除该调度）。
 
     :param plugin: 插件实例
     :param task_name: 任务名（不含插件前缀）
@@ -938,33 +1054,26 @@ async def _cron_task_callback(plugin, task_name: str, prompt: str,
     :param session_type: 'group' 或 'private'
     :param session_id: 投递目标会话 ID
     """
-    _log.info(f'定时任务触发: name={task_name}, target={session_type}:{session_id}')
+    record = _get_task_record(plugin, task_name)
     try:
-        client = getattr(plugin, '_default_client', None)
-        if client is None:
-            _log.error(f'定时任务 {task_name} 执行失败: OpenAI 客户端未初始化')
+        if not plugin.get_config('EnableScheduledTaskExecution', True):
+            _log.debug(f'定时任务执行总开关已关闭，跳过: name={task_name}')
             return
-
-        response = client.chat.completions.create(
-            model=plugin.get_config('Model'),
-            messages=_build_task_messages(plugin, session_type, session_id, prompt),
-            tools=None,
-            tool_choice='none',
-        )
-        raw_content = response.choices[0].message.content or ''
-        clean = getattr(plugin, '_clean_content', None)
-        content = clean(raw_content) if callable(clean) else raw_content.strip()
-        if not content:
-            _log.warning(f'定时任务 {task_name} 模型返回空内容，已跳过投递')
-            return
-
-        if session_type == 'group':
-            await plugin.api.qq.post_group_msg(session_id, text=content)
-        else:
-            await plugin.api.qq.post_private_msg(session_id, text=content)
-        _log.info(f'定时任务 {task_name} 已投递到 {session_type}:{session_id}（{len(content)} 字）')
+        _log.info(f'定时任务触发: name={task_name}, target={session_type}:{session_id}')
+        runner = getattr(plugin, '_run_scheduled_task_turn', None)
+        if not callable(runner):
+            raise RuntimeError('插件不支持定时任务轮次（缺少 _run_scheduled_task_turn）')
+        creator_id = str(record.get('creator_id', '')) if record else ''
+        await runner(session_type, session_id, task_name, prompt, creator_id)
+        _record_task_success(plugin, task_name)
     except Exception as e:
+        _record_task_failure(plugin, task_name, str(e))
         _log.error(f'定时任务 {task_name} 执行失败: {e}')
+    finally:
+        # 一次性任务执行后框架会自动移除调度，这里同步清理记录避免残留
+        if record is not None and _is_once_task(record):
+            _drop_task_record(plugin, task_name)
+            _log.info(f'一次性定时任务 {task_name} 已执行，记录已清理')
 
 
 def _task_status_payload(plugin, task_name: str) -> dict:
@@ -989,19 +1098,25 @@ def _task_status_payload(plugin, task_name: str) -> dict:
 
 async def manage_cron_tasks(plugin, action: str, task_name: str = '', interval: str = '',
                             prompt: str = '', session_type: str = 'group',
-                            session_id: str = '', **_extra: Any) -> str:
+                            session_id: str = '', creator_id: str = '',
+                            **_extra: Any) -> str:
     """管理定时任务：增（add）/删（delete）/查（list）
 
     投递目标由插件按当前会话注入（模型无法指定其他群或用户），任务记录保存在
     ``data['data']['scheduled_tasks']``，重启后由 ``on_load`` 恢复注册。
 
+    任务**不做会话隔离**：``list`` 能看到所有会话的任务记录，但 ``add`` 只能创建到
+    当前会话、``delete`` 只能删除当前会话创建的任务（跨会话删除会被拒绝）。
+
     :param plugin: 插件实例
     :param action: 操作类型，支持 add / delete / list
     :param task_name: 任务名（字母/数字/下划线/连字符，1~32 字符）
-    :param interval: 调度时间参数，支持 ``30s`` / ``2h30m`` / ``0.5d`` / ``HH:MM`` / ``YYYY-MM-DD HH:MM:SS``
+    :param interval: 调度时间参数，支持 ``30s`` / ``2h30m`` / ``0.5d`` / ``HH:MM`` / ``YYYY-MM-DD HH:MM:SS``，
+        最小间隔 ``MIN_SCHEDULED_INTERVAL_SECONDS`` 秒
     :param prompt: 每次执行时发送给模型的提示（仅 add）
     :param session_type: 投递类型 'group' / 'private'（由插件注入）
     :param session_id: 投递目标会话 ID（由插件注入）
+    :param creator_id: 创建者用户 ID（由插件注入，供定时轮的记忆/环境工具使用）
     :param _extra: 忽略模型多传的未知参数
     :return: json 字符串，包含操作结果
     """
@@ -1013,6 +1128,12 @@ async def manage_cron_tasks(plugin, action: str, task_name: str = '', interval: 
                 'error', 'task_name 只能包含字母/数字/下划线/连字符，长度 1~32')
         if not interval:
             return _generate_tool_payload('error', '添加任务时必须提供 interval')
+        interval_error = validate_schedule_interval(interval)
+        if interval_error:
+            return _generate_tool_payload('error', interval_error)
+        if not plugin.get_config('EnableScheduledTaskExecution', True):
+            return _generate_tool_payload(
+                'error', '定时任务执行已暂停，无法创建新任务')
         if not prompt or not prompt.strip():
             return _generate_tool_payload('error', '添加任务时必须提供 prompt')
         if not session_id:
@@ -1031,6 +1152,7 @@ async def manage_cron_tasks(plugin, action: str, task_name: str = '', interval: 
             'prompt': prompt,
             'session_type': session_type,
             'session_id': str(session_id),
+            'creator_id': str(creator_id or ''),
             'created_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         }
         plugin._save_data()
@@ -1044,6 +1166,18 @@ async def manage_cron_tasks(plugin, action: str, task_name: str = '', interval: 
             return _generate_tool_payload('error', '删除任务时必须提供 task_name')
         if task_name not in tasks:
             return _generate_tool_payload('error', f'任务 {task_name} 不存在')
+        owner = tasks[task_name]
+        if not isinstance(owner, dict):
+            return _generate_tool_payload('error', f'任务 {task_name} 的记录已损坏，无法删除')
+        # 跨会话删除一律拒绝：任务可以查看，但只能由创建它的会话管理
+        if (str(owner.get('session_id', '')) != str(session_id)
+                or owner.get('session_type', 'group') != session_type):
+            _log.warning(
+                f'拒绝跨会话删除定时任务: name={task_name}, '
+                f'owner={owner.get("session_type")}:{owner.get("session_id")}, '
+                f'requester={session_type}:{session_id}')
+            return _generate_tool_payload(
+                'error', f'任务 {task_name} 不属于当前会话，无法删除')
         removed = plugin.remove_scheduled_task(_scheduled_task_key(task_name))
         tasks.pop(task_name, None)
         plugin._save_data()

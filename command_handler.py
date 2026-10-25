@@ -8,6 +8,7 @@ from ncatbot.event.qq import GroupMessageEvent, MessageEvent
 from ncatbot.utils import get_config_manager
 from ncatbot.utils.logger import get_log
 
+from . import tools
 from .preset_manager import Preset
 
 _log = get_log('openai_chat_plugin')
@@ -27,6 +28,10 @@ ADMIN_HELP_TEXT = '''OpenAI Chat Plugin 管理员命令帮助：
 /chat-admin set-preset <name> [group:<id>|user:<id>] - 设置预设（管理员功能）
 /chat-admin reset [group:<id>|user:<id>] - 重置会话（管理员功能）
 /chat-admin update-prompt [group:<id>|user:<id>|all(default)] - 更新指定用户的提示词，不清除会话记录（管理员功能）
+/chat-admin task list - 查看全部定时任务（含所属会话、停用状态与下次执行时间）
+/chat-admin task delete <name> - 删除指定定时任务（可跨会话清理）
+/chat-admin task pause - 暂停所有定时任务（记录保留，可随时 resume）
+/chat-admin task resume - 恢复定时任务执行并重新注册
 /chat-admin help - 显示此帮助信息
 
 示例：
@@ -337,6 +342,9 @@ class OpenAICommandHandlerMixin:
                     except (ValueError, IndexError):
                         await event.reply(text='目标格式错误，请使用 group:<id>、user:<id> 或 all', at_sender=False)
 
+            elif command[1] == 'task':
+                await self._handle_task_admin(event, command)
+
             elif command[1] == 'help':
                 await event.reply(text=ADMIN_HELP_TEXT, at_sender=False)
                 return
@@ -346,6 +354,105 @@ class OpenAICommandHandlerMixin:
 
             # 管理操作后持久化数据
             self._save_data()
+
+    async def _handle_task_admin(self, event: MessageEvent, command: list) -> None:
+        """处理 /chat-admin task 子命令（list / delete / pause / resume）
+
+        定时任务默认对普通用户只读（list 全局可见），运维侧需要能跨会话清理
+        与一键停跑，因此这里的操作不受任务归属限制，但整条命令仍经过
+        ``_check_admin()`` 校验。
+
+        :param event: 消息事件
+        :param command: 已解析的命令参数（command[2] 为子命令）
+        """
+        # 定时任务是全局资源：查看他人任务、跨会话删除、全局暂停都属于跨群操作，
+        # 必须走严格 RBAC，避免群主/群管理借本群身份提权
+        if not await self._check_global_admin(event):
+            return
+
+        if len(command) < 3:
+            await event.reply(
+                text='用法：/chat-admin task list|delete <name>|pause|resume',
+                at_sender=False)
+            return
+
+        sub_command = command[2].lower()
+        tasks = self.data['data'].setdefault('scheduled_tasks', {})
+
+        if sub_command == 'list':
+            if not tasks:
+                await event.reply(text='当前没有定时任务', at_sender=False)
+                return
+            lines = ['定时任务列表：']
+            for index, (name, info) in enumerate(tasks.items()):
+                if index >= 20:
+                    lines.append(f'...（共 {len(tasks)} 个，仅显示前 20 个）')
+                    break
+                if not isinstance(info, dict):
+                    lines.append(f'- {name} | 记录已损坏')
+                    continue
+                try:
+                    status = self.get_task_status(tools._scheduled_task_key(name)) or {}
+                except Exception as e:
+                    _log.debug(f'读取定时任务 {name} 状态失败: {e}')
+                    status = {}
+                next_run = status.get('next_run')
+                if hasattr(next_run, 'isoformat'):
+                    next_run = next_run.isoformat()
+                if info.get('disabled'):
+                    state = '已停用'
+                elif status:
+                    state = '运行中'
+                else:
+                    state = '未注册'
+                lines.append(
+                    f'- {name} | {info.get("interval", "?")} | '
+                    f'{info.get("session_type", "?")}:{info.get("session_id", "?")} | '
+                    f'{state} | 连续失败={info.get("failures", 0)} | 下次={next_run or "-"}')
+            await event.reply(text='\n'.join(lines), at_sender=False)
+            return
+
+        if sub_command == 'delete':
+            task_name = command[3] if len(command) > 3 else ''
+            if not task_name:
+                await event.reply(text='请提供要删除的任务名', at_sender=False)
+                return
+            record = tasks.pop(task_name, None)
+            removed = self.remove_scheduled_task(tools._scheduled_task_key(task_name))
+            self._save_data()
+            if record is None and not removed:
+                await event.reply(text=f'任务 {task_name} 不存在', at_sender=False)
+                return
+            _log.info(f'管理员删除定时任务: name={task_name}')
+            await event.reply(text=f'已删除定时任务 {task_name}', at_sender=False)
+            return
+
+        if sub_command == 'pause':
+            self.set_config('EnableScheduledTaskExecution', False)
+            removed_count = 0
+            for task_name in list(tasks):
+                if self.remove_scheduled_task(tools._scheduled_task_key(task_name)):
+                    removed_count += 1
+            _log.warning(f'管理员暂停定时任务执行，已移出调度器 {removed_count} 个任务')
+            await event.reply(
+                text=f'已暂停定时任务执行，移出调度器 {removed_count} 个任务'
+                     f'（记录保留，可用 /chat-admin task resume 恢复）',
+                at_sender=False)
+            return
+
+        if sub_command == 'resume':
+            self.set_config('EnableScheduledTaskExecution', True)
+            restored = self._restore_scheduled_tasks()
+            _log.info(f'管理员恢复定时任务执行，重新注册 {restored} 个任务')
+            await event.reply(
+                text=f'已恢复定时任务执行，重新注册 {restored} 个任务'
+                     f'（已停用的任务需先删除后重建）',
+                at_sender=False)
+            return
+
+        await event.reply(
+            text='未知 task 子命令，请使用 /chat-admin task list|delete <name>|pause|resume',
+            at_sender=False)
 
     # ------------------------------------------------------------------
     # /chat 用户命令

@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import asyncio
 import json
 import os
 import random
@@ -44,6 +45,11 @@ RANDOM_REPLY_SYSTEM_PROMPT = (
 NO_REPLY_PATTERN = re.compile(r'^\W*no[_\-\s]?reply\W*$', re.IGNORECASE)
 # 同一群的随机插话最小间隔（秒），防止连续刷屏
 RANDOM_REPLY_COOLDOWN_SECONDS = 30
+# 单次 OpenAI 请求超时（秒）。同步客户端在网络异常时可能长时间阻塞，
+# 因此限制单请求耗时并减少重试，避免定时任务卡住事件循环太久
+REQUEST_TIMEOUT_SECONDS = 60.0
+# 请求失败后的最大重试次数（SDK 默认 2 次，这里收紧到 1 次）
+REQUEST_MAX_RETRIES = 1
 
 
 class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
@@ -53,7 +59,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
     """
 
     name = 'OpenAIChatPlugin'  # 插件名（须与 manifest.toml 一致）
-    version = '0.4.0'  # 插件版本（须与 manifest.toml 一致）
+    version = '0.4.1'  # 插件版本（须与 manifest.toml 一致）
     author = 'Yang-qwq'
     description = 'OpenAI 对话插件：多预设管理、函数调用（Function Calling）、会话持久化'
 
@@ -76,6 +82,9 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             'AllowWebRequests': False,
             # 是否允许AI创建/管理定时任务（内置函数调用功能需要开启）
             'AllowScheduledTasks': False,
+            # 定时任务执行总开关（kill switch）：关闭后不注册/不执行任务，
+            # 记录保留，可用 /chat-admin task resume 恢复
+            'EnableScheduledTaskExecution': True,
             # 是否识别并下载用户消息中携带的图片，作为视觉输入交给模型（无需开启函数调用）
             'EnableImageRecognition': True,
             # 是否剥离推理模型的思维链（<think>/<reasoning> 等标签），防止思维链暴露给用户或污染历史
@@ -119,6 +128,8 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         self.temp_history_messages_kv = {}
         # 随机插话冷却时间记录（内存态，不持久化）：group_id -> monotonic 时间戳
         self._last_random_reply_ts: dict[str, float] = {}
+        # 会话级锁（内存态）：普通聊天与定时任务共用，保证同一会话的轮次串行执行
+        self._session_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
         workspace_path = str(self.workspace)
 
@@ -185,24 +196,36 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         # 创建默认OpenAI客户端
         self._default_client = OpenAI(
             api_key=self.get_config('ApiKey'),
-            base_url=self.get_config('BaseUrl')
+            base_url=self.get_config('BaseUrl'),
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            max_retries=REQUEST_MAX_RETRIES,
         )
 
         # ---- 恢复持久化的 AI 定时任务（失败不阻塞加载） ----
         self._restore_scheduled_tasks()
 
-    def _restore_scheduled_tasks(self) -> None:
+    def _restore_scheduled_tasks(self) -> int:
         """把 data.json 中记录的定时任务重新注册到框架调度器。
 
         任务记录不会因为 ``AllowScheduledTasks`` 关闭而删除，该开关只控制模型能否
         新增/管理任务；注册失败时保留记录并记录警告，便于排查 interval 等问题。
+        执行总开关 ``EnableScheduledTaskExecution`` 关闭或记录被标记为
+        ``disabled`` 时不会注册，已在运行的调度任务需由调用方先移除。
+
+        :return: 成功注册的任务数量
         """
         tasks = self.data['data'].get('scheduled_tasks') or {}
         if not tasks:
-            return
+            return 0
+        if not self.get_config('EnableScheduledTaskExecution', True):
+            _log.info('定时任务执行开关已关闭，跳过恢复注册')
+            return 0
         restored = 0
         for task_name, info in tasks.items():
             if not isinstance(info, dict):
+                continue
+            if info.get('disabled'):
+                _log.info(f'定时任务 {task_name} 已停用，跳过恢复（可用 /chat-admin task delete 清理）')
                 continue
             ok = tools.register_scheduled_task(
                 self,
@@ -215,31 +238,90 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             if ok:
                 restored += 1
             else:
-                _log.warning(f'定时任务 {task_name} 恢复失败（interval 非法或定时任务服务不可用）')
+                reason = tools.validate_schedule_interval(info.get('interval', ''))
+                _log.warning(
+                    f'定时任务 {task_name} 恢复失败（{reason or "定时任务服务不可用"}）')
         if restored:
             _log.info(f'已恢复 {restored}/{len(tasks)} 个 AI 定时任务')
+        return restored
 
-    def _build_task_messages(self, session_type: str, session_id: str, prompt: str) -> list[dict]:
-        """构造定时任务的请求消息：会话当前预设的 system + 任务提示。
+    def _ensure_session(self, conversation_dict: str, session_id: str) -> list[dict]:
+        """确保会话存在，返回该会话的消息列表（不存在时用默认预设初始化）。
+
+        :param conversation_dict: ``group_conversations`` 或 ``user_conversations``
+        :param session_id: 会话 ID（统一转为 str）
+        :return: 会话消息列表（原地修改即可持久化）
+        """
+        conversations = self.data['data'][conversation_dict]
+        session_key = str(session_id)
+        if session_key not in conversations:
+            preset = Preset()
+            if preset.load(str(self.workspace), DEFAULT_PRESET_NAME):
+                conversations[session_key] = preset.to_conversations()
+                self._set_preset_name(conversation_dict, session_key, DEFAULT_PRESET_NAME)
+            else:
+                # 预设缺失时不阻塞定时任务：退化为无 system 提示的会话
+                _log.warning('默认预设不存在，会话将以无 system 提示的方式初始化')
+                conversations[session_key] = []
+        return conversations[session_key]
+
+    async def _run_scheduled_task_turn(self, session_type: str, session_id: str,
+                                       task_name: str, prompt: str,
+                                       creator_id: str = '') -> str:
+        """执行一次定时任务轮次（内部消息入主会话历史 → 模型/工具 → 投递 → 落库）。
+
+        定时任务与普通聊天共用同一份会话历史，并且同样具备工具调用能力（受
+        ``EnableBuiltinFunctionCalling`` 与各 ``AllowXxx`` 开关控制）。请求在内存中
+        构造为 ``历史 + 内部消息``，只有最终回复成功投递后才把整轮消息写入历史，
+        失败不会污染上下文。
 
         :param session_type: 'group' 或 'private'
-        :param session_id: 会话 ID
+        :param session_id: 投递目标会话 ID
+        :param task_name: 任务名（不含插件前缀）
         :param prompt: 任务提示
-        :return: OpenAI 消息列表
+        :param creator_id: 任务创建者 ID（供记忆/环境工具使用，旧记录可能为空）
+        :return: 已投递的回复正文
+        :raises RuntimeError: 客户端未初始化、模型返回空内容或投递失败
         """
-        conversation_dict = 'group_conversations' if session_type == 'group' else 'user_conversations'
-        try:
-            preset_name = self._get_preset_name(conversation_dict, str(session_id))
-        except Exception:
-            preset_name = DEFAULT_PRESET_NAME
+        conversation_dict = ('group_conversations' if session_type == 'group'
+                             else 'user_conversations')
+        session_key = str(session_id)
+        is_group = session_type == 'group'
+        internal_message = {
+            'role': 'user',
+            'content': f'[定时任务 {task_name}] {prompt}',
+        }
 
-        preset = Preset()
-        if not preset.load(str(self.workspace), preset_name):
-            preset = Preset()
-            if not preset.load(str(self.workspace), DEFAULT_PRESET_NAME):
-                _log.warning('定时任务找不到可用预设，将以无 system 提示的方式执行')
-                return [{'role': 'user', 'content': prompt}]
-        return list(preset.to_conversations()) + [{'role': 'user', 'content': prompt}]
+        if getattr(self, '_default_client', None) is None:
+            raise RuntimeError('OpenAI 客户端未初始化')
+
+        async with self._get_session_lock(conversation_dict, session_key):
+            history = self._ensure_session(conversation_dict, session_key)
+            # 工作副本：历史 + 内部触发消息；工具轮次只会追加到副本
+            working = list(history) + [internal_message]
+            reply = await self._generate_reply(
+                working,
+                conversation_dict=conversation_dict,
+                session_id=session_key,
+                is_group=is_group,
+                sender_id=str(creator_id or ''),
+                event=None,
+                random_reply=False,
+                use_tools=bool(self.get_config('EnableBuiltinFunctionCalling')),
+            )
+            if not reply:
+                raise RuntimeError('模型返回空内容')
+
+            # 先投递最终回复，成功后再把整轮消息（含工具调用）提交回历史
+            await self._post_session_text(session_key, is_group, reply)
+            working.append({'role': 'assistant', 'content': reply})
+            history[:] = working
+            self._save_data()
+
+        _log.info(
+            f'[{"群组" if is_group else "用户"} {session_key}] '
+            f'定时任务 {task_name} 已投递（{len(reply)} 字）')
+        return reply
 
     def _clean_content(self, content: str | None) -> str:
         """按配置剥离思维链并去除首尾空白。
@@ -440,12 +522,30 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             _log.debug(f'查询 NcatBotTRPG 会话状态失败: {e}')
         return False
 
+    def _session_key(self, event: MessageEvent) -> tuple[str, str]:
+        """返回事件对应的会话字典名与会话 ID（统一为 str）。"""
+        if isinstance(event, GroupMessageEvent):
+            return 'group_conversations', str(event.group_id)
+        return 'user_conversations', str(event.user_id)
+
+    def _get_session_lock(self, conversation_dict: str, session_id: str) -> asyncio.Lock:
+        """获取会话级锁。
+
+        普通聊天与定时任务共用同一把锁，避免两边同时读写同一份会话历史
+        导致消息交错或上下文丢失。
+        """
+        key = (conversation_dict, str(session_id))
+        lock = self._session_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[key] = lock
+        return lock
+
     async def _handle_message(self, event: MessageEvent):
-        """处理消息事件
+        """处理消息事件（外层：过滤 + 按会话串行）
 
         :param event: 事件对象
         :return: None
-        :raises exceptions.TooManyToolCallsException: 当连续工具调用次数达到上限时抛出
         """
         is_group = isinstance(event, GroupMessageEvent)
 
@@ -466,6 +566,231 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         if self._is_trpg_session_active(event, is_group):
             _log.debug('该会话跑团进行中，跳过 OpenAI 对话处理（交由 NcatBotTRPG 接管）')
             return
+
+        conversation_dict, session_id = self._session_key(event)
+        async with self._get_session_lock(conversation_dict, session_id):
+            await self._handle_message_turn(event)
+
+    async def _post_session_text(self, session_id: str, is_group: bool, text: str) -> None:
+        """把文本投递到指定会话（群聊/私聊）。"""
+        if is_group:
+            await self.api.qq.post_group_msg(session_id, text=text)
+        else:
+            await self.api.qq.post_private_msg(session_id, text=text)
+
+    async def _generate_reply(self, working: list[dict], *, conversation_dict: str,
+                              session_id: str, is_group: bool, sender_id: str,
+                              event: MessageEvent | None, random_reply: bool,
+                              use_tools: bool) -> str | None:
+        """执行模型请求与工具调用循环，返回清理后的最终正文。
+
+        ``working`` 是本轮的工作消息列表：普通聊天直接传主会话列表（工具轮次原地
+        追加），定时任务传"历史副本 + 内部消息"，只有调用方投递成功后才提交回历史。
+
+        :param working: 本轮工作消息列表（会被原地追加 assistant/tool/视觉消息）
+        :param conversation_dict: 会话字典名（用于读取预设名）
+        :param session_id: 会话 ID
+        :param is_group: 是否群聊
+        :param sender_id: 触发者 ID（定时任务为创建者，未知时为空）
+        :param event: 普通聊天的消息事件；定时任务为 None
+        :param random_reply: 是否随机插话轮
+        :param use_tools: 是否允许工具调用
+        :return: 最终回复正文；模型未产生响应（MaxRetriesTimes 非正）时返回 None
+        :raises exceptions.TooManyToolCallsException: 达到工具轮次上限且没有正文
+        """
+        # 工具 schema 始终完整暴露：各工具开关只影响实际调用（分派链校验 + 错误提示）
+        available_tools = tools.tools if use_tools else None
+        response = None
+        current_retries_times = 0
+
+        # 如果启用了内置函数调用功能，则在模型想要调用工具时会循环执行工具调用并获取结果，
+        # 直到模型不再想要调用工具或达到最大重试次数为止
+        while current_retries_times < self.get_config('MaxRetriesTimes'):
+            # 未启用工具时完全不传 tools/tool_choice，避免 `"tools": null`
+            # 被严格网关（如 AMD Radeon）判为非法请求
+            request_kwargs = {
+                'model': self.get_config('Model'),
+                'messages': self._build_request_messages(working, random_reply),
+            }
+            if available_tools:
+                request_kwargs['tools'] = available_tools
+                request_kwargs['tool_choice'] = 'auto'
+
+            # 同步 SDK 调用放到线程池执行，避免阻塞事件循环导致
+            # NapCat 心跳超时/其他会话卡死（定时任务同样走 to_thread）
+            response = await asyncio.to_thread(
+                self._default_client.chat.completions.create, **request_kwargs)
+
+            _log.debug(
+                f'请求尝试: {current_retries_times + 1}/{self.get_config("MaxRetriesTimes")}，'
+                f'模型回复: {response.choices[0].message.content}, '
+                f'finish_reason: {response.choices[0].finish_reason}, '
+                f'tool_calls: {response.choices[0].message.tool_calls}'
+            )
+
+            # 思维链只写日志，绝不进入回复与会话历史
+            self._log_reasoning(
+                response.choices[0].message, response.choices[0].message.content or '')
+
+            # 模型停止生成、未启用工具，或没有工具调用请求时结束循环
+            if (response.choices[0].finish_reason == 'stop'
+                    or not use_tools
+                    or not response.choices[0].message.tool_calls):
+                if response.choices[0].finish_reason == 'stop':
+                    _log.debug('模型回复已完成，无需继续处理工具调用。')
+                break
+
+            # ---- 工具调用轮 ----
+            current_retries_times += 1
+            assistant_msg = response.choices[0].message
+            thinking_content = self._clean_content(assistant_msg.content)
+            if thinking_content:
+                _log.info(
+                    f'[{"群组" if is_group else "用户"} {session_id}] '
+                    f'AI思考/中间内容: {thinking_content[:OMITTED_TEXT_LENGTH]}'
+                    f'{"..." if len(thinking_content) > OMITTED_TEXT_LENGTH else ""}')
+
+            # 完整 assistant 轮次（含 tool_calls）必须先于各条 tool 消息写入历史
+            working.append(self._assistant_message_to_history_dict(assistant_msg))
+
+            # 中间正文（如有）也投递到会话；「仅空白/空」视为无效，不发送
+            if thinking_content:
+                await self._post_session_text(session_id, is_group, thinking_content)
+
+            preset_name = self._get_preset_name(conversation_dict, session_id)
+            vision_messages: list[dict] = []
+            for tool_call in assistant_msg.tool_calls:
+                tool_name = tool_call.function.name
+                try:
+                    tool_args = json.loads(tool_call.function.arguments or '{}')
+                except ValueError:
+                    tool_args = {}
+                    _log.warning(f'工具参数不是有效的 JSON: {tool_call.function.arguments}')
+
+                # 以下工具不需要权限，直接可调用
+                if tool_name == 'get_system_time':
+                    result = await tools.get_system_time()
+                elif tool_name == 'get_environment_info':
+                    if event is not None:
+                        result = await tools.get_environment_info(event)
+                    else:
+                        # 定时轮没有消息事件：用餐次上下文替代
+                        result = tools._generate_tool_payload('success', '', {
+                            'user_id': sender_id or None,
+                            'group_id': session_id if is_group else None,
+                            'message_id': None,
+                            'source': 'scheduled_task',
+                        })
+                elif tool_name == 'get_stranger_info':
+                    result = await tools.get_stranger_info(self.api.qq, **tool_args)
+                elif tool_name == 'get_group_info':
+                    result = await tools.get_group_info(self.api.qq, **tool_args)
+                elif tool_name == 'query_missing_message_context':
+                    if is_group:
+                        result = await tools.query_missing_message_context(
+                            self.temp_history_messages_kv, session_id)
+                    else:
+                        result = tools._generate_tool_payload(
+                            'error', '查询漏掉的消息上下文仅支持群聊')
+
+                # 以下工具需要配置权限才能调用
+                elif tool_name == 'access_memory':
+                    if not self.get_config('AllowAccessMemory'):
+                        # 如果不允许访问记忆功能，则拒绝工具调用请求并返回错误信息
+                        result = tools._generate_tool_payload(
+                            'error', '`AllowAccessMemory` 配置未启用，当前无法使用记忆功能；'
+                                     '请告知用户在 config.yaml 的 plugin_configs.OpenAIChatPlugin 中开启该配置')
+                        _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许访问记忆功能')
+                    else:
+                        # 来源由会话/创建者决定（定时任务无创建者时记为未知）
+                        tool_args['from_user'] = sender_id or 0
+                        tool_args['from_group'] = session_id if is_group else -1
+                        result = tools.access_memory(
+                            os.path.join(str(self.workspace), 'presets', preset_name), **tool_args
+                        )
+                elif tool_name == 'create_http_request':
+                    if not self.get_config('AllowWebRequests'):
+                        # 如果不允许网络请求功能，则拒绝工具调用请求并返回错误信息
+                        result = tools._generate_tool_payload(
+                            'error', '`AllowWebRequests` 配置未启用，当前无法进行网络请求；'
+                                     '请告知用户在 config.yaml 的 plugin_configs.OpenAIChatPlugin 中开启该配置')
+                        _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许网络请求功能')
+                    else:
+                        result = await tools.create_http_request(**tool_args)
+                elif tool_name == 'manage_cron_tasks':
+                    if not self.get_config('AllowScheduledTasks'):
+                        # 工具始终对模型可见，开关关闭时由这里拒绝并给出提示
+                        result = tools._generate_tool_payload(
+                            'error', '`AllowScheduledTasks` 配置未启用，当前无法管理定时任务；'
+                                     '请告知用户在 config.yaml 的 plugin_configs.OpenAIChatPlugin 中开启该配置')
+                        _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许定时任务功能')
+                    else:
+                        # 投递目标强制为当前会话，模型无法指定其他群/用户
+                        result = await tools.manage_cron_tasks(
+                            self,
+                            session_type='group' if is_group else 'private',
+                            session_id=str(session_id),
+                            creator_id=sender_id,
+                            **tool_args,
+                        )
+                else:
+                    _log.warning(f'未知工具调用请求: {tool_name}')
+                    result = tools._generate_tool_payload('error', f'未知工具: {tool_name}')
+
+                # 图片类工具结果：工具历史只保存摘要，完整 data URL 作为
+                # 后续 user 视觉消息附加，避免把 base64 正文塞进上下文
+                vision = tools.extract_vision_payload(result)
+                history_content = tools._vision_summary_payload(vision) if vision else result
+
+                _log.info(
+                    f'[{"群组" if is_group else "用户"} {session_id}] 工具调用: '
+                    f'{tool_name}({json.dumps(tool_args, ensure_ascii=False)[:OMITTED_TEXT_LENGTH]}) -> '
+                    f'{str(history_content)[:OMITTED_TEXT_LENGTH]}'
+                    f'{"..." if len(str(history_content)) > OMITTED_TEXT_LENGTH else ""}'
+                )
+
+                # 将工具调用结果添加到会话中，供模型后续生成回复时参考
+                working.append(
+                    {'tool_call_id': tool_call.id, 'role': 'tool', 'name': tool_name,
+                     'content': history_content})
+
+                if vision:
+                    vision_messages.append({
+                        'role': 'user',
+                        'content': [
+                            {'type': 'text', 'text': '以下是通过工具获取的图片：'},
+                            {'type': 'image_url', 'image_url': {'url': vision['data_url']}},
+                        ],
+                    })
+
+            # 所有 tool 消息追加完毕后，再附加视觉消息（保持 tool_calls 与 tool 的相邻顺序）
+            for vision_message in vision_messages:
+                working.append(vision_message)
+                _log.debug('已将工具获取的图片作为视觉输入附加到会话')
+
+        # MaxRetriesTimes 配置 <= 0 时循环不会执行，避免后续解引用未定义的 response
+        if response is None:
+            _log.error('MaxRetriesTimes 配置须为正整数，已跳过本次对话请求')
+            return None
+
+        last_msg = response.choices[0].message
+        # 模型可能在正文首尾输出换行/空格（日志中常见 "\n\n你好..."），发送前统一去除；
+        # 同时剥离思维链，避免把推理过程发送给用户
+        reply_message = self._clean_content(last_msg.content)
+
+        # 最后一轮 API 仍在请求工具时 while 已无法继续，content 往往为空，避免 reply(None)
+        if last_msg.tool_calls and not reply_message:
+            raise exceptions.TooManyToolCallsException('抱歉，连续工具调用次数已达上限')
+        return reply_message
+
+    async def _handle_message_turn(self, event: MessageEvent):
+        """处理一轮对话（调用方需持有该会话的锁）
+
+        :param event: 事件对象
+        :return: None
+        :raises exceptions.TooManyToolCallsException: 当连续工具调用次数达到上限时抛出
+        """
+        is_group = isinstance(event, GroupMessageEvent)
 
         user_message = await self._build_user_message(event)
 
@@ -533,173 +858,23 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             f'[{"群组" if is_group else "用户"} {session_id}] 用户输入: '
             f'{user_message[:OMITTED_TEXT_LENGTH]}{"..." if len(user_message) > OMITTED_TEXT_LENGTH else ""}')
 
-        response = None
+        conversation = self.data['data'][conversation_dict][session_id]
         try:
-            current_retries_times = 0
             # 随机插话场景禁用工具调用：省 token，且避免随机消息产生副作用
             use_tools = self.get_config('EnableBuiltinFunctionCalling') and not random_reply
-            available_tools = tools.get_available_tools(
-                allow_scheduled_tasks=self.get_config('AllowScheduledTasks')) if use_tools else None
+            reply_message = await self._generate_reply(
+                conversation,
+                conversation_dict=conversation_dict,
+                session_id=str(session_id),
+                is_group=is_group,
+                sender_id=str(event.user_id),
+                event=event,
+                random_reply=random_reply,
+                use_tools=use_tools,
+            )
 
-            # 如果启用了内置函数调用功能，则在模型想要调用工具时会循环执行工具调用并获取结果，
-            # 直到模型不再想要调用工具或达到最大重试次数为止
-            while current_retries_times < self.get_config('MaxRetriesTimes'):
-                response = self._default_client.chat.completions.create(
-                    model=self.get_config('Model'),
-                    messages=self._build_request_messages(
-                        self.data['data'][conversation_dict][session_id], random_reply),
-                    tools=available_tools,
-                    tool_choice='auto' if use_tools else 'none',
-                )
-
-                _log.debug(
-                    f'请求尝试: {current_retries_times + 1}/{self.get_config("MaxRetriesTimes")}，'
-                    f'模型回复: {response.choices[0].message.content}, '
-                    f'finish_reason: {response.choices[0].finish_reason}, '
-                    f'tool_calls: {response.choices[0].message.tool_calls}'
-                )
-
-                # 思维链只写日志，绝不进入回复与会话历史
-                self._log_reasoning(
-                    response.choices[0].message, response.choices[0].message.content or '')
-
-                # 模型是否主动停止生成回复
-                if response.choices[0].finish_reason == 'stop':
-                    _log.debug('模型回复已完成，无需继续处理工具调用。')
-                    break
-
-                # 检查模型是否想要调用工具
-                if use_tools:
-                    if response.choices[0].message.tool_calls:
-                        current_retries_times += 1
-                        thinking_content = self._clean_content(response.choices[0].message.content)
-                        if thinking_content:
-                            _log.info(
-                                f'[{"群组" if is_group else "用户"} {session_id}] '
-                                f'AI思考/中间内容: {thinking_content[:OMITTED_TEXT_LENGTH]}'
-                                f'{"..." if len(thinking_content) > OMITTED_TEXT_LENGTH else ""}'
-                            )
-
-                        # 完整 assistant 轮次（含 tool_calls）必须先于各条 tool 消息写入历史
-                        assistant_msg = response.choices[0].message
-                        self.data['data'][conversation_dict][session_id].append(
-                            self._assistant_message_to_history_dict(assistant_msg))
-
-                        # 可选：将调用工具前的正文发送
-                        # 仅在正文存在有效内容时发送；「仅空白/空」的中间内容
-                        # （如换行、空格）视为无效，不向用户发出（复用上方已 strip 的 thinking_content）
-                        if thinking_content:
-                            if is_group:
-                                await self.api.qq.post_group_msg(event.group_id, text=thinking_content)
-                            else:
-                                await self.api.qq.post_private_msg(event.user_id, text=thinking_content)
-
-                        # 处理每个工具调用请求
-                        preset_name = self._get_preset_name(conversation_dict, session_id)
-                        vision_messages: list[dict] = []
-                        for tool_call in response.choices[0].message.tool_calls:
-                            tool_name = tool_call.function.name
-                            try:
-                                tool_args = json.loads(tool_call.function.arguments or '{}')
-                            except ValueError:
-                                tool_args = {}
-                                _log.warning(f'工具参数不是有效的 JSON: {tool_call.function.arguments}')
-
-                            # 以下工具不需要权限，直接可调用
-                            if tool_name == 'get_system_time':
-                                result = await tools.get_system_time()
-                            elif tool_name == 'get_environment_info':
-                                result = await tools.get_environment_info(event)
-                            elif tool_name == 'get_stranger_info':
-                                result = await tools.get_stranger_info(self.api.qq, **tool_args)
-                            elif tool_name == 'get_group_info':
-                                result = await tools.get_group_info(self.api.qq, **tool_args)
-                            elif tool_name == 'query_missing_message_context':
-                                result = await tools.query_missing_message_context(
-                                    self.temp_history_messages_kv, event.group_id)
-
-                            # 以下工具需要配置权限才能调用
-                            elif tool_name == 'access_memory':
-                                if not self.get_config('AllowAccessMemory'):
-                                    # 如果不允许访问记忆功能，则拒绝工具调用请求并返回错误信息
-                                    result = tools._generate_tool_payload(
-                                        'error', '`AllowAccessMemory` 配置未启用，无法使用记忆功能')
-                                    _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许访问记忆功能')
-                                else:
-                                    # 来源由会话决定
-                                    tool_args['from_user'] = event.user_id
-                                    tool_args['from_group'] = event.group_id if is_group else -1
-                                    result = tools.access_memory(
-                                        os.path.join(str(self.workspace), 'presets', preset_name), **tool_args
-                                    )
-                            elif tool_name == 'create_http_request':
-                                if not self.get_config('AllowWebRequests'):
-                                    # 如果不允许网络请求功能，则拒绝工具调用请求并返回错误信息
-                                    result = tools._generate_tool_payload(
-                                        'error', '`AllowWebRequests` 配置未启用，无法使用网络请求功能')
-                                    _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许网络请求功能')
-                                else:
-                                    result = await tools.create_http_request(**tool_args)
-                            elif tool_name == 'manage_cron_tasks':
-                                if not self.get_config('AllowScheduledTasks'):
-                                    # 双保险：未开启时即使模型看到 schema 也无法创建任务
-                                    result = tools._generate_tool_payload(
-                                        'error', '`AllowScheduledTasks` 配置未启用，无法管理定时任务')
-                                    _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许定时任务功能')
-                                else:
-                                    # 投递目标强制为当前会话，模型无法指定其他群/用户
-                                    result = await tools.manage_cron_tasks(
-                                        self,
-                                        session_type='group' if is_group else 'private',
-                                        session_id=str(session_id),
-                                        **tool_args,
-                                    )
-                            else:
-                                _log.warning(f'未知工具调用请求: {tool_name}')
-                                result = tools._generate_tool_payload('error', f'未知工具: {tool_name}')
-
-                            # 图片类工具结果：工具历史只保存摘要，完整 data URL 作为
-                            # 后续 user 视觉消息附加，避免把 base64 正文塞进上下文
-                            vision = tools.extract_vision_payload(result)
-                            history_content = tools._vision_summary_payload(vision) if vision else result
-
-                            _log.info(
-                                f'[{"群组" if is_group else "用户"} {session_id}] 工具调用: '
-                                f'{tool_name}({json.dumps(tool_args, ensure_ascii=False)[:OMITTED_TEXT_LENGTH]}) -> '
-                                f'{str(history_content)[:OMITTED_TEXT_LENGTH]}'
-                                f'{"..." if len(str(history_content)) > OMITTED_TEXT_LENGTH else ""}'
-                            )
-
-                            # 将工具调用结果添加到会话中，供模型后续生成回复时参考
-                            self.data['data'][conversation_dict][session_id].append(
-                                {'tool_call_id': tool_call.id, 'role': 'tool', 'name': tool_name,
-                                 'content': history_content})
-
-                            if vision:
-                                vision_messages.append({
-                                    'role': 'user',
-                                    'content': [
-                                        {'type': 'text', 'text': '以下是通过工具获取的图片：'},
-                                        {'type': 'image_url', 'image_url': {'url': vision['data_url']}},
-                                    ],
-                                })
-
-                        # 所有 tool 消息追加完毕后，再附加视觉消息（保持 tool_calls 与 tool 的相邻顺序）
-                        for vision_message in vision_messages:
-                            self.data['data'][conversation_dict][session_id].append(vision_message)
-                            _log.debug('已将工具获取的图片作为视觉输入附加到会话')
-                    else:
-                        break
-
-            # MaxRetriesTimes 配置 <= 0 时循环不会执行，避免后续解引用未定义的 response
-            if response is None:
-                _log.error('MaxRetriesTimes 配置须为正整数，已跳过本次对话请求')
+            if reply_message is None:
                 return
-
-            last_msg = response.choices[0].message
-            # 模型可能在正文首尾输出换行/空格（日志中常见 "\n\n你好..."），发送前统一去除；
-            # 同时剥离思维链，避免把推理过程发送给用户
-            reply_message = self._clean_content(last_msg.content)
 
             # 随机插话：模型回空正文或 NO_REPLY 哨兵时保持沉默（不发送、不写 assistant 历史）
             if random_reply and self._is_silent_reply(reply_message):
@@ -707,9 +882,6 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                 self._save_data()
                 return
 
-            # 最后一轮 API 仍在请求工具时 while 已无法继续，content 往往为空，避免 reply(None)
-            if last_msg.tool_calls and not reply_message:
-                raise exceptions.TooManyToolCallsException('抱歉，连续工具调用次数已达上限')
             if not reply_message:
                 _log.warning('模型返回了空回复，已跳过发送')
                 self._save_data()

@@ -107,3 +107,19 @@ async def test_command_prefix_skips_chat(tmp_path, monkeypatch):
         await h.settle()
         # 命令由命令处理器响应，不消耗模型调用
         assert len(client.chat.completions.calls) == 0
+
+
+async def test_disabled_function_calling_omits_tool_params(tmp_path, monkeypatch):
+    """未启用函数调用时，请求体不出现 tools/tool_choice（兼容严格网关）"""
+    monkeypatch.chdir(tmp_path)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        # 默认 EnableBuiltinFunctionCalling=False
+        client = _configure(plugin)
+
+        await h.inject(private_message("你好", user_id=ROOT_QQ))
+        await h.settle()
+
+        call = client.chat.completions.calls[0]
+        assert "tools" not in call
+        assert "tool_choice" not in call
