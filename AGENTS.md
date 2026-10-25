@@ -15,7 +15,8 @@ OpenAIChatPlugin/
 ├── main.py              # 插件入口：init_defaults、RBAC 注册、消息处理、事件回调
 ├── command_handler.py   # 命令 Mixin：/chat、/chat-admin、/chatrbac + 三层权限校验
 ├── preset_manager.py   # 预设管理：Preset 类（config.yaml + prompt.md）
-├── tools.py             # Function Calling 工具定义与实现（记忆、环境、HTTP 请求、图片视觉等）
+├── reasoning.py         # 思维链剥离（移植自 NcatBotTRPG llm.py）：strip_reasoning / extract_reasoning
+├── tools.py             # Function Calling 工具定义与实现（记忆、环境、HTTP 请求、图片视觉、定时任务等）
 ├── update.py            # 数据迁移：4.x 工作区数据迁移、记忆格式升级
 ├── exceptions.py        # 自定义异常（TooManyToolCallsException）
 ├── requirements.txt     # 依赖：openai, pyyaml, beautifulsoup4, markdownify
@@ -127,6 +128,7 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 |------|------|------|
 | `/chat set-preset <name>` | 所有人 | 设置当前会话预设 |
 | `/chat reset` | 所有人 | 重置当前会话 |
+| `/chat nolisten [on\|off]` | 所有人 | 群级随机插话开关（on = 关闭；无参查询状态） |
 | `/chat help` | 所有人 | 用户帮助 |
 | `/chat-admin set-preset <name> [group:\|user:<id>]` | 三层校验 | 跨群/用户设置预设 |
 | `/chat-admin reset [group:\|user:<id>]` | 三层校验 | 跨群/用户重置会话 |
@@ -160,6 +162,11 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 | `AllowAccessMemory` | bool | false | 允许 AI 访问记忆（需启用函数调用） |
 | `AllowWebRequests` | bool | false | 允许 AI 网络请求（需启用函数调用） |
 | `EnableImageRecognition` | bool | true | 识别并下载用户消息中的图片作为视觉输入（无需函数调用） |
+| `StripReasoning` | bool | true | 剥离推理模型思维链（标签/DeepSeek 全角分隔符/孤儿闭标签），仅写日志 |
+| `EnableRandomReplyGroup` | bool | false | 群聊随机插话总开关（未 @机器人 的消息按概率参与） |
+| `GroupRandomReplyChance` | float | 0.02 | 随机插话概率（0~1），命中后仍由模型决定是否发言 |
+| `ReplaceSystemAsUser` | bool | false | 把随机插话的临时 system 提示降级为 user（兼容 GLM 单 system） |
+| `AllowScheduledTasks` | bool | false | 允许 AI 创建/管理定时任务（需启用函数调用） |
 | `MaxRetriesTimes` | int | 15 | 工具调用最大重试次数 |
 | `MaxConversationCacheStoreAmount` | int | 1000 | 最大对话缓存存储数量 |
 | `IsConfigured` | bool | false | 插件是否已配置 |
@@ -170,8 +177,11 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 
 ## 数据持久化
 
-- 会话数据存储在 `self.data['data']`（四个子字典：group/user_conversations、group/user_preset_names），
+- 会话数据存储在 `self.data['data']`（四个会话子字典：group/user_conversations、group/user_preset_names），
   由 DataMixin 自动持久化到 `<workspace>/data.json`；中途保存用 `self._save_data()`
+- 另有 `group_nolisten`（群级随机插话开关，group_id -> bool）与 `scheduled_tasks`
+  （AI 定时任务记录，task_name -> {interval, prompt, session_type, session_id, created_at}），
+  均由 `on_load()` 幂等 `setdefault` 补齐，无需迁移函数
 - v5 事件中 `event.group_id` / `event.user_id` / `event.self_id` 均为 **str**，会话字典键统一为字符串
 
 ## 数据迁移（update.py）
@@ -197,7 +207,10 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 
 - 遵循 OpenAI Function Calling 格式（`type: "function"`, `function.name`, `function.description`, `function.parameters`）
 - 在 `_handle_message()` 的工具分派 `if-elif` 链中添加对应的调用分支
-- 如果工具需要权限控制，添加 `self.get_config('AllowXxx')` 检查
+- 如果工具需要权限控制，添加 `self.get_config('AllowXxx')` 检查，并在
+  `tools.get_available_tools()` 中按开关过滤 schema（双保险，参考定时任务工具）
+- 需要会话上下文的工具（如投递目标）应由分派链注入 `session_type`/`session_id`，
+  不要放进 schema 让模型自由指定
 - 返回 JSON 字符串结果（查询类 API 返回 pydantic model 时经 `_to_jsonable()` 转换）
 
 ## HTTP 请求与图片视觉
@@ -237,6 +250,60 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
   用 `httpx.MockTransport`，对话链路用 `FakeOpenAIClient` + monkeypatch
   `tools._default_http_transport`），覆盖私聊/群聊 @、多图、关闭、下载失败降级
 
+## 思维链剥离（reasoning.py）
+
+移植自 NcatBotTRPG `llm.py`（同作者、同为 AGPL-3.0，文件头已标注来源）。
+
+- `strip_reasoning(text)`：移除 `<think>/<thinking>/<reasoning>/<thought>/<analysis>` 成对标签、
+  未闭合开标签（连同其后内容）、DeepSeek-R1 全角分隔符、孤儿闭标签（其前的思维链残留）
+- `extract_reasoning(text)`：提取思维链文本，仅供日志
+- `main._clean_content()` 统一走 `strip()` +（`StripReasoning` 开启时）`strip_reasoning()`
+- 三处剥离点（缺一不可）：
+  1. 最终回复 `reply_message`
+  2. 工具轮中间正文 `thinking_content`
+  3. `_assistant_message_to_history_dict()` 写入历史的 assistant content
+- `_log_reasoning()` 把思维链 / `reasoning_content` 以 `AI思维链:` 写日志（截断到
+  `OMITTED_TEXT_LENGTH`）；正文为空且无 tool_calls 时按"只有思维链"/"完全没内容"分别告警
+- 仅返回思维链时发送环节保持沉默（不追加 assistant 历史，不加兜底文案）
+
+## 群聊随机插话
+
+`EnableRandomReplyGroup`（默认关）+ `GroupRandomReplyChance`（默认 0.02）：
+
+- `on_group_message` → `_handle_message`：未被 @ 时调用 `_should_random_reply(event)`；
+  命中后视为必须处理（绕过 `MustAtBot`），并在日志标注"随机插话"
+- `_should_random_reply` 依次检查：总开关 → 群级 `group_nolisten` → 概率（clamp 0~1）→
+  消息有效性（纯文本或带图）→ 同群 `RANDOM_REPLY_COOLDOWN_SECONDS`（30s）冷却
+- 自消息过滤：`str(event.user_id) == str(event.self_id)` 直接跳过，避免自问自答
+- `_build_request_messages()` 生成**请求副本**并在 system 之后插入
+  `RANDOM_REPLY_SYSTEM_PROMPT`（不写回会话历史）；`ReplaceSystemAsUser` 开启时该条用 user 角色
+- 随机插话轮 `use_tools=False`（不暴露工具，`tool_choice='none'`）
+- `_is_silent_reply()`：空正文或 `NO_REPLY_PATTERN` 命中（容忍反引号/句点/连字符）→ 不发送、
+  不写 assistant 历史、`_save_data()` 后返回
+- `/chat nolisten on|off`（无参查询）写 `data['data']['group_nolisten'][group_id]`，
+  `on` 表示关闭本群随机插话；所有人可用
+- 测试见 `tests/test_random_reply.py`
+
+## AI 定时任务（tools.manage_cron_tasks）
+
+受 `EnableBuiltinFunctionCalling` + `AllowScheduledTasks`（默认关）双重控制：
+
+- 工具 schema 仅在开关开启时通过 `tools.get_available_tools(allow_scheduled_tasks=...)` 暴露；
+  分派链里仍有二次校验（`AllowScheduledTasks` 未开 → error payload）
+- 目标锁定：schema 只有 `action/task_name/interval/prompt`，`session_type`/`session_id`
+  由 `_handle_message` 按当前事件注入，模型无法指定其他群/私聊
+- 任务名：`^[A-Za-z0-9_\-]{1,32}$`；框架任务名为 `OpenAIChatPlugin:<task_name>`
+  （框架任务名全局唯一、`remove_scheduled_task` 也按名删除，前缀避免误删其他插件任务）
+- `register_scheduled_task()` 工具创建与启动恢复共用；框架以**返回值**表示成功/失败，
+  必须检查，失败不得写入 `data.json`
+- 记录落在 `data['data']['scheduled_tasks']`，`on_load()` 末尾 `_restore_scheduled_tasks()`
+  重新注册；恢复不受 `AllowScheduledTasks` 影响（开关只限制模型管理权限）
+- 回调 `_cron_task_callback()`：`plugin._build_task_messages()`（会话预设 system + prompt）→
+  调模型（无工具）→ `plugin._clean_content()` → `api.qq.post_group_msg/post_private_msg`；
+  空内容不投递；全程 try/except 只记日志（回调跑在调度线程，抛出会阻塞调度）
+- 定时任务结果**不写入**会话历史
+- 测试见 `tests/test_cron_tools.py`（工具可见性/增删查/失败分支/投递/恢复/分派拦截）
+
 ## 测试要求
 
 - 测试放 `tests/`，用 `ncatbot.testing.PluginTestHarness` + MockAdapter 离线驱动，
@@ -251,6 +318,11 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 - 运行（推荐在插件目录内执行）：`python -m pytest tests -v -o "addopts="`
   （仓库根目录 `.\.venv\Scripts\python -m pytest plugins/OpenAIChatPlugin/tests -o "addopts="` 亦可）
 - 对话链路测试须替换 `plugin._default_client` 为 stub（见 `tests/fake_openai.py`），禁止真实网络请求
+- 功能用例：`test_reasoning.py` / `test_reasoning_unit.py`（思维链剥离）、
+  `test_random_reply.py`（随机插话：命中/沉默/冷却/群开关/角色降级）、
+  `test_cron_tools.py`（定时任务：可见性/增删查/失败分支/投递/恢复/分派拦截）
+- `test_trpg_coordination.py` 会在模块级探测 `plugins/NcatBotTRPG/manifest.toml`，
+  插件不存在时整体 skip，而不是加载报错
 
 ## 注意事项
 

@@ -27,6 +27,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
+from functools import partial
 from typing import Any
 from urllib.parse import urlparse
 
@@ -43,11 +44,14 @@ __all__ = [
     'create_http_request',
     'extract_vision_payload',
     'fetch_image_data_url',
+    'get_available_tools',
     'get_environment_info',
     'get_group_info',
     'get_stranger_info',
     'get_system_time',
+    'manage_cron_tasks',
     'query_missing_message_context',
+    'register_scheduled_task',
     'tools',
 ]
 
@@ -69,6 +73,13 @@ DEFAULT_HTTP_TIMEOUT = 15.0
 MAX_HTTP_TIMEOUT = 60.0
 # 默认 transport（None 表示使用 httpx 默认实现；测试中可注入 MockTransport）
 _default_http_transport: httpx.AsyncBaseTransport | None = None
+
+# ---- 定时任务工具限制 ----
+SCHEDULED_TASK_TOOL_NAME = 'manage_cron_tasks'
+# 框架的定时任务名全局唯一（跨插件共享命名空间），加插件前缀避免冲突
+SCHEDULED_TASK_PREFIX = 'OpenAIChatPlugin:'
+# 任务名允许的字符与长度（同时作为持久化字典的键）
+_TASK_NAME_RE = re.compile(r'^[A-Za-z0-9_\-]{1,32}$')
 
 tools = [
     {
@@ -211,6 +222,42 @@ tools = [
                     }
                 },
                 'required': ['method', 'url']
+            }
+        }
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': SCHEDULED_TASK_TOOL_NAME,
+            'description': 'Manage scheduled tasks of this chat session. '
+                           'A task periodically asks the model with the given prompt, '
+                           'then sends the generated reply back to the current session only. '
+                           'Use action="add" to create, "delete" to remove, "list" to view tasks.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'action': {
+                        'type': 'string',
+                        'enum': ['add', 'delete', 'list'],
+                        'description': 'The operation to perform.'
+                    },
+                    'task_name': {
+                        'type': 'string',
+                        'description': 'Unique task name (letters/digits/underscore/hyphen, 1-32 chars). '
+                                       'Required for add and delete.'
+                    },
+                    'interval': {
+                        'type': 'string',
+                        'description': "When to run, e.g. '30s', '2h30m', '0.5d', 'HH:MM' (daily) "
+                                       "or 'YYYY-MM-DD HH:MM:SS' (one-shot). Required for add."
+                    },
+                    'prompt': {
+                        'type': 'string',
+                        'description': 'The instruction sent to the model each time the task runs. '
+                                       'Required for add.'
+                    }
+                },
+                'required': ['action']
             }
         }
     }
@@ -819,3 +866,202 @@ async def create_http_request(
     except Exception as e:
         _log.error(f'HTTP 请求出现未预期错误: {normalized_method} {normalized_url}: {e}')
         return _generate_tool_payload('error', f'请求出现未预期错误: {e}')
+
+
+def get_available_tools(*, allow_scheduled_tasks: bool) -> list[dict]:
+    """返回当前配置下暴露给模型的工具列表。
+
+    定时任务工具默认不对模型可见，只有显式开启 ``AllowScheduledTasks`` 时才加入。
+
+    :param allow_scheduled_tasks: 是否允许模型管理定时任务
+    :return: 工具 schema 列表
+    """
+    if allow_scheduled_tasks:
+        return list(tools)
+    return [tool for tool in tools
+            if tool['function']['name'] != SCHEDULED_TASK_TOOL_NAME]
+
+
+# ======================================================================
+# 四、定时任务工具
+# ======================================================================
+
+def _scheduled_task_key(task_name: str) -> str:
+    """把用户任务名转换为框架任务名（加插件前缀，避免跨插件重名）。"""
+    return f'{SCHEDULED_TASK_PREFIX}{task_name}'
+
+
+def register_scheduled_task(plugin, task_name: str, interval: str, prompt: str,
+                            session_type: str, session_id: str) -> bool:
+    """向框架注册一个定时任务（工具创建与启动恢复共用）。
+
+    :param plugin: 插件实例（需具备 add_scheduled_task）
+    :param task_name: 任务名（不含插件前缀）
+    :param interval: 调度时间参数，交给框架解析
+    :param prompt: 每次执行时发给模型的提示
+    :param session_type: 'group' 或 'private'
+    :param session_id: 投递目标会话 ID
+    :return: 是否注册成功（框架以返回值而非异常表示失败）
+    """
+    return plugin.add_scheduled_task(
+        _scheduled_task_key(task_name),
+        interval,
+        callback=partial(
+            _cron_task_callback, plugin, task_name, prompt, session_type, session_id),
+    )
+
+
+def _build_task_messages(plugin, session_type: str, session_id: str, prompt: str) -> list[dict]:
+    """构造定时任务的请求消息（优先复用插件侧的预设装配逻辑）。
+
+    :param plugin: 插件实例
+    :param session_type: 'group' 或 'private'
+    :param session_id: 会话 ID
+    :param prompt: 任务提示
+    :return: OpenAI 消息列表
+    """
+    builder = getattr(plugin, '_build_task_messages', None)
+    if callable(builder):
+        return builder(session_type, session_id, prompt)
+    return [{'role': 'user', 'content': prompt}]
+
+
+async def _cron_task_callback(plugin, task_name: str, prompt: str,
+                              session_type: str, session_id: str) -> None:
+    """定时任务触发：用会话预设生成回复并投递到创建者会话。
+
+    任何异常都只记录日志、不向上抛（回调运行在调度线程，抛出会阻塞调度）。
+
+    :param plugin: 插件实例
+    :param task_name: 任务名（不含插件前缀）
+    :param prompt: 任务提示
+    :param session_type: 'group' 或 'private'
+    :param session_id: 投递目标会话 ID
+    """
+    _log.info(f'定时任务触发: name={task_name}, target={session_type}:{session_id}')
+    try:
+        client = getattr(plugin, '_default_client', None)
+        if client is None:
+            _log.error(f'定时任务 {task_name} 执行失败: OpenAI 客户端未初始化')
+            return
+
+        response = client.chat.completions.create(
+            model=plugin.get_config('Model'),
+            messages=_build_task_messages(plugin, session_type, session_id, prompt),
+            tools=None,
+            tool_choice='none',
+        )
+        raw_content = response.choices[0].message.content or ''
+        clean = getattr(plugin, '_clean_content', None)
+        content = clean(raw_content) if callable(clean) else raw_content.strip()
+        if not content:
+            _log.warning(f'定时任务 {task_name} 模型返回空内容，已跳过投递')
+            return
+
+        if session_type == 'group':
+            await plugin.api.qq.post_group_msg(session_id, text=content)
+        else:
+            await plugin.api.qq.post_private_msg(session_id, text=content)
+        _log.info(f'定时任务 {task_name} 已投递到 {session_type}:{session_id}（{len(content)} 字）')
+    except Exception as e:
+        _log.error(f'定时任务 {task_name} 执行失败: {e}')
+
+
+def _task_status_payload(plugin, task_name: str) -> dict:
+    """读取框架侧任务状态（下次执行时间 / 已执行次数）。
+
+    :param plugin: 插件实例
+    :param task_name: 任务名（不含插件前缀）
+    :return: 状态字典（任务不在调度器中时返回空字典）
+    """
+    try:
+        status = plugin.get_task_status(_scheduled_task_key(task_name))
+    except Exception as e:
+        _log.debug(f'读取定时任务 {task_name} 状态失败: {e}')
+        return {}
+    if not status:
+        return {}
+    next_run = status.get('next_run')
+    if next_run is not None:
+        next_run = next_run.isoformat() if hasattr(next_run, 'isoformat') else str(next_run)
+    return {'next_run': next_run, 'run_count': status.get('run_count')}
+
+
+async def manage_cron_tasks(plugin, action: str, task_name: str = '', interval: str = '',
+                            prompt: str = '', session_type: str = 'group',
+                            session_id: str = '', **_extra: Any) -> str:
+    """管理定时任务：增（add）/删（delete）/查（list）
+
+    投递目标由插件按当前会话注入（模型无法指定其他群或用户），任务记录保存在
+    ``data['data']['scheduled_tasks']``，重启后由 ``on_load`` 恢复注册。
+
+    :param plugin: 插件实例
+    :param action: 操作类型，支持 add / delete / list
+    :param task_name: 任务名（字母/数字/下划线/连字符，1~32 字符）
+    :param interval: 调度时间参数，支持 ``30s`` / ``2h30m`` / ``0.5d`` / ``HH:MM`` / ``YYYY-MM-DD HH:MM:SS``
+    :param prompt: 每次执行时发送给模型的提示（仅 add）
+    :param session_type: 投递类型 'group' / 'private'（由插件注入）
+    :param session_id: 投递目标会话 ID（由插件注入）
+    :param _extra: 忽略模型多传的未知参数
+    :return: json 字符串，包含操作结果
+    """
+    tasks = plugin.data['data'].setdefault('scheduled_tasks', {})
+
+    if action == 'add':
+        if not task_name or not _TASK_NAME_RE.match(task_name):
+            return _generate_tool_payload(
+                'error', 'task_name 只能包含字母/数字/下划线/连字符，长度 1~32')
+        if not interval:
+            return _generate_tool_payload('error', '添加任务时必须提供 interval')
+        if not prompt or not prompt.strip():
+            return _generate_tool_payload('error', '添加任务时必须提供 prompt')
+        if not session_id:
+            return _generate_tool_payload('error', '无法确定投递会话，已取消创建')
+        if task_name in tasks:
+            return _generate_tool_payload(
+                'error', f'任务 {task_name} 已存在，请先删除或换一个名称')
+
+        if not register_scheduled_task(
+                plugin, task_name, interval, prompt, session_type, str(session_id)):
+            return _generate_tool_payload(
+                'error', f'任务 {task_name} 添加失败（interval 非法或定时任务服务不可用）')
+
+        tasks[task_name] = {
+            'interval': interval,
+            'prompt': prompt,
+            'session_type': session_type,
+            'session_id': str(session_id),
+            'created_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        }
+        plugin._save_data()
+        _log.info(
+            f'已创建定时任务: name={task_name}, interval={interval}, '
+            f'target={session_type}:{session_id}')
+        return _generate_tool_payload('success', f'任务 {task_name} 添加成功', tasks[task_name])
+
+    if action == 'delete':
+        if not task_name:
+            return _generate_tool_payload('error', '删除任务时必须提供 task_name')
+        if task_name not in tasks:
+            return _generate_tool_payload('error', f'任务 {task_name} 不存在')
+        removed = plugin.remove_scheduled_task(_scheduled_task_key(task_name))
+        tasks.pop(task_name, None)
+        plugin._save_data()
+        if not removed:
+            _log.warning(f'任务 {task_name} 不在调度器中，已仅清理持久化记录')
+            return _generate_tool_payload(
+                'success', f'任务 {task_name} 已从记录中移除（调度器中原本不存在）')
+        _log.info(f'已删除定时任务: name={task_name}')
+        return _generate_tool_payload('success', f'任务 {task_name} 删除成功')
+
+    if action == 'list':
+        result = []
+        for name, info in tasks.items():
+            item = {'name': name, **info}
+            item.update(_task_status_payload(plugin, name))
+            result.append(item)
+        _log.info(f'已获取定时任务列表: {len(result)} 个任务')
+        return _generate_tool_payload('success', f'共 {len(result)} 个任务', result)
+
+    return _generate_tool_payload('error', f'不支持的操作类型: {action}')
+

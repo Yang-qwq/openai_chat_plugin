@@ -43,11 +43,14 @@ USER_HELP_TEXT = '''OpenAI Chat Plugin 用户命令帮助：
 
 /chat set-preset <name> - 设置预设（仅限当前用户/群组）
 /chat reset - 重置当前会话
+/chat nolisten [on|off] - 开关本群随机插话（on = 关闭随机插话，off = 开启；不带参数查看当前状态）
 /chat help - 显示此帮助信息
 
 示例：
 /chat set-preset MyPreset
 /chat reset
+/chat nolisten on
+/chat nolisten
 /chat help
 '''
 
@@ -405,6 +408,27 @@ class OpenAICommandHandlerMixin:
                 # 重置会话后持久化数据
                 self._save_data()
                 return
+
+            elif command[1] == 'nolisten':  # 群级随机插话开关
+                if not isinstance(event, GroupMessageEvent):
+                    await event.reply(text='nolisten 命令仅在群聊中有效', at_sender=False)
+                    return
+                group_nolisten = self.data['data'].setdefault('group_nolisten', {})
+                if len(command) < 3:
+                    state = '已关闭' if group_nolisten.get(event.group_id, False) else '已开启'
+                    await event.reply(
+                        text=f'本群随机插话当前{state}（用法：/chat nolisten on|off）', at_sender=False)
+                    return
+                param = command[2].lower()
+                if param not in ('on', 'off'):
+                    await event.reply(text='nolisten 参数必须为 on 或 off', at_sender=False)
+                    return
+                # nolisten on = 本群不再随机插话
+                group_nolisten[event.group_id] = (param == 'on')
+                state = '关闭' if param == 'on' else '开启'
+                await event.reply(text=f'已{state}本群（{event.group_id}）的随机插话', at_sender=False)
+                # 配置变更后持久化数据
+                self._save_data()
 
             elif command[1] == 'help':
                 await event.reply(text=USER_HELP_TEXT, at_sender=False)

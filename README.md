@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -18,6 +18,9 @@
 - 🌐 **网络请求**：AI 可抓取网页（HTML 自动转 Markdown）或调用 JSON API
 - 🖼️ **图片视觉**：AI 可获取图片 URL 并直接“看到”图片内容
 - 👁️ **用户图片识别**：用户发送的图片会被自动下载并交给视觉模型理解（可配置关闭）
+- 🧠 **思维链隔离**：自动剥离 `<think>` / `<reasoning>` / DeepSeek-R1 全角分隔符等思维链，只写日志不外泄
+- 🎲 **群聊随机插话**：按概率参与未 @机器人 的群聊，由模型自行决定是否发言（可群级关闭）
+- ⏰ **AI 定时任务**：AI 可创建周期任务，到点用当前预设生成内容并投递回本会话
 
 ## 📋 系统要求
 
@@ -96,6 +99,11 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 # 重置当前环境会话
 /chat reset
 
+# 关闭 / 开启本群随机插话（不带参数查看当前状态）
+/chat nolisten on
+/chat nolisten off
+/chat nolisten
+
 # 显示帮助信息
 /chat help
 ```
@@ -165,6 +173,11 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 | `AllowAccessMemory`            | boolean | False                     | 是否允许访问会话记忆（内置函数调用功能需要开启）   |
 | `AllowWebRequests`             | boolean | False                     | 是否允许AI进行网络请求（内置函数调用功能需要开启） |
 | `EnableImageRecognition`       | boolean | True                      | 是否识别用户消息中携带的图片并作为视觉输入交给模型（无需开启函数调用） |
+| `StripReasoning`               | boolean | True                      | 是否剥离推理模型的思维链（`<think>` / `<reasoning>` / DeepSeek 全角分隔符等），仅写日志 |
+| `EnableRandomReplyGroup`       | boolean | False                     | 是否允许群聊随机插话（未 @机器人 的消息按概率参与） |
+| `GroupRandomReplyChance`       | number  | 0.02                      | 群聊随机插话概率（0~1），命中后仍由模型决定是否发言 |
+| `ReplaceSystemAsUser`          | boolean | False                     | 把随机插话等临时 system 提示降级为 user，兼容只接受单个 system 的供应商（如智谱 GLM） |
+| `AllowScheduledTasks`          | boolean | False                     | 是否允许 AI 创建/管理定时任务（内置函数调用功能需要开启） |
 | `MaxRetriesTimes`              | integer | 15                        | 工具调用轮次的最大重试次数                         |
 | `MaxConversationCacheStoreAmount` | integer | 1000                    | 最大对话缓存存储数量                               |
 | `EnableGroupOwnerAutoAuth`     | boolean | True                      | 群主/群管理自动放行本群管理员命令                  |
@@ -220,6 +233,50 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 - 请求失败/参数非法/超时都会以工具错误结果返回，不会中断对话
 - 图片会以 data URL 形式附加到上下文；工具历史只保留摘要，避免 base64 占满上下文
 - 网络请求具有访问内网的潜在风险，请仅在可信环境开启 `AllowWebRequests`
+
+### 思维链隔离
+
+默认开启（`StripReasoning: true`）。部分推理模型会把思考过程混进正文，插件会在发送与
+写入会话历史之前统一剥离：
+
+- `<think>` / `<thinking>` / `<reasoning>` / `<thought>` / `<analysis>` 成对标签
+- 未闭合的开标签：连同其后的全部内容一并移除（宁缺毋滥）
+- DeepSeek-R1 全角分隔符 `<｜begin▁of▁thinking｜>…<｜end▁of▁thinking｜>`
+- provider 已剥掉开标签、只剩 `</think>` 的孤儿闭标签：其前的思维链残留一并移除
+
+思维链（含 API 的 `reasoning_content` 字段）只以 `AI思维链:` 写入日志，不会发送给用户；
+若模型仅返回思维链而无正文，插件保持沉默而不是把思考过程发出去。
+
+### 群聊随机插话
+
+关闭时群聊仍需 @机器人（`MustAtBot`）。开启 `EnableRandomReplyGroup` 后，未 @机器人 的
+群消息会按 `GroupRandomReplyChance` 概率参与对话：
+
+- 命中后仍由模型决定是否发言：模型输出 `NO_REPLY` 或空正文时插件保持沉默
+- 随机插话轮不启用工具调用（省 token、避免随机产生副作用）
+- 同一群有 30 秒冷却，避免连续刷屏；机器人自己的消息不参与
+- 群内任何人可用 `/chat nolisten on` 关闭本群随机插话（`off` 重新开启，不带参数查看状态）
+- 该开关保存在插件工作区 `data.json` 的 `group_nolisten` 中
+- 只接受单个 system 的供应商（如智谱 GLM）可将 `ReplaceSystemAsUser` 置为 true，
+  随机插话的临时提示会改用 user 角色，预设提示词仍是唯一的 system
+
+### AI 定时任务
+
+需要同时开启 `EnableBuiltinFunctionCalling` 与 `AllowScheduledTasks`。开启后模型可调用
+`manage_cron_tasks` 工具：
+
+| action | 说明 |
+|--------|------|
+| `add` | 创建任务，需要 `task_name`、`interval`、`prompt` |
+| `delete` | 删除任务，需要 `task_name` |
+| `list` | 查看本会话的任务与下次执行时间 |
+
+- 到点后插件用**当前会话预设** + `prompt` 调一次模型，把生成的回复投递回创建者所在会话
+  （模型无法指定其他群/私聊，避免越权骚扰）
+- `interval` 支持 `30s`、`2h30m`、`0.5d`、`HH:MM`（每日）、`YYYY-MM-DD HH:MM:SS`（一次性）
+- 任务记录保存在 `data.json` 的 `scheduled_tasks`，重启后自动重新注册
+- 任务名仅允许字母/数字/下划线/连字符（1~32 字符）；同一插件内不可重名
+- 定时任务生成的内容不写入会话历史，避免污染日常对话
 
 ### 多配置文件支持
 
@@ -278,6 +335,14 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.4.0
+
+- 🧠 **思维链隔离**：移植 NcatBotTRPG 的思维链剥离逻辑，自动移除 `<think>` / `<reasoning>` / DeepSeek 全角分隔符与孤儿闭标签；思维链只写日志，不进入回复与会话历史（新增 `StripReasoning`，默认开启）
+- 🎲 **群聊随机插话**：未 @机器人 的群消息按概率参与，命中后由模型决定是否发言（`NO_REPLY`/空正文即沉默）；新增 `EnableRandomReplyGroup`、`GroupRandomReplyChance`、`/chat nolisten` 群级开关与 30s 冷却
+- ⏰ **AI 定时任务**：新增 `manage_cron_tasks` 工具（add/delete/list），到点用当前预设生成内容并投递回创建者会话；任务落 `data.json`、重启恢复，受 `AllowScheduledTasks` 控制（默认关闭）
+- 🌐 **GLM 兼容**：新增 `ReplaceSystemAsUser`，把随机插话等临时 system 提示降级为 user，保证只有预设是 system
+- 🧪 **测试**：补齐思维链、随机插话与定时任务测试；NcatBotTRPG 不存在时自动跳过跨插件协调测试
 
 ### v0.3.0
 

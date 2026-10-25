@@ -4,17 +4,21 @@
 
 本模块集中处理三类迁移，统一遵循「幂等、失败不阻塞插件加载」的原则：
 
-1. 目录拼写修正（v0.2.x 内部）
+1. 目录拼写修正（v3）
    早期 v5 版本把预设目录拼写为 presents/，现统一修正为 presets/
    —— migrate_presents_dir()
 
-2. 4.x -> 5.x 运行时数据迁移
+2. 4.x -> 5.x 运行时数据迁移（v3）
    旧 data/openai_chat_plugin/ 中的预设目录与会话数据迁移到插件工作区
    —— migrate_legacy_workspace()
 
 3. 记忆格式升级（v0.1.0 -> v0.1.4+）
    各预设目录下 memory.json 的旧结构升级为新结构
    —— needs_memory_migration() / migrate_memory_format()
+
+4. 新增数据键（无需迁移函数）
+   group_nolisten / scheduled_tasks 等新键由 main.on_load() 中的 setdefault 幂等补齐，
+   旧版 data.json 缺字段时会在加载阶段自动补全，因此这里不提供迁移函数。
 
 调用顺序由 main.on_load() 决定：先修正目录拼写，再迁移 4.x 数据，最后升级记忆格式。
 

@@ -14,14 +14,20 @@ from ncatbot.testing.factories.qq import group_message
 
 from fake_openai import make_client
 
-pytestmark = pytest.mark.asyncio
-
 PLUGINS_DIR = Path(__file__).resolve().parents[2]
 OPENAI_PLUGIN = "OpenAIChatPlugin"
 TRPG_PLUGIN = "NcatBotTRPG"
 ROOT_QQ = "123456"  # ncatbot_test_config.yaml 的 root，用于群内开团
 GROUP_ID = "200200"
 SELF_ID = "10001"
+
+pytestmark = [
+    pytest.mark.asyncio,
+    pytest.mark.skipif(
+        not (PLUGINS_DIR / TRPG_PLUGIN / "manifest.toml").is_file(),
+        reason="NcatBotTRPG 插件不存在，跳过跨插件协调测试",
+    ),
+]
 
 
 def _harness() -> PluginTestHarness:

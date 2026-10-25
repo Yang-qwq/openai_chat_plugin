@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 import json
 import os
+import random
+import re
+import time
 import traceback
 
 from ncatbot.core import registrar
@@ -11,7 +14,7 @@ from ncatbot.utils import get_config_manager
 from ncatbot.utils.logger import get_log
 from openai import OpenAI
 
-from . import exceptions, tools
+from . import exceptions, reasoning, tools
 from .command_handler import (
     ADMIN_PERMISSION,
     DEFAULT_PRESET_NAME,
@@ -30,6 +33,18 @@ _log = get_log('openai_chat_plugin')  # 日志记录器
 # 省略文本长度
 OMITTED_TEXT_LENGTH = 100
 
+# 随机插话时临时插入的提示词（不写入会话历史）：让模型自行判断是否值得插话
+RANDOM_REPLY_SYSTEM_PROMPT = (
+    '现在你处于群聊随机插话模式：这条消息并没有 @ 你，是否参与完全由你决定。\n'
+    '只有当内容与你的设定相关、且你确实有值得补充的内容时才简短发言；'
+    '如果只是日常闲聊、你没什么可说的，或插话会显得突兀，请只输出 NO_REPLY（不要输出任何其他内容）。\n'
+    '不要复述本条提示，也不要解释你的判断。'
+)
+# 随机插话的「不发言」哨兵：容忍 NO_REPLY / NO-REPLY / `no_reply` 等写法
+NO_REPLY_PATTERN = re.compile(r'^\W*no[_\-\s]?reply\W*$', re.IGNORECASE)
+# 同一群的随机插话最小间隔（秒），防止连续刷屏
+RANDOM_REPLY_COOLDOWN_SECONDS = 30
+
 
 class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
     """OpenAI 对话插件（NcatBot 5）
@@ -38,7 +53,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
     """
 
     name = 'OpenAIChatPlugin'  # 插件名（须与 manifest.toml 一致）
-    version = '0.3.0'  # 插件版本（须与 manifest.toml 一致）
+    version = '0.4.0'  # 插件版本（须与 manifest.toml 一致）
     author = 'Yang-qwq'
     description = 'OpenAI 对话插件：多预设管理、函数调用（Function Calling）、会话持久化'
 
@@ -59,8 +74,12 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             'AllowAccessMemory': False,
             # 是否允许AI进行网络请求（内置函数调用功能需要开启）
             'AllowWebRequests': False,
+            # 是否允许AI创建/管理定时任务（内置函数调用功能需要开启）
+            'AllowScheduledTasks': False,
             # 是否识别并下载用户消息中携带的图片，作为视觉输入交给模型（无需开启函数调用）
             'EnableImageRecognition': True,
+            # 是否剥离推理模型的思维链（<think>/<reasoning> 等标签），防止思维链暴露给用户或污染历史
+            'StripReasoning': True,
             # 启用内置函数调用功能时，模型调用工具后重新生成回复的最大重试次数
             'MaxRetriesTimes': 15,
             # 最大对话缓存存储数量，用于AI获取非唤醒时错过的上下文消息，超过该数量的最早消息将被丢弃
@@ -68,6 +87,9 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             'IsConfigured': False,  # 插件是否已配置
             # 群主/群管理自动放行本群管理员命令（/chat-admin）
             'EnableGroupOwnerAutoAuth': True,
+            'EnableRandomReplyGroup': False,  # 是否随机回复群消息
+            'GroupRandomReplyChance': 0.02,  # 群随机回复概率（0~1）
+            'ReplaceSystemAsUser': False,  # 在部分AI提供商中只允许出现单个 system 提示词（如智谱 GLM），启用后将 system 提示词替换为 user 消息段
         })
 
         # ---- RBAC：注册管理员权限点并自动授予 root（幂等） ----
@@ -82,14 +104,21 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             'group_conversations': {},
             'user_conversations': {},
             'group_preset_names': {},
-            'user_preset_names': {}
+            'user_preset_names': {},
+            # 群级随机插话开关：group_id -> bool（True = 该群不再随机插话）
+            'group_nolisten': {},
+            # AI 定时任务记录：task_name -> {interval, prompt, session_type, session_id, created_at}
+            'scheduled_tasks': {}
         })
         for key in ('group_conversations', 'user_conversations',
-                    'group_preset_names', 'user_preset_names'):
+                    'group_preset_names', 'user_preset_names', 'group_nolisten',
+                    'scheduled_tasks'):
             self.data['data'].setdefault(key, {})
 
         # 准备历史信息查询缓存 kv（query_missing_message_context 工具使用）
         self.temp_history_messages_kv = {}
+        # 随机插话冷却时间记录（内存态，不持久化）：group_id -> monotonic 时间戳
+        self._last_random_reply_ts: dict[str, float] = {}
 
         workspace_path = str(self.workspace)
 
@@ -100,7 +129,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             else:
                 _log.debug('预设目录无需重命名')
         except Exception as e:
-            _log.error(f'重命名预设目录失败：{e}')
+            _log.error(f'重命名预设目录失败: {e}')
 
         # ---- 一次性迁移旧版 4.x 运行时数据到 v5 新位置（失败不阻塞加载） ----
         try:
@@ -109,7 +138,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             else:
                 _log.debug('未检测到需要迁移的 4.x 运行时数据')
         except Exception as e:  # 迁移失败不应阻塞插件整体加载
-            _log.error(f'迁移旧版运行时数据失败：{e}')
+            _log.error(f'迁移旧版运行时数据失败: {e}')
 
         # ---- 记忆格式升级迁移（legacy memory.json -> v0.1.4+，失败不阻塞加载） ----
         try:
@@ -119,7 +148,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             else:
                 _log.debug('未检测到需要迁移的数据，跳过记忆格式升级')
         except Exception as e:
-            _log.error(f'迁移记忆数据失败：{e}')
+            _log.error(f'迁移记忆数据失败: {e}')
 
         # ---- 检查/创建默认预设 ----
         default_config_path = os.path.join(workspace_path, 'presets', DEFAULT_PRESET_NAME, 'config.yaml')
@@ -159,6 +188,93 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             base_url=self.get_config('BaseUrl')
         )
 
+        # ---- 恢复持久化的 AI 定时任务（失败不阻塞加载） ----
+        self._restore_scheduled_tasks()
+
+    def _restore_scheduled_tasks(self) -> None:
+        """把 data.json 中记录的定时任务重新注册到框架调度器。
+
+        任务记录不会因为 ``AllowScheduledTasks`` 关闭而删除，该开关只控制模型能否
+        新增/管理任务；注册失败时保留记录并记录警告，便于排查 interval 等问题。
+        """
+        tasks = self.data['data'].get('scheduled_tasks') or {}
+        if not tasks:
+            return
+        restored = 0
+        for task_name, info in tasks.items():
+            if not isinstance(info, dict):
+                continue
+            ok = tools.register_scheduled_task(
+                self,
+                task_name,
+                info.get('interval', ''),
+                info.get('prompt', ''),
+                info.get('session_type', 'group'),
+                str(info.get('session_id', '')),
+            )
+            if ok:
+                restored += 1
+            else:
+                _log.warning(f'定时任务 {task_name} 恢复失败（interval 非法或定时任务服务不可用）')
+        if restored:
+            _log.info(f'已恢复 {restored}/{len(tasks)} 个 AI 定时任务')
+
+    def _build_task_messages(self, session_type: str, session_id: str, prompt: str) -> list[dict]:
+        """构造定时任务的请求消息：会话当前预设的 system + 任务提示。
+
+        :param session_type: 'group' 或 'private'
+        :param session_id: 会话 ID
+        :param prompt: 任务提示
+        :return: OpenAI 消息列表
+        """
+        conversation_dict = 'group_conversations' if session_type == 'group' else 'user_conversations'
+        try:
+            preset_name = self._get_preset_name(conversation_dict, str(session_id))
+        except Exception:
+            preset_name = DEFAULT_PRESET_NAME
+
+        preset = Preset()
+        if not preset.load(str(self.workspace), preset_name):
+            preset = Preset()
+            if not preset.load(str(self.workspace), DEFAULT_PRESET_NAME):
+                _log.warning('定时任务找不到可用预设，将以无 system 提示的方式执行')
+                return [{'role': 'user', 'content': prompt}]
+        return list(preset.to_conversations()) + [{'role': 'user', 'content': prompt}]
+
+    def _clean_content(self, content: str | None) -> str:
+        """按配置剥离思维链并去除首尾空白。
+
+        :param content: 模型返回的原始正文
+        :return: 可直接发送/写入历史的正文
+        """
+        cleaned = (content or '').strip()
+        if self.get_config('StripReasoning'):
+            cleaned = reasoning.strip_reasoning(cleaned)
+        return cleaned
+
+    def _log_reasoning(self, message, content: str) -> None:
+        """提取并打印思维链（仅写日志，不发送给用户）。
+
+        :param message: API 返回的 assistant 消息（可能含 reasoning_content 字段）
+        :param content: 该消息的正文内容
+        """
+        reasoning_text = reasoning.extract_reasoning(content)
+        field_reasoning = getattr(message, 'reasoning_content', None)
+        if field_reasoning:
+            field_reasoning = str(field_reasoning).strip()
+            reasoning_text = (f'{reasoning_text}\n{field_reasoning}'
+                              if reasoning_text else field_reasoning)
+        if reasoning_text:
+            _log.info(
+                f'AI思维链: {reasoning_text[:OMITTED_TEXT_LENGTH]}'
+                f'{"..." if len(reasoning_text) > OMITTED_TEXT_LENGTH else ""}'
+            )
+        if not content and not getattr(message, 'tool_calls', None):
+            if reasoning_text:
+                _log.warning('模型仅返回思维链而无正文，已忽略以避免暴露思维链')
+            else:
+                _log.warning('模型未返回任何正文内容')
+
     def _assistant_message_to_history_dict(self, assistant_message) -> dict:
         """将 API 返回的 assistant 消息转为可写入 messages 历史的 dict（含 tool_calls）。
 
@@ -166,9 +282,10 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         :return: dict, 可写入 messages 历史的 dict（含 tool_calls）
         """
         content = assistant_message.content
-        # 部分模型会在正文首尾输出换行/空格，统一去除，避免历史与回复出现多余空白
+        # 部分模型会在正文首尾输出换行/空格，统一去除，避免历史与回复出现多余空白；
+        # 同时剥离思维链，避免把 <think>…</think> 之类的推理过程写入会话历史
         if isinstance(content, str):
-            content = content.strip() or None
+            content = self._clean_content(content) or None
         entry: dict = {'role': 'assistant', 'content': content}
         tcs = assistant_message.tool_calls
         if tcs:
@@ -193,6 +310,79 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         """
         return f'{event.sender.nickname}({event.sender.user_id}): {event.raw_message}' if self.get_config(
             'InsertUserdataAsPrefix') else event.raw_message
+
+    # ------------------------------------------------------------------
+    # 随机插话（群聊非 @ 消息按概率参与）
+    # ------------------------------------------------------------------
+
+    def _should_random_reply(self, event: GroupMessageEvent) -> bool:
+        """判断本条群消息是否触发随机插话。
+
+        依次检查：功能开关 → 群级 nolisten → 概率 → 消息有效性 → 群冷却。
+
+        :param event: 群消息事件
+        :return: 是否随机插话
+        """
+        if not self.get_config('EnableRandomReplyGroup'):
+            return False
+
+        group_id = str(event.group_id)
+        if self.data['data'].get('group_nolisten', {}).get(group_id, False):
+            return False
+
+        try:
+            chance = float(self.get_config('GroupRandomReplyChance'))
+        except (TypeError, ValueError):
+            _log.warning('GroupRandomReplyChance 不是有效数字，已跳过随机插话')
+            return False
+        if chance <= 0:
+            return False
+        chance = min(chance, 1.0)
+
+        # 纯 @ / 空消息不参与（笔记：text 只含纯文本段）
+        if not event.message.text.strip() and not event.message.filter_image():
+            return False
+
+        now = time.monotonic()
+        if now - self._last_random_reply_ts.get(group_id, 0.0) < RANDOM_REPLY_COOLDOWN_SECONDS:
+            return False
+
+        if random.random() >= chance:
+            return False
+
+        self._last_random_reply_ts[group_id] = now
+        return True
+
+    def _build_request_messages(self, conversation: list[dict],
+                                random_reply: bool = False) -> list[dict]:
+        """构造本次 API 请求的消息列表（副本，不写回会话历史）。
+
+        随机插话时插入一条临时提示；``ReplaceSystemAsUser`` 开启时该提示改用
+        user 角色，以兼容只接受单个 system 的供应商（如智谱 GLM）。
+
+        :param conversation: 会话消息列表
+        :param random_reply: 本次是否为随机插话
+        :return: 供 API 使用的消息列表副本
+        """
+        messages = list(conversation)
+        if not random_reply:
+            return messages
+        hint_role = 'user' if self.get_config('ReplaceSystemAsUser') else 'system'
+        insert_at = 1 if messages and messages[0].get('role') == 'system' else 0
+        messages.insert(insert_at, {'role': hint_role, 'content': RANDOM_REPLY_SYSTEM_PROMPT})
+        return messages
+
+    @staticmethod
+    def _is_silent_reply(text: str) -> bool:
+        """随机插话的「不发言」判定：空正文或模型只回 NO_REPLY 哨兵。
+
+        :param text: 已剥离思维链并 strip 的回复正文
+        :return: 是否应保持沉默
+        """
+        stripped = (text or '').strip()
+        if not stripped:
+            return True
+        return NO_REPLY_PATTERN.match(stripped) is not None
 
     async def _extract_user_image_visions(self, event: MessageEvent) -> list[dict]:
         """识别并下载用户消息中携带的图片，返回视觉输入信息列表。
@@ -263,6 +453,10 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         if event.raw_message.strip().startswith('/'):
             return
 
+        # 不处理机器人自己发出的消息，避免自问自答循环
+        if str(event.user_id) == str(event.self_id):
+            return
+
         # 检查是否已配置插件
         if not self.get_config('IsConfigured'):
             # _log.warning('插件未配置，请先配置插件后再使用')
@@ -275,21 +469,27 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
 
         user_message = await self._build_user_message(event)
 
+        random_reply = False
         if is_group:  # 群消息
             conversation_dict = 'group_conversations'
-
-            # 检查是否必须@机器人才能触发对话
-            if self.get_config('MustAtBot'):
-                at_bot = any(
-                    isinstance(segment, At) and segment.user_id == str(event.self_id)
-                    for segment in event.message
-                )
-                if not at_bot:
-                    _log.debug('群消息未@机器人，忽略该消息')
-                    return
-                _log.debug('群消息已@机器人，处理该消息')
-
             session_id = event.group_id
+
+            at_bot = any(
+                isinstance(segment, At) and segment.user_id == str(event.self_id)
+                for segment in event.message
+            )
+
+            # 未被 @ 时按概率决定是否随机插话
+            if not at_bot:
+                random_reply = self._should_random_reply(event)
+                if random_reply:
+                    _log.info(f'[群组 {session_id}] 命中随机插话概率，本次消息将参与群聊')
+
+            # 检查是否必须@机器人才能触发对话（随机插话命中时绕过该限制）
+            if self.get_config('MustAtBot') and not at_bot and not random_reply:
+                _log.debug('群消息未@机器人，忽略该消息')
+                return
+            _log.debug('群消息已@机器人，处理该消息' if at_bot else '群消息随机插话，处理该消息')
         else:  # 私聊消息
             conversation_dict = 'user_conversations'
             session_id = event.user_id
@@ -336,23 +536,32 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         response = None
         try:
             current_retries_times = 0
+            # 随机插话场景禁用工具调用：省 token，且避免随机消息产生副作用
+            use_tools = self.get_config('EnableBuiltinFunctionCalling') and not random_reply
+            available_tools = tools.get_available_tools(
+                allow_scheduled_tasks=self.get_config('AllowScheduledTasks')) if use_tools else None
 
             # 如果启用了内置函数调用功能，则在模型想要调用工具时会循环执行工具调用并获取结果，
             # 直到模型不再想要调用工具或达到最大重试次数为止
             while current_retries_times < self.get_config('MaxRetriesTimes'):
                 response = self._default_client.chat.completions.create(
                     model=self.get_config('Model'),
-                    messages=self.data['data'][conversation_dict][session_id],
-                    tools=tools.tools if self.get_config('EnableBuiltinFunctionCalling') else None,
-                    tool_choice='auto' if self.get_config('EnableBuiltinFunctionCalling') else 'none',
+                    messages=self._build_request_messages(
+                        self.data['data'][conversation_dict][session_id], random_reply),
+                    tools=available_tools,
+                    tool_choice='auto' if use_tools else 'none',
                 )
 
                 _log.debug(
-                    f'请求尝试：{current_retries_times + 1}/{self.get_config("MaxRetriesTimes")}，'
+                    f'请求尝试: {current_retries_times + 1}/{self.get_config("MaxRetriesTimes")}，'
                     f'模型回复: {response.choices[0].message.content}, '
                     f'finish_reason: {response.choices[0].finish_reason}, '
                     f'tool_calls: {response.choices[0].message.tool_calls}'
                 )
+
+                # 思维链只写日志，绝不进入回复与会话历史
+                self._log_reasoning(
+                    response.choices[0].message, response.choices[0].message.content or '')
 
                 # 模型是否主动停止生成回复
                 if response.choices[0].finish_reason == 'stop':
@@ -360,10 +569,10 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                     break
 
                 # 检查模型是否想要调用工具
-                if self.get_config('EnableBuiltinFunctionCalling'):
+                if use_tools:
                     if response.choices[0].message.tool_calls:
                         current_retries_times += 1
-                        thinking_content = (response.choices[0].message.content or '').strip()
+                        thinking_content = self._clean_content(response.choices[0].message.content)
                         if thinking_content:
                             _log.info(
                                 f'[{"群组" if is_group else "用户"} {session_id}] '
@@ -431,6 +640,20 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                                     _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许网络请求功能')
                                 else:
                                     result = await tools.create_http_request(**tool_args)
+                            elif tool_name == 'manage_cron_tasks':
+                                if not self.get_config('AllowScheduledTasks'):
+                                    # 双保险：未开启时即使模型看到 schema 也无法创建任务
+                                    result = tools._generate_tool_payload(
+                                        'error', '`AllowScheduledTasks` 配置未启用，无法管理定时任务')
+                                    _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许定时任务功能')
+                                else:
+                                    # 投递目标强制为当前会话，模型无法指定其他群/用户
+                                    result = await tools.manage_cron_tasks(
+                                        self,
+                                        session_type='group' if is_group else 'private',
+                                        session_id=str(session_id),
+                                        **tool_args,
+                                    )
                             else:
                                 _log.warning(f'未知工具调用请求: {tool_name}')
                                 result = tools._generate_tool_payload('error', f'未知工具: {tool_name}')
@@ -474,8 +697,16 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                 return
 
             last_msg = response.choices[0].message
-            # 模型可能在正文首尾输出换行/空格（日志中常见 "\n\n你好..."），发送前统一去除
-            reply_message = (last_msg.content or '').strip()
+            # 模型可能在正文首尾输出换行/空格（日志中常见 "\n\n你好..."），发送前统一去除；
+            # 同时剥离思维链，避免把推理过程发送给用户
+            reply_message = self._clean_content(last_msg.content)
+
+            # 随机插话：模型回空正文或 NO_REPLY 哨兵时保持沉默（不发送、不写 assistant 历史）
+            if random_reply and self._is_silent_reply(reply_message):
+                _log.info(f'[群组 {session_id}] 随机插话未命中/模型选择不发言，已跳过发送')
+                self._save_data()
+                return
+
             # 最后一轮 API 仍在请求工具时 while 已无法继续，content 往往为空，避免 reply(None)
             if last_msg.tool_calls and not reply_message:
                 raise exceptions.TooManyToolCallsException('抱歉，连续工具调用次数已达上限')
@@ -538,7 +769,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         # 如果不存在群记录，则新建该key
         self.temp_history_messages_kv.setdefault(group_key, []).append(await self._build_user_message(event))
         _log.debug(
-            f'[群组 {group_key}:{event.user_id}] 记录消息：'
+            f'[群组 {group_key}:{event.user_id}] 记录消息: '
             f'{event.raw_message[:100]}{"..." if len(event.raw_message) > 100 else ""}')
 
         # 长度超过限制时删除最早的消息
