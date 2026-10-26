@@ -180,7 +180,7 @@ async def test_random_reply_hint_always_user(tmp_path, monkeypatch):
 
     部分网关（如 AMD Radeon、智谱 GLM）只接受位于开头的单个 system，
     第二条 system 会被 400 拒绝（'System message must be at the beginning.'），
-    因此提示角色不再可配置。
+    因此提示角色不再可配置。提示紧邻本次用户消息，不写回会话历史。
     """
     monkeypatch.chdir(tmp_path)
     _force_random_hit(monkeypatch)
@@ -198,3 +198,34 @@ async def test_random_reply_hint_always_user(tmp_path, monkeypatch):
         hint = [m for m in messages if "NO_REPLY" in str(m["content"])]
         assert len(hint) == 1
         assert hint[0]["role"] == "user"
+        # 提示紧贴本次用户消息，而不是插在 system 之后
+        assert messages[-2] is hint[0]
+
+
+async def test_random_reply_hint_inserted_before_latest_message(tmp_path, monkeypatch):
+    """已有历史时，提示插在本次用户消息之前，且不写回会话历史"""
+    monkeypatch.chdir(tmp_path)
+    _force_random_hit(monkeypatch)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        client = _configure(plugin, ["第一次插话", "第二次插话"])
+        (plugin.workspace / "presets" / "default" / "prompt.md").write_text(
+            "你是一个群友", encoding="utf-8")
+
+        await h.inject(_group_text("第一条消息"))
+        await h.settle()
+        # 绕过 30s 冷却，模拟一段时间后的第二条消息
+        plugin._last_random_reply_ts.clear()
+        await h.inject(_group_text("第二条消息"))
+        await h.settle()
+
+        messages = client.chat.completions.calls[1]["messages"]
+        assert [m["role"] for m in messages] == [
+            "system", "user", "assistant", "user", "user"]
+        assert messages[-1]["content"] == "第二条消息"
+        assert "NO_REPLY" in messages[-2]["content"]
+        # 提示只存在于本次请求副本，不写回持久化历史
+        session = plugin.data["data"]["group_conversations"][GROUP_ID]
+        assert [m["role"] for m in session] == [
+            "system", "user", "assistant", "user", "assistant"]
+        assert all("NO_REPLY" not in str(m.get("content")) for m in session)

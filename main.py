@@ -443,15 +443,19 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         system，第二条 system 会被 400 拒绝
         （'System message must be at the beginning.'）。
 
-        :param conversation: 会话消息列表
+        提示插在**本次用户消息之前**（而非 system 之后）：既让指令贴近最新
+        消息、避免长历史下被稀释，也保留 system 之后的历史前缀缓存；同时不会
+        把提示伪装成早先的独立用户轮次。
+
+        :param conversation: 会话消息列表（末尾为本次用户消息）
         :param random_reply: 本次是否为随机插话
         :return: 供 API 使用的消息列表副本
         """
         messages = list(conversation)
-        if not random_reply:
+        if not random_reply or not messages:
             return messages
-        insert_at = 1 if messages and messages[0].get('role') == 'system' else 0
-        messages.insert(insert_at, {'role': 'user', 'content': RANDOM_REPLY_SYSTEM_PROMPT})
+        messages.insert(len(messages) - 1,
+                        {'role': 'user', 'content': RANDOM_REPLY_SYSTEM_PROMPT})
         return messages
 
     @staticmethod

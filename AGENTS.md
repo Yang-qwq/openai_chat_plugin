@@ -287,9 +287,10 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 - `_should_random_reply` 依次检查：总开关 → 群级 `group_nolisten` → 概率（clamp 0~1）→
   消息有效性（纯文本或带图）→ 同群 `RANDOM_REPLY_COOLDOWN_SECONDS`（30s）冷却
 - 自消息过滤：`str(event.user_id) == str(event.self_id)` 直接跳过，避免自问自答
-- `_build_request_messages()` 生成**请求副本**并在 system 之后插入
+- `_build_request_messages()` 生成**请求副本**并在**本次用户消息之前**插入
   `RANDOM_REPLY_SYSTEM_PROMPT`（不写回会话历史）；该条固定用 user 角色，
-  避免第二条 system 被严格网关（AMD Radeon、GLM 等）400 拒绝
+  避免第二条 system 被严格网关（AMD Radeon、GLM 等）400 拒绝。放在末尾而非
+  system 之后，是为了让提示贴近最新消息并复用历史前缀缓存
 - 随机插话轮 `use_tools=False`（不暴露工具，`tool_choice='none'`）
 - `_is_silent_reply()`：空正文或 `NO_REPLY_PATTERN` 命中（容忍反引号/句点/连字符）→ 不发送、
   不写 assistant 历史、`_save_data()` 后返回
@@ -367,7 +368,7 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
   （仓库根目录 `.\.venv\Scripts\python -m pytest plugins/OpenAIChatPlugin/tests -o "addopts="` 亦可）
 - 对话链路测试须替换 `plugin._default_client` 为 stub（见 `tests/fake_openai.py`），禁止真实网络请求
 - 功能用例：`test_reasoning.py` / `test_reasoning_unit.py`（思维链剥离）、
-  `test_random_reply.py`（随机插话：命中/沉默/冷却/群开关/角色降级）、
+  `test_random_reply.py`（随机插话：命中/沉默/冷却/群开关/提示固定 user 角色）、
   `test_cron_tools.py`（定时任务：可见性/增删查/失败分支/投递/恢复/分派拦截）
 - `test_trpg_coordination.py` 会在模块级探测 `plugins/NcatBotTRPG/manifest.toml`，
   插件不存在时整体 skip，而不是加载报错
