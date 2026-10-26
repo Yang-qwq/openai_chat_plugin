@@ -59,7 +59,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
     """
 
     name = 'OpenAIChatPlugin'  # 插件名（须与 manifest.toml 一致）
-    version = '0.4.1'  # 插件版本（须与 manifest.toml 一致）
+    version = '0.4.2'  # 插件版本（须与 manifest.toml 一致）
     author = 'Yang-qwq'
     description = 'OpenAI 对话插件：多预设管理、函数调用（Function Calling）、会话持久化'
 
@@ -98,7 +98,6 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             'EnableGroupOwnerAutoAuth': True,
             'EnableRandomReplyGroup': False,  # 是否随机回复群消息
             'GroupRandomReplyChance': 0.02,  # 群随机回复概率（0~1）
-            'ReplaceSystemAsUser': False,  # 在部分AI提供商中只允许出现单个 system 提示词（如智谱 GLM），启用后将 system 提示词替换为 user 消息段
         })
 
         # ---- RBAC：注册管理员权限点并自动授予 root（幂等） ----
@@ -439,8 +438,10 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                                 random_reply: bool = False) -> list[dict]:
         """构造本次 API 请求的消息列表（副本，不写回会话历史）。
 
-        随机插话时插入一条临时提示；``ReplaceSystemAsUser`` 开启时该提示改用
-        user 角色，以兼容只接受单个 system 的供应商（如智谱 GLM）。
+        随机插话时插入一条临时提示，固定使用 user 角色。不用 system 是因为
+        部分网关（如 AMD Radeon、智谱 GLM）只接受位于消息列表开头的单个
+        system，第二条 system 会被 400 拒绝
+        （'System message must be at the beginning.'）。
 
         :param conversation: 会话消息列表
         :param random_reply: 本次是否为随机插话
@@ -449,9 +450,8 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         messages = list(conversation)
         if not random_reply:
             return messages
-        hint_role = 'user' if self.get_config('ReplaceSystemAsUser') else 'system'
         insert_at = 1 if messages and messages[0].get('role') == 'system' else 0
-        messages.insert(insert_at, {'role': hint_role, 'content': RANDOM_REPLY_SYSTEM_PROMPT})
+        messages.insert(insert_at, {'role': 'user', 'content': RANDOM_REPLY_SYSTEM_PROMPT})
         return messages
 
     @staticmethod

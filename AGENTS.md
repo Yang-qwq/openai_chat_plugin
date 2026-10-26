@@ -176,7 +176,6 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 | `StripReasoning` | bool | true | 剥离推理模型思维链（标签/DeepSeek 全角分隔符/孤儿闭标签），仅写日志 |
 | `EnableRandomReplyGroup` | bool | false | 群聊随机插话总开关（未 @机器人 的消息按概率参与） |
 | `GroupRandomReplyChance` | float | 0.02 | 随机插话概率（0~1），命中后仍由模型决定是否发言 |
-| `ReplaceSystemAsUser` | bool | false | 把随机插话的临时 system 提示降级为 user（兼容 GLM 单 system） |
 | `AllowScheduledTasks` | bool | false | 允许 AI 创建/管理定时任务（需启用函数调用） |
 | `EnableScheduledTaskExecution` | bool | true | 定时任务执行总开关（kill switch），关闭后不注册/不执行 |
 | `MaxRetriesTimes` | int | 15 | 工具调用最大重试次数 |
@@ -289,7 +288,8 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
   消息有效性（纯文本或带图）→ 同群 `RANDOM_REPLY_COOLDOWN_SECONDS`（30s）冷却
 - 自消息过滤：`str(event.user_id) == str(event.self_id)` 直接跳过，避免自问自答
 - `_build_request_messages()` 生成**请求副本**并在 system 之后插入
-  `RANDOM_REPLY_SYSTEM_PROMPT`（不写回会话历史）；`ReplaceSystemAsUser` 开启时该条用 user 角色
+  `RANDOM_REPLY_SYSTEM_PROMPT`（不写回会话历史）；该条固定用 user 角色，
+  避免第二条 system 被严格网关（AMD Radeon、GLM 等）400 拒绝
 - 随机插话轮 `use_tools=False`（不暴露工具，`tool_choice='none'`）
 - `_is_silent_reply()`：空正文或 `NO_REPLY_PATTERN` 命中（容忍反引号/句点/连字符）→ 不发送、
   不写 assistant 历史、`_save_data()` 后返回

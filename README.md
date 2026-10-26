@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.4.1-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.4.2-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -185,7 +185,6 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 | `StripReasoning`               | boolean | True                      | 是否剥离推理模型的思维链（`<think>` / `<reasoning>` / DeepSeek 全角分隔符等），仅写日志 |
 | `EnableRandomReplyGroup`       | boolean | False                     | 是否允许群聊随机插话（未 @机器人 的消息按概率参与） |
 | `GroupRandomReplyChance`       | number  | 0.02                      | 群聊随机插话概率（0~1），命中后仍由模型决定是否发言 |
-| `ReplaceSystemAsUser`          | boolean | False                     | 把随机插话等临时 system 提示降级为 user，兼容只接受单个 system 的供应商（如智谱 GLM） |
 | `AllowScheduledTasks`          | boolean | False                     | 是否允许 AI 创建/管理定时任务（内置函数调用功能需要开启） |
 | `EnableScheduledTaskExecution` | boolean | True                      | 定时任务执行总开关（kill switch）；关闭后不注册/不执行，记录保留 |
 | `MaxRetriesTimes`              | integer | 15                        | 工具调用轮次的最大重试次数                         |
@@ -267,8 +266,8 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 - 同一群有 30 秒冷却，避免连续刷屏；机器人自己的消息不参与
 - 群内任何人可用 `/chat nolisten on` 关闭本群随机插话（`off` 重新开启，不带参数查看状态）
 - 该开关保存在插件工作区 `data.json` 的 `group_nolisten` 中
-- 只接受单个 system 的供应商（如智谱 GLM）可将 `ReplaceSystemAsUser` 置为 true，
-  随机插话的临时提示会改用 user 角色，预设提示词仍是唯一的 system
+- 随机插话的临时提示固定使用 user 角色（预设提示词仍是唯一的 system），
+  兼容只接受单个 system 的供应商（如智谱 GLM、AMD Radeon 网关）
 
 ### AI 定时任务
 
@@ -365,6 +364,10 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.4.2
+
+- 🔧 **移除 `ReplaceSystemAsUser` 配置**：随机插话的临时提示现在固定使用 user 角色（预设提示词仍是唯一的 system）。第二条 system 会被严格网关以 400 `System message must be at the beginning.` 拒绝（实测 AMD Radeon 网关 + Qwen3.8-27B），该开关已无存在必要，部署中如有设置可直接删除
 
 ### v0.4.1
 

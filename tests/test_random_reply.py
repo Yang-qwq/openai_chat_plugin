@@ -2,7 +2,7 @@
 """群聊随机插话测试
 
 覆盖：概率命中绕过 MustAtBot、模型回 NO_REPLY/空正文保持沉默、群级 nolisten、
-冷却时间、ReplaceSystemAsUser 兼容单 system 供应商。
+冷却时间、插话提示固定 user 角色（避免双 system 被严格网关拒绝）。
 
 运行：python -m pytest tests -v -o "addopts="
 """
@@ -175,18 +175,18 @@ async def test_random_reply_cooldown(tmp_path, monkeypatch):
         h.assert_api("send_group_msg").times(1)
 
 
-@pytest.mark.parametrize("replace_system, expected_roles", [
-    (True, ["system", "user", "user"]),
-    (False, ["system", "system", "user"]),
-])
-async def test_replace_system_as_user_hint_role(tmp_path, monkeypatch, replace_system, expected_roles):
-    """ReplaceSystemAsUser 开启时随机插话提示降级为 user，保证只有预设是 system"""
+async def test_random_reply_hint_always_user(tmp_path, monkeypatch):
+    """随机插话的临时提示固定为 user 角色，保证预设是唯一的 system
+
+    部分网关（如 AMD Radeon、智谱 GLM）只接受位于开头的单个 system，
+    第二条 system 会被 400 拒绝（'System message must be at the beginning.'），
+    因此提示角色不再可配置。
+    """
     monkeypatch.chdir(tmp_path)
     _force_random_hit(monkeypatch)
     async with _harness() as h:
         plugin = h.get_plugin(PLUGIN_NAME)
         client = _configure(plugin, ["好的"])
-        plugin.config["ReplaceSystemAsUser"] = replace_system
         (plugin.workspace / "presets" / "default" / "prompt.md").write_text(
             "你是一个群友", encoding="utf-8")
 
@@ -194,7 +194,7 @@ async def test_replace_system_as_user_hint_role(tmp_path, monkeypatch, replace_s
         await h.settle()
 
         messages = client.chat.completions.calls[0]["messages"]
-        assert [m["role"] for m in messages] == expected_roles
+        assert [m["role"] for m in messages] == ["system", "user", "user"]
         hint = [m for m in messages if "NO_REPLY" in str(m["content"])]
         assert len(hint) == 1
-        assert hint[0]["role"] == ("user" if replace_system else "system")
+        assert hint[0]["role"] == "user"
