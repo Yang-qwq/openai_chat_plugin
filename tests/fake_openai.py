@@ -1,5 +1,14 @@
 # -*- coding: utf-8 -*-
 """OpenAI 客户端 stub：隔离真实网络，驱动对话链路测试。"""
+import httpx
+from openai import RateLimitError
+
+
+def make_rate_limit_error() -> RateLimitError:
+    """构造 SDK 的 429 异常，用于模拟重试耗尽后的限流失败"""
+    request = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
+    return RateLimitError(
+        "429 rate limit", response=httpx.Response(429, request=request), body=None)
 
 
 class FakeMessage:
@@ -43,7 +52,11 @@ class FakeCompletions:
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        return self.responses.pop(0)
+        item = self.responses.pop(0)
+        # 允许脚本中放异常实例，用于驱动限流/网络错误等失败分支
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
 
 class FakeChat:

@@ -18,6 +18,7 @@ from fake_openai import (
     FakeOpenAIClient,
     FakeResponse,
     FakeToolCall,
+    make_rate_limit_error,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -61,6 +62,22 @@ async def test_private_chat_reply_and_history(tmp_path, monkeypatch):
         session = plugin.data["data"]["user_conversations"][ROOT_QQ]
         roles = [m["role"] for m in session]
         assert roles == ["user", "assistant"]
+
+
+async def test_private_chat_rate_limit_replies_friendly(tmp_path, monkeypatch):
+    """私聊遇到持续限流（429，重试耗尽）时回复可读提示，而不是内部错误"""
+    monkeypatch.chdir(tmp_path)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        _configure(plugin, [make_rate_limit_error()])
+
+        await h.inject(private_message("你好", user_id=ROOT_QQ))
+        await h.settle()
+
+        h.assert_api("send_private_msg").called().with_text("请求过于频繁，请稍后再试")
+        # 失败的一轮不写入 assistant 历史
+        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        assert [m["role"] for m in session] == ["user"]
 
 
 async def test_reply_strips_leading_and_trailing_whitespace(tmp_path, monkeypatch):

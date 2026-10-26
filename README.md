@@ -268,6 +268,8 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 - 该开关保存在插件工作区 `data.json` 的 `group_nolisten` 中
 - 随机插话的临时提示固定使用 user 角色（预设提示词仍是唯一的 system），
   兼容只接受单个 system 的供应商（如智谱 GLM、AMD Radeon 网关）
+- 请求遇瞬时限流（429）时由 OpenAI SDK 自动指数退避重试；重试耗尽仍被限流时
+  随机插话静默放弃（不往群里发错误提示），@/私聊则回复「请求过于频繁，请稍后再试」
 
 ### AI 定时任务
 
@@ -304,8 +306,8 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
   - `/chat-admin task delete <name>`：删除任意任务（可跨会话清理）
   - `/chat-admin task pause` / `resume`：暂停/恢复执行总开关 `EnableScheduledTaskExecution`，
     暂停时任务记录保留，恢复后重新注册未停用的任务
-- 同步 OpenAI 请求通过线程池（`asyncio.to_thread`）执行，单请求默认超时 60 秒、重试 1 次，
-  定时任务不会阻塞事件循环
+- 同步 OpenAI 请求通过线程池（`asyncio.to_thread`）执行，单请求默认超时 60 秒；
+  429/5xx 由 SDK 指数退避重试 4 次（并遵守 `Retry-After`），定时任务不会阻塞事件循环
 
 ### 多配置文件支持
 
@@ -368,6 +370,7 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ### v0.4.2
 
 - 🔧 **移除 `ReplaceSystemAsUser` 配置**：随机插话的临时提示现在固定使用 user 角色（预设提示词仍是唯一的 system）。第二条 system 会被严格网关以 400 `System message must be at the beginning.` 拒绝（实测 AMD Radeon 网关 + Qwen3.8-27B），该开关已无存在必要，部署中如有设置可直接删除
+- 🛡️ **429 限流容错**：OpenAI 请求最大重试次数从 1 提高到 4（SDK 指数退避 + 遵守 `Retry-After`）；重试耗尽仍限流时随机插话静默放弃，@/私聊回复「请求过于频繁，请稍后再试」，不再报「插件出现内部错误」
 
 ### v0.4.1
 

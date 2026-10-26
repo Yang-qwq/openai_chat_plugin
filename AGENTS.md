@@ -292,6 +292,8 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
   避免第二条 system 被严格网关（AMD Radeon、GLM 等）400 拒绝。放在末尾而非
   system 之后，是为了让提示贴近最新消息并复用历史前缀缓存
 - 随机插话轮 `use_tools=False`（不暴露工具，`tool_choice='none'`）
+- 请求限流（429）由 SDK 按 `REQUEST_MAX_RETRIES`（4 次，指数退避）自动重试；
+  重试耗尽仍 429 时随机插话静默放弃，@/私聊回复「请求过于频繁，请稍后再试」
 - `_is_silent_reply()`：空正文或 `NO_REPLY_PATTERN` 命中（容忍反引号/句点/连字符）→ 不发送、
   不写 assistant 历史、`_save_data()` 后返回
 - `/chat nolisten on|off`（无参查询）写 `data['data']['group_nolisten'][group_id]`，

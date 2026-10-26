@@ -14,7 +14,13 @@ import pytest
 from ncatbot.testing import PluginTestHarness
 from ncatbot.testing.factories.qq import group_message
 
-from fake_openai import FakeChoice, FakeMessage, FakeOpenAIClient, FakeResponse
+from fake_openai import (
+    FakeChoice,
+    FakeMessage,
+    FakeOpenAIClient,
+    FakeResponse,
+    make_rate_limit_error,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -36,7 +42,9 @@ def _configure(plugin, replies, *, chance=1.0):
     plugin.config["EnableRandomReplyGroup"] = True
     plugin.config["GroupRandomReplyChance"] = chance
     client = FakeOpenAIClient([
-        FakeResponse(FakeChoice(FakeMessage(reply), "stop")) for reply in replies
+        reply if isinstance(reply, BaseException)
+        else FakeResponse(FakeChoice(FakeMessage(reply), "stop"))
+        for reply in replies
     ])
     plugin._default_client = client
     return client
@@ -229,3 +237,20 @@ async def test_random_reply_hint_inserted_before_latest_message(tmp_path, monkey
         assert [m["role"] for m in session] == [
             "system", "user", "assistant", "user", "assistant"]
         assert all("NO_REPLY" not in str(m.get("content")) for m in session)
+
+
+async def test_random_reply_rate_limit_stays_silent(tmp_path, monkeypatch):
+    """随机插话遇到持续限流（429，重试耗尽）时静默放弃，不向群里发错误提示"""
+    monkeypatch.chdir(tmp_path)
+    _force_random_hit(monkeypatch)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        _configure(plugin, [make_rate_limit_error()])
+
+        await h.inject(_group_text())
+        await h.settle()
+
+        # 不发送任何消息（既不是 AI 回复，也不是「插件内部错误」）
+        h.assert_api("send_group_msg").not_called()
+        session = plugin.data["data"]["group_conversations"][GROUP_ID]
+        assert [m["role"] for m in session] == ["user"]

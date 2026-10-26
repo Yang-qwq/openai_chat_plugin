@@ -64,3 +64,11 @@ async def test_default_preset_created(tmp_path, monkeypatch):
         preset_dir = plugin.workspace / "presets" / "default"
         assert (preset_dir / "config.yaml").is_file()
         assert (preset_dir / "prompt.md").is_file()
+
+
+async def test_openai_client_retry_budget(tmp_path, monkeypatch):
+    """客户端重试次数足够消化瞬时 429（生产环境曾因只重试 1 次而失败）"""
+    monkeypatch.chdir(tmp_path)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        assert plugin._default_client.max_retries >= 3

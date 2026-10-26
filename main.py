@@ -13,7 +13,7 @@ from ncatbot.plugin import NcatBotPlugin
 from ncatbot.types import At
 from ncatbot.utils import get_config_manager
 from ncatbot.utils.logger import get_log
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 from . import exceptions, reasoning, tools
 from .command_handler import (
@@ -48,8 +48,10 @@ RANDOM_REPLY_COOLDOWN_SECONDS = 30
 # 单次 OpenAI 请求超时（秒）。同步客户端在网络异常时可能长时间阻塞，
 # 因此限制单请求耗时并减少重试，避免定时任务卡住事件循环太久
 REQUEST_TIMEOUT_SECONDS = 60.0
-# 请求失败后的最大重试次数（SDK 默认 2 次，这里收紧到 1 次）
-REQUEST_MAX_RETRIES = 1
+# 请求限流/服务端错误的最大重试次数（SDK 会对 408/409/429/5xx 做指数退避，
+# 并遵守响应头 Retry-After）。生产环境出现过瞬时 429：只重试 1 次时，第二次
+# 仍被限流就会把异常抛给用户，因此放宽到 4 次（最多 5 次尝试）
+REQUEST_MAX_RETRIES = 4
 
 
 class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
@@ -702,8 +704,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                     if not self.get_config('AllowAccessMemory'):
                         # 如果不允许访问记忆功能，则拒绝工具调用请求并返回错误信息
                         result = tools._generate_tool_payload(
-                            'error', '`AllowAccessMemory` 配置未启用，当前无法使用记忆功能；'
-                                     '请告知用户在 config.yaml 的 plugin_configs.OpenAIChatPlugin 中开启该配置')
+                            'error', '`AllowAccessMemory` 配置未启用，当前无法使用记忆功能')
                         _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许访问记忆功能')
                     else:
                         # 来源由会话/创建者决定（定时任务无创建者时记为未知）
@@ -716,8 +717,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                     if not self.get_config('AllowWebRequests'):
                         # 如果不允许网络请求功能，则拒绝工具调用请求并返回错误信息
                         result = tools._generate_tool_payload(
-                            'error', '`AllowWebRequests` 配置未启用，当前无法进行网络请求；'
-                                     '请告知用户在 config.yaml 的 plugin_configs.OpenAIChatPlugin 中开启该配置')
+                            'error', '`AllowWebRequests` 配置未启用，当前无法进行网络请求')
                         _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许网络请求功能')
                     else:
                         result = await tools.create_http_request(**tool_args)
@@ -725,8 +725,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                     if not self.get_config('AllowScheduledTasks'):
                         # 工具始终对模型可见，开关关闭时由这里拒绝并给出提示
                         result = tools._generate_tool_payload(
-                            'error', '`AllowScheduledTasks` 配置未启用，当前无法管理定时任务；'
-                                     '请告知用户在 config.yaml 的 plugin_configs.OpenAIChatPlugin 中开启该配置')
+                            'error', '`AllowScheduledTasks` 配置未启用，当前无法管理定时任务')
                         _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许定时任务功能')
                     else:
                         # 投递目标强制为当前会话，模型无法指定其他群/用户
@@ -906,6 +905,16 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             self._save_data()
         except exceptions.TooManyToolCallsException as e:
             await event.reply(text=str(e), at_sender=False)
+
+        except RateLimitError:
+            # SDK 已按 REQUEST_MAX_RETRIES 指数退避重试，仍 429 说明限流持续存在。
+            # 随机插话静默放弃，避免往群里发错误提示；@/私聊给出可读提示
+            _log.warning(
+                f'[{"群组" if is_group else "用户"} {session_id}] OpenAI 请求触发限流（429），'
+                f'本次{"随机插话" if random_reply else "对话"}已放弃')
+            self._save_data()
+            if not random_reply:
+                await event.reply(text='请求过于频繁，请稍后再试', at_sender=False)
 
         except Exception:
             _log.error(traceback.format_exc())
