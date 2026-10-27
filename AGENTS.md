@@ -13,6 +13,7 @@ OpenAIChatPlugin/
 ├── manifest.toml        # 插件清单（name/version/main/entry_class/pip_dependencies）
 ├── __init__.py          # 导出 OpenAIChatPlugin
 ├── main.py              # 插件入口：init_defaults、RBAC 注册、消息处理、事件回调
+├── prompt.py            # 集中管理硬编码提示词（随机插话提示、视觉说明、定时任务内部消息等）
 ├── command_handler.py   # 命令 Mixin：/chat、/chat-admin、/chatrbac + 三层权限校验
 ├── preset_manager.py   # 预设管理：Preset 类（config.yaml + prompt.md）
 ├── reasoning.py         # 思维链剥离（移植自 NcatBotTRPG llm.py）：strip_reasoning / extract_reasoning
@@ -23,6 +24,18 @@ OpenAIChatPlugin/
 ├── tests/               # pytest 测试（PluginTestHarness + MockAdapter 离线驱动）
 └── README.md            # 用户文档
 ```
+
+## 提示词管理（prompt.py）
+
+所有会作为消息内容发给模型的自然语言提示集中在 `prompt.py`，调整措辞时无需翻 `main.py`：
+
+- `RANDOM_REPLY_SYSTEM_PROMPT`：随机插话临时提示（固定 user 角色，不写回会话历史）
+- `IMAGE_ONLY_USER_TEXT`：用户仅发图片、无文字时的兜底文本
+- `TOOL_VISION_IMAGE_TEXT`：工具返回图片后附加视觉消息的引导文本
+- `SCHEDULED_TASK_MESSAGE_TEMPLATE` / `build_scheduled_task_message()`：定时任务轮次的内部消息
+
+边界：Function Calling 的工具名/描述/参数说明属于工具 schema，仍在 `tools.py`；
+用户自定义的 system 提示词来自预设目录的 `prompt.md`，不放进 `prompt.py`。
 
 ## 架构层次
 
@@ -172,6 +185,8 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 | `EnableBuiltinFunctionCalling` | bool | false | 启用内置函数调用 |
 | `AllowAccessMemory` | bool | false | 允许 AI 访问记忆（需启用函数调用） |
 | `AllowWebRequests` | bool | false | 允许 AI 网络请求（需启用函数调用） |
+| `AllowLoopbackIps` | bool | false | 允许 HTTP/图片请求访问回环地址（127.0.0.0/8、::1） |
+| `AllowLocalNetworkIps` | bool | false | 允许 HTTP/图片请求访问内网地址（10/8、172.16/12、192.168/16、fc00::/7 等） |
 | `EnableImageRecognition` | bool | true | 识别并下载用户消息中的图片作为视觉输入（无需函数调用） |
 | `StripReasoning` | bool | true | 剥离推理模型思维链（标签/DeepSeek 全角分隔符/孤儿闭标签），仅写日志 |
 | `EnableRandomReplyGroup` | bool | false | 群聊随机插话总开关（未 @机器人 的消息按概率参与） |
@@ -235,12 +250,42 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
   默认超时 15s（上限 60s），文本响应上限 2 MiB、图片上限 5 MiB
 - `data` 按 JSON 请求体发送；`headers` / `params` 可选；所有异常与非法参数
   都转为 `status: error` payload，不会向上抛异常中断对话
+- **SSRF 防护**：`_check_protected_host()` 在**每一跳请求前**校验目标主机——
+  IP 字面量直接判定，域名经 `_dns_resolver()`（默认 `asyncio.getaddrinfo`，
+  在线程池执行不阻塞事件循环）解析后对**全部** A/AAAA 记录逐条判定，任一命中
+  即拒绝；DNS 解析失败一律拒绝（fail-closed）。拦截规则（`_classify_ip()`）：
+  1. 回环（127.0.0.0/8、::1、IPv4-mapped `::ffff:127.0.0.1`）——受 `AllowLoopbackIps` 控制
+  2. 内网/私有段（10/8、172.16/12、192.168/16、fc00::/7 等）——受 `AllowLocalNetworkIps` 控制
+  3. **一律拦截、无配置项**：链路本地（含云元数据 `169.254.169.254`）、
+     未指定（0.0.0.0、::）、组播、保留段、非全局可路由地址（CGNAT 100.64/10 等）
+- 重定向**手动逐跳跟随**（`follow_redirects=False` + `MAX_HTTP_REDIRECTS = 5`），
+  每一跳重新校验主机与协议（`_resolve_redirect_target()`），防止「公网 URL
+  302 到内网地址」绕过；303/302 除 HEAD 外降级为 GET、301 仅 POST 降级、307/308
+  保持方法与请求体（均与 httpx 默认一致）；查询参数不带到下一跳；图片来源
+  记录最终跳 URL
+- 手动跟随重定向后需自行复刻 httpx 的请求头清理（`_redirect_headers()`）：跨源
+  移除 `Authorization` / `Proxy-Authorization`（http→https 同主机保留）与 `Host`
+  （由 httpx 重建），任何重定向都移除 `Cookie`；方法降级为 GET 时移除
+  `Content-Length` / `Transfer-Encoding`。缺失这些清理会把凭据泄露给重定向目标
+- 网络层错误文案统一为「请求失败：…」，不区分超时/连接失败/DNS 失败，
+  避免被当作端口与路径存在性探测的 oracle（HTTP 状态码与响应片段仍保留）
+- 配置由 `main.py` 分派链注入（`allow_loopback_ips` / `allow_local_network_ips`
+  参数），模型传入的同名参数一律 `pop` 忽略，不能自行放行
+- 已知权衡：采用「请求前解析校验」而非「用解析出的 IP 建连、Host 头保留原域名」
+  的 pinning 方案（后者需要自定义 TLS 上下文才能保住 HTTPS 证书校验），
+  存在理论上的 DNS rebinding 窗口；对本插件「模型/提示注入驱动」的威胁模型
+  足够，重定向绕过已逐 hop 堵死
 - `image` 模式返回 `_generate_vision_tool_payload()` 的 data URL；`main.py`
   用 `extract_vision_payload()` 识别后：
   1. 工具历史只写入 `_vision_summary_payload()`（不含 base64）
   2. 等本轮所有 tool 消息追加完，再追加一条带 `image_url` 的 user 视觉消息
+- 用户图片识别链路（`tools.fetch_image_data_url` 的 http/https 分支）共用
+  同一道 SSRF 闸门与手动重定向逻辑；策略同样由 `main._extract_user_image_visions()`
+  按运营配置注入
 - 测试用 `httpx.MockTransport` 注入：单测直接传 `transport=`，
-  插件链路测试 monkeypatch `tools._default_http_transport`；禁止真实网络请求
+  插件链路测试 monkeypatch `tools._default_http_transport`；DNS 解析统一
+  monkeypatch `tools._dns_resolver` 为返回公网 IP 的 stub（否则 SSRF 校验
+  会发起真实 DNS 请求）；禁止真实网络请求。详见 `tests/test_ssrf.py`
 
 ## 用户图片识别（视觉输入）
 
@@ -250,6 +295,9 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 - 遍历 `event.message.filter_image()`，取每个图片段的 `url`（优先）或 `file` 作为来源
 - 经 `tools.fetch_image_data_url(source)` 下载并校验：
   - 来源可为 http/https URL 或本地文件路径；本地文件直接读字节
+  - http/https 分支共用 HTTP 工具的 SSRF 闸门（主机校验 + 手动逐跳重定向，
+    策略按 `AllowLoopbackIps` / `AllowLocalNetworkIps` 注入），防止伪造的
+    图片消息段指向内网/云元数据地址
   - 按文件头**魔数**推断 MIME（`_sniff_image_mime`），支持 PNG / JPEG / GIF / WEBP / BMP；
     不依赖扩展名 / Content-Type，非受支持格式返回 None
   - 流式读取，超过 5 MiB（`MAX_IMAGE_RESPONSE_BYTES`）中止；任何异常均返回 None，不向上抛
@@ -291,7 +339,13 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
   `RANDOM_REPLY_SYSTEM_PROMPT`（不写回会话历史）；该条固定用 user 角色，
   避免第二条 system 被严格网关（AMD Radeon、GLM 等）400 拒绝。放在末尾而非
   system 之后，是为了让提示贴近最新消息并复用历史前缀缓存
-- 随机插话轮 `use_tools=False`（不暴露工具，`tool_choice='none'`）
+- 随机插话轮**保留工具能力**（与普通聊天一致，受 `EnableBuiltinFunctionCalling`
+  与各 `AllowXxx` 开关约束）；工具轮写入**工作副本**，最终发言（回复成功）才提交回
+  主会话，因此回 `NO_REPLY` 时不会留下「user → assistant(tool_calls) → tool」半截轮次
+- 随机插话轮的工具中间正文**不投递**到群（避免「先说话再沉默」）；工具轮上限
+  （`TooManyToolCallsException`）与内部错误在随机轮同样静默，只写日志
+- 提示词明确「调用工具后若仍无值得补充的内容，依旧只输出 NO_REPLY」，避免模型
+  因为用过工具而强行发言
 - 请求限流（429）由 SDK 按 `REQUEST_MAX_RETRIES`（4 次，指数退避）自动重试；
   重试耗尽仍 429 时随机插话静默放弃，@/私聊回复「请求过于频繁，请稍后再试」
 - `_is_silent_reply()`：空正文或 `NO_REPLY_PATTERN` 命中（容忍反引号/句点/连字符）→ 不发送、
@@ -371,7 +425,9 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 - 对话链路测试须替换 `plugin._default_client` 为 stub（见 `tests/fake_openai.py`），禁止真实网络请求
 - 功能用例：`test_reasoning.py` / `test_reasoning_unit.py`（思维链剥离）、
   `test_random_reply.py`（随机插话：命中/沉默/冷却/群开关/提示固定 user 角色）、
-  `test_cron_tools.py`（定时任务：可见性/增删查/失败分支/投递/恢复/分派拦截）
+  `test_cron_tools.py`（定时任务：可见性/增删查/失败分支/投递/恢复/分派拦截）、
+  `test_ssrf.py`（SSRF 防护：地址段分类/主机校验/重定向逐跳复核/配置注入与
+  模型参数隔离）
 - `test_trpg_coordination.py` 会在模块级探测 `plugins/NcatBotTRPG/manifest.toml`，
   插件不存在时整体 skip，而不是加载报错
 

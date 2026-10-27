@@ -1,6 +1,6 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.4.2-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.4.3-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
 
@@ -181,6 +181,8 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 | `EnableBuiltinFunctionCalling` | boolean | False                     | 是否启用内置函数调用功能                           |
 | `AllowAccessMemory`            | boolean | False                     | 是否允许访问会话记忆（内置函数调用功能需要开启）   |
 | `AllowWebRequests`             | boolean | False                     | 是否允许AI进行网络请求（内置函数调用功能需要开启） |
+| `AllowLoopbackIps`             | boolean | False                     | 是否允许网络/图片请求访问回环地址（如 127.0.0.1、::1） |
+| `AllowLocalNetworkIps`         | boolean | False                     | 是否允许网络/图片请求访问内网地址（如 10.x、192.168.x、fc00::） |
 | `EnableImageRecognition`       | boolean | True                      | 是否识别用户消息中携带的图片并作为视觉输入交给模型（无需开启函数调用） |
 | `StripReasoning`               | boolean | True                      | 是否剥离推理模型的思维链（`<think>` / `<reasoning>` / DeepSeek 全角分隔符等），仅写日志 |
 | `EnableRandomReplyGroup`       | boolean | False                     | 是否允许群聊随机插话（未 @机器人 的消息按概率参与） |
@@ -242,6 +244,16 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 - 请求失败/参数非法/超时都会以工具错误结果返回，不会中断对话
 - 图片会以 data URL 形式附加到上下文；工具历史只保留摘要，避免 base64 占满上下文
 - 网络请求具有访问内网的潜在风险，请仅在可信环境开启 `AllowWebRequests`
+- **SSRF 防护**：插件在每一跳请求前校验目标主机，默认仅允许公网地址——
+  - 回环（`127.0.0.1`、`::1`）与内网段（`10/8`、`172.16/12`、`192.168/16`、
+    `fc00::/7` 等）分别受 `AllowLoopbackIps` / `AllowLocalNetworkIps` 控制，
+    默认拒绝
+  - 链路本地地址（含云元数据 `169.254.169.254`）、未指定、组播、保留段等
+    **一律拒绝，不提供放行开关**
+  - 重定向由插件手动逐跳跟随并重新校验，公网 URL 302 到内网地址也会被拦截；
+    跨源重定向不会携带 `Authorization` / `Cookie`，`Host` 按目标主机重建
+  - 网络错误的提示文案统一为「请求失败」，不泄露具体是超时还是连接被拒
+  - 用户发送图片的下载链路共用同一套校验
 
 ### 思维链隔离
 
@@ -262,7 +274,11 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 群消息会按 `GroupRandomReplyChance` 概率参与对话：
 
 - 命中后仍由模型决定是否发言：模型输出 `NO_REPLY` 或空正文时插件保持沉默
-- 随机插话轮不启用工具调用（省 token、避免随机产生副作用）
+- 随机插话轮同样保留工具调用能力（与普通聊天一致，受 `EnableBuiltinFunctionCalling`
+  与各 `AllowXxx` 开关约束）；工具轮只在最终发言成功后写入会话历史，回 `NO_REPLY`
+  时整轮回滚，不会污染上下文
+- 工具轮产生的中间正文不会投递到群里，避免「先说话再沉默」；工具轮上限与内部错误
+  同样静默处理
 - 同一群有 30 秒冷却，避免连续刷屏；机器人自己的消息不参与
 - 群内任何人可用 `/chat nolisten on` 关闭本群随机插话（`off` 重新开启，不带参数查看状态）
 - 该开关保存在插件工作区 `data.json` 的 `group_nolisten` 中
@@ -366,6 +382,15 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.4.3
+
+- 🛡️ **SSRF 防护**：HTTP 工具与用户图片下载链路在每一跳请求前校验目标主机，修复开启 `AllowWebRequests` 后可经 `http://169.254.169.254/…`、`http://127.0.0.1:…` 等读取云元数据/内网服务的问题（[issue #23](https://github.com/Yang-qwq/openai_chat_plugin/issues/23) R1）
+  - 回环地址（含 IPv4-mapped 写法）受新配置 `AllowLoopbackIps` 控制（默认关）、内网段受 `AllowLocalNetworkIps` 控制（默认关）；链路本地（含云元数据）、未指定、组播、保留段等一律拦截，无放行开关
+  - 域名主机解析 DNS 后对全部 A/AAAA 记录逐条校验，任一命中即拒绝；DNS 解析失败同样拒绝
+  - 重定向改由插件手动逐跳跟随（上限 5 跳），每一跳重新校验主机与协议，防止「公网 URL 302 到内网地址」绕过；301/302/303 降级 POST 为 GET（与原 httpx 行为一致），307/308 保持方法与请求体
+  - 网络错误文案统一为「请求失败：…」，不再区分超时/连接失败，避免被当作端口与路径探测的 oracle
+  - 模型无法通过工具参数自行放行受限地址（同名参数一律忽略，策略只由运营配置决定）
 
 ### v0.4.2
 

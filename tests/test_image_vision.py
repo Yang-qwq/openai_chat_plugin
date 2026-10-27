@@ -50,6 +50,16 @@ NOT_IMAGE_BYTES = b'hello this is not an image'
 
 IMAGE_URL = 'https://qpic.example.com/pic/1.jpg'
 
+# 公网 IP：stub DNS 解析器统一返回，避免单测发起真实 DNS 请求（SSRF 校验需要解析主机）
+PUBLIC_IP = '93.184.216.34'
+
+
+@pytest.fixture(autouse=True)
+def _stub_dns_resolver(monkeypatch):
+    async def _resolver(host: str) -> list[str]:
+        return [PUBLIC_IP]
+    monkeypatch.setattr(plugin_tools, '_dns_resolver', _resolver)
+
 
 # ==================== fetch_image_data_url / _sniff_image_mime 单元测试 ====================
 
@@ -141,11 +151,16 @@ def _harness() -> PluginTestHarness:
 
 
 def _patch_image_transport(monkeypatch, plugin, content: bytes):
-    """让插件 main 实际使用的 tools 模块走 MockTransport 下载图片"""
+    """让插件 main 实际使用的 tools 模块走 MockTransport 下载图片，
+    并 stub DNS 解析器避免真实 DNS 请求（SSRF 主机校验需要解析主机）"""
     main_module = sys.modules[plugin.__class__.__module__]
     monkeypatch.setattr(
         main_module.tools, '_default_http_transport',
         _transport_for(content, content_type='image/png'))
+
+    async def _resolver(host: str) -> list[str]:
+        return [PUBLIC_IP]
+    monkeypatch.setattr(main_module.tools, '_dns_resolver', _resolver)
 
 
 async def test_private_image_attached_as_vision_message(tmp_path, monkeypatch):

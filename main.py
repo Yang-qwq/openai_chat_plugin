@@ -22,6 +22,12 @@ from .command_handler import (
     OpenAICommandHandlerMixin,
 )
 from .preset_manager import Preset
+from .prompt import (
+    IMAGE_ONLY_USER_TEXT,
+    RANDOM_REPLY_SYSTEM_PROMPT,
+    TOOL_VISION_IMAGE_TEXT,
+    build_scheduled_task_message,
+)
 from .update import (
     migrate_legacy_workspace,
     migrate_memory_format,
@@ -34,13 +40,6 @@ _log = get_log('openai_chat_plugin')  # 日志记录器
 # 省略文本长度
 OMITTED_TEXT_LENGTH = 100
 
-# 随机插话时临时插入的提示词（不写入会话历史）：让模型自行判断是否值得插话
-RANDOM_REPLY_SYSTEM_PROMPT = (
-    '现在你处于群聊随机插话模式：这条消息并没有 @ 你，是否参与完全由你决定。\n'
-    '只有当内容与你的设定相关、且你确实有值得补充的内容时才简短发言；'
-    '如果只是日常闲聊、你没什么可说的，或插话会显得突兀，请只输出 NO_REPLY（不要输出任何其他内容）。\n'
-    '不要复述本条提示，也不要解释你的判断。'
-)
 # 随机插话的「不发言」哨兵：容忍 NO_REPLY / NO-REPLY / `no_reply` 等写法
 NO_REPLY_PATTERN = re.compile(r'^\W*no[_\-\s]?reply\W*$', re.IGNORECASE)
 # 同一群的随机插话最小间隔（秒），防止连续刷屏
@@ -61,7 +60,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
     """
 
     name = 'OpenAIChatPlugin'  # 插件名（须与 manifest.toml 一致）
-    version = '0.4.2'  # 插件版本（须与 manifest.toml 一致）
+    version = '0.4.3'  # 插件版本（须与 manifest.toml 一致）
     author = 'Yang-qwq'
     description = 'OpenAI 对话插件：多预设管理、函数调用（Function Calling）、会话持久化'
 
@@ -78,27 +77,22 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             'InsertUserdataAsPrefix': False,
             'MustAtBot': True,  # 是否必须@机器人才能触发对话
             'EnableBuiltinFunctionCalling': False,  # 是否启用内置函数调用功能
-            # 是否允许AI记录和访问会话历史（内置函数调用功能需要开启）
-            'AllowAccessMemory': False,
-            # 是否允许AI进行网络请求（内置函数调用功能需要开启）
-            'AllowWebRequests': False,
-            # 是否允许AI创建/管理定时任务（内置函数调用功能需要开启）
-            'AllowScheduledTasks': False,
+            'AllowAccessMemory': False,  # 是否允许AI记录和访问会话历史（内置函数调用功能需要开启）
+            'AllowWebRequests': False,  # 是否允许AI进行网络请求（内置函数调用功能需要开启）
+            'AllowScheduledTasks': False,  # 是否允许AI创建/管理定时任务（内置函数调用功能需要开启）
             # 定时任务执行总开关（kill switch）：关闭后不注册/不执行任务，
             # 记录保留，可用 /chat-admin task resume 恢复
             'EnableScheduledTaskExecution': True,
-            # 是否识别并下载用户消息中携带的图片，作为视觉输入交给模型（无需开启函数调用）
-            'EnableImageRecognition': True,
-            # 是否剥离推理模型的思维链（<think>/<reasoning> 等标签），防止思维链暴露给用户或污染历史
-            'StripReasoning': True,
-            # 启用内置函数调用功能时，模型调用工具后重新生成回复的最大重试次数
-            'MaxRetriesTimes': 15,
-            # 最大对话缓存存储数量，用于AI获取非唤醒时错过的上下文消息，超过该数量的最早消息将被丢弃
-            'MaxConversationCacheStoreAmount': 1000,
+            'EnableImageRecognition': True,  # 是否识别并下载用户消息中携带的图片，作为视觉输入交给模型（无需开启函数调用）
+            'StripReasoning': True,  # 是否剥离推理模型的思维链（<think>/<reasoning> 等标签），防止思维链暴露给用户或污染历史
+            'MaxRetriesTimes': 15,  # 启用内置函数调用功能时，模型调用工具后重新生成回复的最大重试次数
+            'MaxConversationCacheStoreAmount': 1000,  # 最大对话缓存存储数量，用于AI获取非唤醒时错过的上下文消息，超过该数量的最早消息将被丢弃
             'IsConfigured': False,  # 插件是否已配置
-            # 群主/群管理自动放行本群管理员命令（/chat-admin）
-            'EnableGroupOwnerAutoAuth': True,
+            'EnableGroupOwnerAutoAuth': True,  # 群主/群管理自动放行本群管理员命令（/chat-admin）
             'EnableRandomReplyGroup': False,  # 是否随机回复群消息
+            # 'AllowHttpRiskIps': False,  # 是否允许风险IP段访问（如AWS 169.254.169.254）（直接禁止访问，不做配置）
+            'AllowLoopbackIps': False,  # 是否允许回环访问（如 127.0.0.1）
+            'AllowLocalNetworkIps': False,  # 是否允许访问局域网内网IP段（如 192.168.0.0/16）
             'GroupRandomReplyChance': 0.02,  # 群随机回复概率（0~1）
         })
 
@@ -290,7 +284,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         is_group = session_type == 'group'
         internal_message = {
             'role': 'user',
-            'content': f'[定时任务 {task_name}] {prompt}',
+            'content': build_scheduled_task_message(task_name, prompt),
         }
 
         if getattr(self, '_default_client', None) is None:
@@ -491,7 +485,11 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             if not source:
                 _log.debug('图片消息段缺少可下载地址，已忽略')
                 continue
-            vision = await tools.fetch_image_data_url(source)
+            vision = await tools.fetch_image_data_url(
+                source,
+                allow_loopback_ips=bool(self.get_config('AllowLoopbackIps')),
+                allow_local_network_ips=bool(self.get_config('AllowLocalNetworkIps')),
+            )
             if vision is None:
                 _log.warning(f'无法识别或下载用户发送的图片，已忽略: {source}')
                 continue
@@ -659,8 +657,9 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             # 完整 assistant 轮次（含 tool_calls）必须先于各条 tool 消息写入历史
             working.append(self._assistant_message_to_history_dict(assistant_msg))
 
-            # 中间正文（如有）也投递到会话；「仅空白/空」视为无效，不发送
-            if thinking_content:
+            # 中间正文（如有）也投递到会话；「仅空白/空」视为无效，不发送。
+            # 随机插话可能最终选择沉默，中间正文同样不投递，避免「先说话再消失」
+            if thinking_content and not random_reply:
                 await self._post_session_text(session_id, is_group, thinking_content)
 
             preset_name = self._get_preset_name(conversation_dict, session_id)
@@ -720,7 +719,14 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                             'error', '`AllowWebRequests` 配置未启用，当前无法进行网络请求')
                         _log.warning(f'工具调用被拒绝: {tool_name}，因为当前预设不允许网络请求功能')
                     else:
-                        result = await tools.create_http_request(**tool_args)
+                        # SSRF 防护策略由运营配置决定，模型传入的同名参数一律忽略
+                        tool_args.pop('allow_loopback_ips', None)
+                        tool_args.pop('allow_local_network_ips', None)
+                        result = await tools.create_http_request(
+                            allow_loopback_ips=bool(self.get_config('AllowLoopbackIps')),
+                            allow_local_network_ips=bool(self.get_config('AllowLocalNetworkIps')),
+                            **tool_args,
+                        )
                 elif tool_name == 'manage_cron_tasks':
                     if not self.get_config('AllowScheduledTasks'):
                         # 工具始终对模型可见，开关关闭时由这里拒绝并给出提示
@@ -761,7 +767,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                     vision_messages.append({
                         'role': 'user',
                         'content': [
-                            {'type': 'text', 'text': '以下是通过工具获取的图片：'},
+                            {'type': 'text', 'text': TOOL_VISION_IMAGE_TEXT},
                             {'type': 'image_url', 'image_url': {'url': vision['data_url']}},
                         ],
                     })
@@ -843,7 +849,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             # 仅取纯文本段作为文本部分，避免把 [CQ:image,...] 等消息段标记塞给模型；
             # 仅发图片无文字时给一句默认说明。
             clean_text = event.message.text.strip()
-            text_part = clean_text or '用户发送了图片，请查看随附图片。'
+            text_part = clean_text or IMAGE_ONLY_USER_TEXT
             if self.get_config('InsertUserdataAsPrefix'):
                 text_part = f'{event.sender.nickname}({event.sender.user_id}): {text_part}'
             user_content: str | list[dict] = [{'type': 'text', 'text': text_part}]
@@ -862,11 +868,14 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             f'{user_message[:OMITTED_TEXT_LENGTH]}{"..." if len(user_message) > OMITTED_TEXT_LENGTH else ""}')
 
         conversation = self.data['data'][conversation_dict][session_id]
+        # 随机插话可能最终不发言：工具轮写入工作副本，确认发言后才提交回主会话，
+        # 避免 NO_REPLY 时留下「user → assistant(tool_calls) → tool」的半截轮次
+        working = list(conversation) if random_reply else conversation
         try:
-            # 随机插话场景禁用工具调用：省 token，且避免随机消息产生副作用
-            use_tools = self.get_config('EnableBuiltinFunctionCalling') and not random_reply
+            # 随机插话轮同样保留工具能力；副作用类工具仍由各 AllowXxx 开关在分派链拦截
+            use_tools = self.get_config('EnableBuiltinFunctionCalling')
             reply_message = await self._generate_reply(
-                conversation,
+                working,
                 conversation_dict=conversation_dict,
                 session_id=str(session_id),
                 is_group=is_group,
@@ -898,13 +907,19 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             # 回复消息（保持旧版不 @ 发送者的行为）
             await event.reply(reply_message, at_sender=False)
 
+            # 发言成功后才把随机插话轮的工具消息提交回主会话（user 消息此前已写入）
+            if working is not conversation:
+                conversation.extend(working[len(conversation):])
+
             # 添加AI回复到会话
             self.data['data'][conversation_dict][session_id].append({'role': 'assistant', 'content': reply_message})
 
             # 保存持久化文件
             self._save_data()
         except exceptions.TooManyToolCallsException as e:
-            await event.reply(text=str(e), at_sender=False)
+            # 随机插话未 @ 机器人，工具轮上限提示保持静默（只记日志）
+            if not random_reply:
+                await event.reply(text=str(e), at_sender=False)
 
         except RateLimitError:
             # SDK 已按 REQUEST_MAX_RETRIES 指数退避重试，仍 429 说明限流持续存在。
@@ -918,7 +933,9 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
 
         except Exception:
             _log.error(traceback.format_exc())
-            await event.reply(text='抱歉，插件出现内部错误，请稍后再试', at_sender=False)
+            # 随机插话同样静默，避免未 @ 机器人的消息收到错误提示
+            if not random_reply:
+                await event.reply(text='抱歉，插件出现内部错误，请稍后再试', at_sender=False)
 
     @registrar.qq.on_group_message()
     async def on_group_message(self, event: GroupMessageEvent):

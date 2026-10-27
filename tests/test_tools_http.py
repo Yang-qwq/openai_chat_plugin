@@ -24,6 +24,16 @@ PNG_BYTES = base64.b64decode(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
 )
 
+# 公网 IP：stub DNS 解析器统一返回，避免单测发起真实 DNS 请求（SSRF 校验需要解析主机）
+PUBLIC_IP = '93.184.216.34'
+
+
+@pytest.fixture(autouse=True)
+def _stub_dns_resolver(monkeypatch):
+    async def _resolver(host: str) -> list[str]:
+        return [PUBLIC_IP]
+    monkeypatch.setattr(plugin_tools, '_dns_resolver', _resolver)
+
 
 def _transport(handler) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
@@ -196,7 +206,8 @@ async def test_timeout_and_network_error_are_caught():
         'GET', 'https://example.com/err', content_format='text',
         transport=_transport(error_handler)))
     assert payload['status'] == 'error'
-    assert 'HTTP 请求失败' in payload['message']
+    # 网络异常文案统一为「请求失败…」，不区分具体原因（防探测 oracle）
+    assert payload['message'] == '请求失败：无法访问目标地址'
 
 
 @pytest.mark.parametrize('method,url,content_format', [
