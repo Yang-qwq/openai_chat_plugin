@@ -2,7 +2,8 @@
 """群聊随机插话测试
 
 覆盖：概率命中绕过 MustAtBot、模型回 NO_REPLY/空正文保持沉默、群级 nolisten、
-冷却时间、插话提示固定 user 角色（避免双 system 被严格网关拒绝）。
+冷却时间、插话提示固定 user 角色（避免双 system 被严格网关拒绝）、
+随机插话轮的工具调用（暴露工具、发言才提交工具轮、沉默回滚、错误静默）。
 
 运行：python -m pytest tests -v -o "addopts="
 """
@@ -19,6 +20,7 @@ from fake_openai import (
     FakeMessage,
     FakeOpenAIClient,
     FakeResponse,
+    FakeToolCall,
     make_rate_limit_error,
 )
 
@@ -37,17 +39,32 @@ def _harness() -> PluginTestHarness:
 
 
 def _configure(plugin, replies, *, chance=1.0):
-    """开启随机插话并注入 stub 客户端"""
+    """开启随机插话并注入 stub 客户端
+
+    ``replies`` 中的元素可以是字符串（按单轮直答包装）、``FakeResponse``
+    （自带 tool_calls 等脚本）或异常实例（驱动失败分支）。
+    """
     plugin.config["IsConfigured"] = True
     plugin.config["EnableRandomReplyGroup"] = True
     plugin.config["GroupRandomReplyChance"] = chance
     client = FakeOpenAIClient([
-        reply if isinstance(reply, BaseException)
+        reply if isinstance(reply, (BaseException, FakeResponse))
         else FakeResponse(FakeChoice(FakeMessage(reply), "stop"))
         for reply in replies
     ])
     plugin._default_client = client
     return client
+
+
+def _tool_call_responses(final_reply, *, intermediate=None):
+    """构造「首轮工具调用 → 二轮最终回复」的响应脚本"""
+    return [
+        FakeResponse(FakeChoice(FakeMessage(
+            content=intermediate,
+            tool_calls=[FakeToolCall("call_1", "get_system_time", "{}")],
+        ), "tool_calls")),
+        FakeResponse(FakeChoice(FakeMessage(content=final_reply), "stop")),
+    ]
 
 
 def _force_random_hit(monkeypatch):
@@ -251,6 +268,113 @@ async def test_random_reply_rate_limit_stays_silent(tmp_path, monkeypatch):
         await h.settle()
 
         # 不发送任何消息（既不是 AI 回复，也不是「插件内部错误」）
+        h.assert_api("send_group_msg").not_called()
+        session = plugin.data["data"]["group_conversations"][GROUP_ID]
+        assert [m["role"] for m in session] == ["user"]
+
+
+async def test_random_reply_exposes_tools_when_function_calling_enabled(tmp_path, monkeypatch):
+    """函数调用开启时，随机插话轮与普通聊天一致向模型暴露工具"""
+    monkeypatch.chdir(tmp_path)
+    _force_random_hit(monkeypatch)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        plugin.config["EnableBuiltinFunctionCalling"] = True
+        client = _configure(plugin, ["好的"])
+
+        await h.inject(_group_text())
+        await h.settle()
+
+        call = client.chat.completions.calls[0]
+        assert "tools" in call
+        assert call["tool_choice"] == "auto"
+        names = {t["function"]["name"] for t in call["tools"]}
+        assert "get_system_time" in names
+
+
+async def test_random_reply_omits_tools_without_function_calling(tmp_path, monkeypatch):
+    """未启用函数调用时，随机插话请求同样不带 tools/tool_choice（兼容严格网关）"""
+    monkeypatch.chdir(tmp_path)
+    _force_random_hit(monkeypatch)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        client = _configure(plugin, ["好的"])  # 默认 EnableBuiltinFunctionCalling=False
+
+        await h.inject(_group_text())
+        await h.settle()
+
+        call = client.chat.completions.calls[0]
+        assert "tools" not in call
+        assert "tool_choice" not in call
+
+
+async def test_random_reply_tool_round_commits_when_speaking(tmp_path, monkeypatch):
+    """随机插话走工具轮并最终发言：工具轮落库，中间正文不投递"""
+    monkeypatch.chdir(tmp_path)
+    _force_random_hit(monkeypatch)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        plugin.config["EnableBuiltinFunctionCalling"] = True
+        client = _configure(
+            plugin, _tool_call_responses("现在是 UTC 时间", intermediate="我先查一下时间"))
+
+        await h.inject(_group_text())
+        await h.settle()
+
+        # 只发送最终回复，工具轮的中间正文不投递（避免「先说话再消失」）
+        h.assert_api("send_group_msg").times(1)
+        h.assert_api("send_group_msg").with_text("现在是 UTC 时间")
+
+        session = plugin.data["data"]["group_conversations"][GROUP_ID]
+        assert [m["role"] for m in session] == ["user", "assistant", "tool", "assistant"]
+        assert session[1].get("tool_calls")
+        assert '"status": "success"' in session[2]["content"]
+        assert session[-1] == {"role": "assistant", "content": "现在是 UTC 时间"}
+
+        # 第二轮请求能看到第一轮的工具结果
+        assert len(client.chat.completions.calls) == 2
+        assert any(m["role"] == "tool" for m in client.chat.completions.calls[1]["messages"])
+
+
+async def test_random_reply_tool_round_rolled_back_on_no_reply(tmp_path, monkeypatch):
+    """随机插话走工具轮但最终 NO_REPLY：工具轮回滚，主会话只留用户消息"""
+    monkeypatch.chdir(tmp_path)
+    _force_random_hit(monkeypatch)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        plugin.config["EnableBuiltinFunctionCalling"] = True
+        client = _configure(
+            plugin, _tool_call_responses("NO_REPLY", intermediate="我先查一下时间"))
+
+        await h.inject(_group_text())
+        await h.settle()
+
+        h.assert_api("send_group_msg").not_called()
+        session = plugin.data["data"]["group_conversations"][GROUP_ID]
+        assert [m["role"] for m in session] == ["user"]
+
+        # 工具确实执行过（两轮请求），但结果没有落库
+        assert len(client.chat.completions.calls) == 2
+        saved = json.loads((plugin.workspace / "data.json").read_text(encoding="utf-8"))
+        assert [m["role"] for m in saved["data"]["group_conversations"][GROUP_ID]] == ["user"]
+
+
+async def test_random_reply_tool_limit_stays_silent(tmp_path, monkeypatch):
+    """随机插话触达工具轮上限时静默放弃，不向群里发错误提示"""
+    monkeypatch.chdir(tmp_path)
+    _force_random_hit(monkeypatch)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        plugin.config["EnableBuiltinFunctionCalling"] = True
+        plugin.config["MaxRetriesTimes"] = 1
+        _configure(plugin, [FakeResponse(FakeChoice(FakeMessage(
+            content=None,
+            tool_calls=[FakeToolCall("call_1", "get_system_time", "{}")],
+        ), "tool_calls"))])
+
+        await h.inject(_group_text())
+        await h.settle()
+
         h.assert_api("send_group_msg").not_called()
         session = plugin.data["data"]["group_conversations"][GROUP_ID]
         assert [m["role"] for m in session] == ["user"]

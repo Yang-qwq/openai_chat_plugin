@@ -238,7 +238,7 @@ async def test_web_image_attached_as_vision_message(tmp_path, monkeypatch):
         plugin.config["EnableBuiltinFunctionCalling"] = True
         plugin.config["AllowWebRequests"] = True
 
-        # 向插件 main 模块中实际使用的 tools 模块注入 MockTransport
+        # 向插件 main 模块中实际使用的 tools 模块注入 MockTransport 与 DNS stub
         main_module = sys.modules[plugin.__class__.__module__]
         png = b"\x89PNG\r\n\x1a\n_fake_png_body"
 
@@ -247,6 +247,11 @@ async def test_web_image_attached_as_vision_message(tmp_path, monkeypatch):
 
         monkeypatch.setattr(
             main_module.tools, "_default_http_transport", httpx.MockTransport(handler))
+
+        async def _resolver(host: str) -> list[str]:
+            return ["93.184.216.34"]  # 公网 IP，避免真实 DNS 请求（SSRF 主机校验）
+
+        monkeypatch.setattr(main_module.tools, "_dns_resolver", _resolver)
 
         client = _configure(plugin, [
             FakeResponse(FakeChoice(FakeMessage(

@@ -21,15 +21,18 @@ v0.1.4+ 记忆数据结构（列表中的每一项是一个 dict）：
 ```
 """
 
+import asyncio
 import base64
+import ipaddress
 import json
 import os
 import re
+import socket
 import uuid
 from datetime import datetime, timezone
 from functools import partial
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import markdownify
@@ -73,6 +76,9 @@ ALLOWED_IMAGE_MIME_TYPES = {'image/png', 'image/jpeg', 'image/gif', 'image/webp'
 # 请求超时（秒）
 DEFAULT_HTTP_TIMEOUT = 15.0
 MAX_HTTP_TIMEOUT = 60.0
+# 重定向上限：重定向不由 httpx 自动跟随，而是手动逐跳处理并重新校验目标主机，
+# 防止「公网 URL 302 到内网地址」绕过 SSRF 防护
+MAX_HTTP_REDIRECTS = 5
 # 默认 transport（None 表示使用 httpx 默认实现；测试中可注入 MockTransport）
 _default_http_transport: httpx.AsyncBaseTransport | None = None
 
@@ -88,6 +94,16 @@ MIN_SCHEDULED_INTERVAL_SECONDS = 60
 # 连续执行失败达到该次数后自动停用任务，避免永久性错误（被踢出群、密钥失效等）
 # 按原间隔无限重试并刷日志
 MAX_TASK_CONSECUTIVE_FAILURES = 5
+
+_INTERVAL_UNIT_SECONDS = {'d': 86400, 'h': 3600, 'm': 60, 's': 1}
+# 一次性任务的时间格式（框架支持两种写法）。注意：任务触发时该时间已过，
+# `TimeTaskParser` 会判定为"过期"而解析失败，因此这里用格式判断而不是重新解析
+_ONCE_INTERVAL_RE = re.compile(
+    r'^(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|\d{4}:\d{2}:\d{2}-\d{2}:\d{2}:\d{2})$')
+# 复合单位（如 2h30m）的正则：框架解析器只支持单一单位（2h / 30m），
+# 这里把多段单位累加后统一换算成秒再交给框架
+_INTERVAL_PART_RE = re.compile(r'(\d+(?:\.\d+)?)([dhms])', re.IGNORECASE)
+_COMPOSITE_INTERVAL_RE = re.compile(r'(?:\d+(?:\.\d+)?[dhms])+', re.IGNORECASE)
 
 tools = [
     {
@@ -191,7 +207,9 @@ tools = [
         'function': {
             'name': 'create_http_request',
             'description': 'Create an HTTP request and return the response. '
-                           'Use content_format="image" to fetch an image and view it.',
+                           'Use content_format="image" to fetch an image and view it. '
+                           'Only public internet addresses are reachable; loopback, '
+                           'private/local network and cloud-metadata addresses are blocked.',
             'parameters': {
                 'type': 'object',
                 'properties': {
@@ -372,14 +390,22 @@ def _vision_summary_payload(vision: dict[str, Any]) -> str:
 async def fetch_image_data_url(
         source: str,
         transport: httpx.AsyncBaseTransport | None = None,
+        allow_loopback_ips: bool = False,
+        allow_local_network_ips: bool = False,
 ) -> dict[str, Any] | None:
     """下载图片并转为视觉输入所需的 data URL 信息。
 
     用于把用户消息中携带的图片（``Image`` 消息段的 url/file）拉取为
     OpenAI ``image_url`` 可用的 data URL。失败时返回 ``None``，不向上抛异常。
 
+    http/https 来源同样受 SSRF 防护：回环/内网/云元数据等受保护地址段会被
+    拒绝（分别受 ``allow_loopback_ips`` / ``allow_local_network_ips`` 控制），
+    重定向手动逐跳跟随并重新校验。
+
     :param source: 图片地址（http/https URL 或本地文件路径）
     :param transport: 可选的自定义 httpx transport（测试用）
+    :param allow_loopback_ips: 是否允许访问回环地址（对应配置 ``AllowLoopbackIps``）
+    :param allow_local_network_ips: 是否允许访问内网地址（对应配置 ``AllowLocalNetworkIps``）
     :return: 含 ``data_url`` / ``mime_type`` / ``size`` 的 dict；无法识别/下载失败返回 None
     """
     if not isinstance(source, str):
@@ -401,28 +427,53 @@ async def fetch_image_data_url(
             return None
     else:
         http_transport = transport if transport is not None else _default_http_transport
+        content: bytes | None = None
         try:
             async with httpx.AsyncClient(
-                    timeout=DEFAULT_HTTP_TIMEOUT, follow_redirects=True,
+                    timeout=DEFAULT_HTTP_TIMEOUT, follow_redirects=False,
                     transport=http_transport,
-            ) as client, client.stream('GET', source) as response:
-                if response.status_code >= 400:
-                    _log.warning(f'下载图片失败（状态码 {response.status_code}）: {source}')
-                    return None
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in response.aiter_bytes():
-                    total += len(chunk)
-                    if total > MAX_IMAGE_RESPONSE_BYTES:
-                        _log.warning(f'图片超过大小限制（> {MAX_IMAGE_RESPONSE_BYTES} 字节），已中止读取: {source}')
+            ) as client:
+                hop_url = source
+                for hop in range(MAX_HTTP_REDIRECTS + 1):
+                    # 每一跳都重新校验目标主机（与 HTTP 工具同一道 SSRF 闸门）
+                    hit, hit_reason = await _check_protected_host(
+                        hop_url, allow_loopback_ips, allow_local_network_ips)
+                    if hit:
+                        _log.warning(f'图片下载被拦截: {hop_url}（目标{hit_reason}）')
                         return None
-                    chunks.append(chunk)
-                content = b''.join(chunks)
+                    async with client.stream('GET', hop_url) as response:
+                        if response.is_redirect:
+                            if hop >= MAX_HTTP_REDIRECTS:
+                                _log.warning(f'图片重定向次数过多: {source}')
+                                return None
+                            next_url, redirect_error = _resolve_redirect_target(
+                                response.headers.get('location') or '', hop_url)
+                            if redirect_error:
+                                _log.warning(
+                                    f'图片重定向被拒绝: {hop_url}（{redirect_error}）')
+                                return None
+                            hop_url = next_url
+                            continue
+                        if response.status_code >= 400:
+                            _log.warning(f'下载图片失败（状态码 {response.status_code}）: {source}')
+                            return None
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in response.aiter_bytes():
+                            total += len(chunk)
+                            if total > MAX_IMAGE_RESPONSE_BYTES:
+                                _log.warning(f'图片超过大小限制（> {MAX_IMAGE_RESPONSE_BYTES} 字节），已中止读取: {source}')
+                                return None
+                            chunks.append(chunk)
+                        content = b''.join(chunks)
+                        break
         except httpx.HTTPError as e:
             _log.warning(f'下载图片失败: {source}: {e}')
             return None
         except Exception as e:
             _log.error(f'下载图片出现未预期错误: {source}: {e}')
+            return None
+        if content is None:
             return None
 
     if not content:
@@ -674,6 +725,10 @@ async def get_system_time() -> str:
         'rfc2822': now.strftime('%a, %d %b %Y %H:%M:%S GMT')
     })
 
+# ======================================================================
+# HTTP 请求工具
+# ======================================================================
+
 def _normalize_http_method(method: object) -> str | None:
     """规范化并校验 HTTP 方法；非法时返回 None。"""
     if not isinstance(method, str):
@@ -694,6 +749,186 @@ def _validate_http_url(url: object) -> tuple[str | None, str | None]:
         return None, 'URL 中不允许携带用户名/密码'
     return normalized, None
 
+
+async def _default_dns_resolver(host: str) -> list[str]:
+    """解析主机名的全部 A/AAAA 记录（去重）；解析失败返回空列表。
+
+    通过事件循环的线程池执行 ``socket.getaddrinfo``，不阻塞事件循环。
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.getaddrinfo(host, None)
+    except (socket.gaierror, OSError):
+        return []
+    return list({info[4][0] for info in infos})
+
+
+# DNS 解析器：默认走 asyncio；测试中可注入 stub，避免真实 DNS 请求
+_dns_resolver = _default_dns_resolver
+
+
+def _classify_ip(ip_str: str) -> str | None:
+    """判定 IP 地址命中的受保护类别；无需拦截时返回 None。
+
+    拦截类别（中文原因，仅用于日志）：
+
+    - ``回环地址``：受 ``allow_loopback_ips`` 控制（127.0.0.0/8、::1）
+    - ``内网地址``：受 ``allow_local_network_ips`` 控制
+      （10/8、172.16/12、192.168/16、fc00::/7 等）
+    - 其余命中段**一律拦截（无配置项）**：链路本地（含云元数据
+      169.254.169.254）、未指定（0.0.0.0、::）、组播、保留段、
+      非全局可路由地址（如 CGNAT 100.64/10）
+
+    :param ip_str: IP 地址字符串（IPv4 或 IPv6）
+    :return: 命中类别，或 None
+    """
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return None
+    # IPv4-mapped IPv6（如 ::ffff:127.0.0.1）按其内嵌的 IPv4 判定，
+    # 防止用 IPv6 写法绕过校验
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if addr.is_loopback:
+        return '回环地址'
+    if addr.is_link_local:
+        return '链路本地地址（含云元数据）'
+    if addr.is_unspecified or addr.is_multicast:
+        return '未指定/组播地址'
+    if addr.is_reserved:
+        return '保留地址段'
+    if addr.is_private:
+        return '内网地址'
+    if not addr.is_global:
+        return '非全局可路由地址'
+    return None
+
+
+def _parse_ip_literal(host: str) -> list[str] | None:
+    """主机为 IP 字面量时返回 ``[host]``；否则返回 None（交给 DNS 解析）。"""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    return [host]
+
+
+async def _check_protected_host(
+        url: str,
+        allow_loopback_ips: bool = False,
+        allow_local_network_ips: bool = False,
+) -> tuple[bool, str]:
+    """检查 HTTP 目标主机是否命中受保护地址段（SSRF 防护）。
+
+    主机为 IP 字面量时直接判定；否则经 DNS 解析后对所有 A/AAAA 记录逐条判定
+    （任一记录命中即拒绝，防止目标主机同时返回公网与内网记录）。DNS 解析
+    失败一律拒绝（fail-closed）。
+
+    :param url: 请求 URL
+    :param allow_loopback_ips: 是否允许回环地址（对应配置 ``AllowLoopbackIps``）
+    :param allow_local_network_ips: 是否允许内网地址（对应配置 ``AllowLocalNetworkIps``）
+    :return: ``(是否命中受保护地址, 命中原因)``；未命中时原因为空串
+    """
+    host = (urlparse(url).hostname or '').lower()
+    if not host:
+        return False, ''
+    ip_strs = _parse_ip_literal(host)
+    if ip_strs is None:
+        ip_strs = await _dns_resolver(host)
+        if not ip_strs:
+            return True, 'DNS 解析失败'
+    for ip_str in ip_strs:
+        category = _classify_ip(ip_str)
+        if category is None:
+            continue
+        if category == '回环地址' and allow_loopback_ips:
+            continue
+        if category == '内网地址' and allow_local_network_ips:
+            continue
+        return True, category
+    return False, ''
+
+
+def _resolve_redirect_target(location: str, base_url: str) -> tuple[str | None, str | None]:
+    """把重定向 Location 解析为绝对 URL 并校验，返回 (绝对 URL, 错误信息)。
+
+    仅允许 http/https 且不含 userinfo 的目标（相对路径按当前 URL 拼接）。
+    """
+    stripped = (location or '').strip()
+    if not stripped:
+        return None, '重定向目标缺失'
+    target = urljoin(base_url, stripped)
+    parsed = urlparse(target)
+    if parsed.scheme not in ('http', 'https'):
+        return None, '重定向目标必须是 http/https'
+    if not parsed.netloc or parsed.username or parsed.password:
+        return None, '重定向目标非法'
+    return target, None
+
+
+def _same_origin(url_a: str, url_b: str) -> bool:
+    """判断两个 URL 是否同源（scheme / host / port 完全相同）。"""
+    parsed_a, parsed_b = urlparse(url_a), urlparse(url_b)
+    return (
+        parsed_a.scheme == parsed_b.scheme
+        and parsed_a.hostname == parsed_b.hostname
+        and parsed_a.port == parsed_b.port
+    )
+
+
+def _redirect_method(method: str, status_code: int) -> str:
+    """按 httpx/浏览器的默认语义决定重定向后的 HTTP 方法。
+
+    - 303：除 HEAD 外一律改为 GET
+    - 302：除 HEAD 外一律改为 GET（浏览器行为）
+    - 301：仅 POST 改为 GET
+    - 307/308：保持原方法
+    """
+    if status_code == 303 and method != 'HEAD':
+        return 'GET'
+    if status_code == 302 and method != 'HEAD':
+        return 'GET'
+    if status_code == 301 and method == 'POST':
+        return 'GET'
+    return method
+
+
+def _redirect_headers(headers: dict[str, str] | None, source_url: str,
+                      target_url: str, method_changed_to_get: bool) -> dict[str, str]:
+    """按 httpx 的默认语义清理跨重定向的请求头。
+
+    手动逐跳跟随重定向后，httpx 不会再替我们做这些清理，因此必须显式处理：
+
+    - 跨源（scheme / host / port 任一不同）时移除 ``Authorization`` /
+      ``Proxy-Authorization``（http→https 同主机跳转保留，与 httpx 一致）
+    - 任何重定向都移除 ``Cookie``（没有客户端 cookie jar，不携带来源不明的 cookie）
+    - 跨源时移除 ``Host``，由 httpx 依据目标 URL 重新生成
+    - 方法降级为 GET 时移除 ``Content-Length`` / ``Transfer-Encoding``
+    """
+    if not headers:
+        return {}
+    cleaned = dict(headers)
+    lower_keys = {key.lower(): key for key in cleaned}
+
+    def _pop(name: str) -> None:
+        key = lower_keys.get(name)
+        if key is not None:
+            cleaned.pop(key, None)
+
+    source = urlparse(source_url)
+    target = urlparse(target_url)
+    if not _same_origin(source_url, target_url):
+        is_https_upgrade = source.scheme == 'http' and target.scheme == 'https'
+        if not (is_https_upgrade and source.hostname == target.hostname):
+            _pop('authorization')
+            _pop('proxy-authorization')
+        _pop('host')
+    _pop('cookie')
+    if method_changed_to_get:
+        _pop('content-length')
+        _pop('transfer-encoding')
+    return cleaned
 
 def _decode_http_text(response: httpx.Response, content: bytes) -> str:
     """按响应 charset 解码文本（缺少 charset 时回退 utf-8）。"""
@@ -724,6 +959,8 @@ async def create_http_request(
         params: dict | None = None,
         timeout: float | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        allow_loopback_ips: bool = False,
+        allow_local_network_ips: bool = False,
         **_extra: Any,
 ) -> str:
     """创建 HTTP 请求并返回适合模型阅读的 JSON payload
@@ -731,6 +968,10 @@ async def create_http_request(
     - ``content_format``：json / text / markdown / image
     - ``image`` 模式下会返回 data URL，主流程会将其转换为视觉消息附加到对话
     - 文本/网页响应默认限制 2 MiB，图片限制 5 MiB
+    - **SSRF 防护**：请求前后逐跳校验目标主机，回环/内网/云元数据等受保护
+      地址段会被拒绝（分别受 ``allow_loopback_ips`` /
+      ``allow_local_network_ips`` 控制，其余段一律拦截）；重定向手动逐跳
+      跟随，每一跳重新校验
     - 所有网络异常、参数错误都会转为 ``status: error`` 的 payload，不向上抛异常
 
     :param method: HTTP 方法，如 'GET'、'POST'
@@ -741,23 +982,29 @@ async def create_http_request(
     :param params: 可选的 URL 查询参数
     :param timeout: 超时秒数（默认 15，最大 60）
     :param transport: 可选的自定义 httpx transport（测试用）
+    :param allow_loopback_ips: 是否允许访问回环地址（对应配置 ``AllowLoopbackIps``）
+    :param allow_local_network_ips: 是否允许访问内网地址（对应配置 ``AllowLocalNetworkIps``）
     :param _extra: 忽略模型多传的未知参数
     :return: json 字符串
     """
+    # 规范化参数
     normalized_method = _normalize_http_method(method)
     if normalized_method is None:
         return _generate_tool_payload('error', f'不支持的 HTTP 方法: {method}')
 
+    # 规范化 URL 并校验
     normalized_url, url_error = _validate_http_url(url)
     if url_error:
         return _generate_tool_payload('error', url_error)
 
+    # 规范化 content_format 并校验
     normalized_format = (content_format or 'text').strip().lower() if isinstance(content_format, str) else ''
     if normalized_format not in ALLOWED_CONTENT_FORMATS:
         return _generate_tool_payload(
             'error', f'不支持的 content_format: {content_format}',
             {'supported': sorted(ALLOWED_CONTENT_FORMATS)})
 
+    # 参数类型校验
     if data is not None and not isinstance(data, (dict, list)):
         return _generate_tool_payload('error', 'data 必须是 JSON 对象或数组')
     if headers is not None and not isinstance(headers, dict):
@@ -765,6 +1012,7 @@ async def create_http_request(
     if params is not None and not isinstance(params, dict):
         return _generate_tool_payload('error', 'params 必须是对象')
 
+    # 超时参数校验
     try:
         request_timeout = DEFAULT_HTTP_TIMEOUT if timeout is None else float(timeout)
     except (TypeError, ValueError):
@@ -786,117 +1034,157 @@ async def create_http_request(
     try:
         async with httpx.AsyncClient(
                 timeout=request_timeout,
-                follow_redirects=True,
+                # 手动逐跳跟随重定向：每一跳都重新校验目标主机，
+                # 防止「公网 URL 302 到内网地址」绕过 SSRF 防护
+                follow_redirects=False,
                 transport=http_transport,
-        ) as client, client.stream(
-                normalized_method,
-                normalized_url,
-                headers=request_headers,
-                params=request_params,
-                **request_data,
-        ) as response:
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in response.aiter_bytes():
-                total += len(chunk)
-                if total > limit:
-                    _log.warning(f'HTTP 响应内容超过限制（{total} > {limit} 字节）')
+        ) as client:
+            # 重定向前可能发生变化的方法 / 请求头 / 查询参数 / 请求体
+            hop_method = normalized_method
+            hop_url = normalized_url
+            hop_params = request_params
+            hop_headers = request_headers
+            hop_data = request_data
+            hops = 0
+            while True:
+                # 每一跳都重新做主机校验（SSRF 防护）
+                hit, hit_reason = await _check_protected_host(
+                    hop_url, allow_loopback_ips, allow_local_network_ips)
+                if hit:
+                    _log.warning(
+                        f'HTTP 请求被拦截: {hop_method} {hop_url}'
+                        f'（目标{hit_reason}）')
                     return _generate_tool_payload(
-                        'error', f'响应内容过大（超过 {limit} 字节），已中止读取',
-                        {'status_code': response.status_code, 'limit': limit})
-                chunks.append(chunk)
-            content = b''.join(chunks)
+                        'error', '请求失败：目标地址被禁止访问')
 
-            _log.info(
-                f'HTTP 请求 {normalized_method} {normalized_url} 返回状态码 '
-                f'{response.status_code}，{total} 字节')
-            message = _http_message(response)
-            content_type = (response.headers.get('content-type') or '').split(';')[0].strip().lower()
+                async with client.stream(
+                        hop_method,
+                        hop_url,
+                        headers=hop_headers,
+                        params=hop_params,
+                        **hop_data,
+                ) as response:
+                    if response.is_redirect:
+                        if hops >= MAX_HTTP_REDIRECTS:
+                            _log.warning(f'HTTP 请求重定向次数过多: {normalized_url}')
+                            return _generate_tool_payload(
+                                'error', '请求失败：重定向次数过多')
+                        next_url, redirect_error = _resolve_redirect_target(
+                            response.headers.get('location') or '', hop_url)
+                        if redirect_error:
+                            _log.warning(
+                                f'HTTP 请求重定向被拒绝: {hop_url}（{redirect_error}）')
+                            return _generate_tool_payload(
+                                'error', f'请求失败：{redirect_error}')
+                        # 303/302 除 HEAD 外降级为 GET、301 仅 POST 降级（与 httpx
+                        # 默认行为一致）；307/308 保持原方法与请求体。
+                        # 每一跳都重新清理请求头（跨源不携带 Authorization/Cookie/Host），
+                        # 原查询参数不带到下一跳
+                        next_method = _redirect_method(hop_method, response.status_code)
+                        hop_headers = _redirect_headers(
+                            hop_headers, hop_url, next_url,
+                            method_changed_to_get=next_method != hop_method)
+                        if next_method != hop_method:
+                            hop_method = next_method
+                            hop_data = {}
+                        hop_params = None
+                        hop_url = next_url
+                        hops += 1
+                        continue
 
-            # 非 2xx：仍然返回响应片段，方便模型判断错误原因
-            if response.status_code >= 400:
-                text = _decode_http_text(response, content)
-                return _generate_tool_payload(
-                    'error', message,
-                    {'status_code': response.status_code, 'content': text[:2000]})
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > limit:
+                            _log.warning(f'HTTP 响应内容超过限制（{total} > {limit} 字节）')
+                            return _generate_tool_payload(
+                                'error', f'响应内容过大（超过 {limit} 字节），已中止读取',
+                                {'status_code': response.status_code, 'limit': limit})
+                        chunks.append(chunk)
+                    content = b''.join(chunks)
 
-            if normalized_format == 'image':
-                if content_type not in ALLOWED_IMAGE_MIME_TYPES:
+                    _log.info(
+                        f'HTTP 请求 {normalized_method} {normalized_url} 返回状态码 '
+                        f'{response.status_code}，{total} 字节')
+                    message = _http_message(response)
+                    content_type = (response.headers.get('content-type') or '').split(';')[0].strip().lower()
+
+                    # 非 2xx：仍然返回响应片段，方便模型判断错误原因
+                    if response.status_code >= 400:
+                        text = _decode_http_text(response, content)
+                        return _generate_tool_payload(
+                            'error', message,
+                            {'status_code': response.status_code, 'content': text[:2000]})
+
+                    if normalized_format == 'image':
+                        if content_type not in ALLOWED_IMAGE_MIME_TYPES:
+                            return _generate_tool_payload(
+                                'error', f'响应不是受支持的图片类型: {content_type or "unknown"}',
+                                {'status_code': response.status_code,
+                                 'supported': sorted(ALLOWED_IMAGE_MIME_TYPES)})
+                        if not content:
+                            return _generate_tool_payload('error', '响应图片内容为空')
+                        return _generate_vision_tool_payload(
+                            content, content_type, hop_url, response.status_code)
+
+                    text = _decode_http_text(response, content)
+
+                    if normalized_format == 'json':
+                        try:
+                            parsed = json.loads(text)
+                        except ValueError:
+                            return _generate_tool_payload(
+                                'error', '响应内容不是有效的 JSON',
+                                {'status_code': response.status_code, 'content': text[:2000]})
+                        return _generate_tool_payload('success', message, parsed)
+
+                    if normalized_format == 'text':
+                        if not text.strip():
+                            return _generate_tool_payload('error', '响应内容为空',
+                                                          {'status_code': response.status_code})
+                        return _generate_tool_payload(
+                            'success', message,
+                            {'status_code': response.status_code, 'content': text})
+
+                    # markdown：响应本身是 Markdown 就直接返回，否则尝试把 HTML 转成 Markdown
+                    looks_like_html = bool(re.search(
+                        r'<\s*(html|head|body|div|p|a|span|table|h[1-6]|ul|ol|li)\b',
+                        text, re.IGNORECASE))
+                    looks_like_markdown = bool(re.search(r'(^|\n)(#{1,6}\s|\*\s|-\s|\d+\.\s)', text))
+                    if looks_like_html or not looks_like_markdown:
+                        try:
+                            _log.debug('响应内容不是 Markdown，尝试将 HTML 转换为 Markdown')
+                            text = _markdownify_html(text)
+                        except Exception as e:
+                            _log.warning(f'将 HTML 转换为 Markdown 失败: {e}')
+                            return _generate_tool_payload(
+                                'error', f'响应内容不是有效的 Markdown 文本，且转换失败: {e}',
+                                {'status_code': response.status_code, 'content': text[:2000]})
                     return _generate_tool_payload(
-                        'error', f'响应不是受支持的图片类型: {content_type or "unknown"}',
-                        {'status_code': response.status_code,
-                         'supported': sorted(ALLOWED_IMAGE_MIME_TYPES)})
-                if not content:
-                    return _generate_tool_payload('error', '响应图片内容为空')
-                return _generate_vision_tool_payload(
-                    content, content_type, normalized_url, response.status_code)
-
-            text = _decode_http_text(response, content)
-
-            if normalized_format == 'json':
-                try:
-                    parsed = json.loads(text)
-                except ValueError:
-                    return _generate_tool_payload(
-                        'error', '响应内容不是有效的 JSON',
-                        {'status_code': response.status_code, 'content': text[:2000]})
-                return _generate_tool_payload('success', message, parsed)
-
-            if normalized_format == 'text':
-                if not text.strip():
-                    return _generate_tool_payload('error', '响应内容为空',
-                                                  {'status_code': response.status_code})
-                return _generate_tool_payload(
-                    'success', message,
-                    {'status_code': response.status_code, 'content': text})
-
-            # markdown：响应本身是 Markdown 就直接返回，否则尝试把 HTML 转成 Markdown
-            looks_like_html = bool(re.search(
-                r'<\s*(html|head|body|div|p|a|span|table|h[1-6]|ul|ol|li)\b',
-                text, re.IGNORECASE))
-            looks_like_markdown = bool(re.search(r'(^|\n)(#{1,6}\s|\*\s|-\s|\d+\.\s)', text))
-            if looks_like_html or not looks_like_markdown:
-                try:
-                    _log.debug('响应内容不是 Markdown，尝试将 HTML 转换为 Markdown')
-                    text = _markdownify_html(text)
-                except Exception as e:
-                    _log.warning(f'将 HTML 转换为 Markdown 失败: {e}')
-                    return _generate_tool_payload(
-                        'error', f'响应内容不是有效的 Markdown 文本，且转换失败: {e}',
-                        {'status_code': response.status_code, 'content': text[:2000]})
-            return _generate_tool_payload(
-                'success', message,
-                {'status_code': response.status_code, 'content': text})
+                        'success', message,
+                        {'status_code': response.status_code, 'content': text})
 
     except httpx.TimeoutException:
         _log.warning(f'HTTP 请求超时: {normalized_method} {normalized_url}')
-        return _generate_tool_payload('error', f'请求超时（{request_timeout:g} 秒）')
+        return _generate_tool_payload('error', '请求失败：目标响应超时')
     except httpx.HTTPError as e:
         _log.warning(f'HTTP 请求失败: {normalized_method} {normalized_url}: {e}')
-        return _generate_tool_payload('error', f'HTTP 请求失败: {e}')
+        # 错误文案不区分「连接被拒 / 超时 / DNS 失败」等具体原因，避免被当作
+        # 端口与路径存在性探测的 oracle（SSRF 防护的一部分）
+        return _generate_tool_payload('error', '请求失败：无法访问目标地址')
     except Exception as e:
         _log.error(f'HTTP 请求出现未预期错误: {normalized_method} {normalized_url}: {e}')
-        return _generate_tool_payload('error', f'请求出现未预期错误: {e}')
+        return _generate_tool_payload('error', '请求失败：服务器内部错误')
 
 
 # ======================================================================
-# 四、定时任务工具
+# 定时任务工具
 # ======================================================================
 
 def _scheduled_task_key(task_name: str) -> str:
     """把用户任务名转换为框架任务名（加插件前缀，避免跨插件重名）。"""
     return f'{SCHEDULED_TASK_PREFIX}{task_name}'
-
-
-_INTERVAL_UNIT_SECONDS = {'d': 86400, 'h': 3600, 'm': 60, 's': 1}
-# 一次性任务的时间格式（框架支持两种写法）。注意：任务触发时该时间已过，
-# `TimeTaskParser` 会判定为"过期"而解析失败，因此这里用格式判断而不是重新解析
-_ONCE_INTERVAL_RE = re.compile(
-    r'^(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|\d{4}:\d{2}:\d{2}-\d{2}:\d{2}:\d{2})$')
-# 复合单位（如 2h30m）的正则：框架解析器只支持单一单位（2h / 30m），
-# 这里把多段单位累加后统一换算成秒再交给框架
-_INTERVAL_PART_RE = re.compile(r'(\d+(?:\.\d+)?)([dhms])', re.IGNORECASE)
-_COMPOSITE_INTERVAL_RE = re.compile(r'(?:\d+(?:\.\d+)?[dhms])+', re.IGNORECASE)
 
 
 def _normalize_schedule_interval(interval: Any) -> tuple[str, dict] | None:
