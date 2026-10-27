@@ -13,7 +13,7 @@ from ncatbot.plugin import NcatBotPlugin
 from ncatbot.types import At
 from ncatbot.utils import get_config_manager
 from ncatbot.utils.logger import get_log
-from openai import OpenAI, RateLimitError
+from openai import BadRequestError, OpenAI, RateLimitError
 
 from . import exceptions, reasoning, tools
 from .command_handler import (
@@ -24,6 +24,7 @@ from .command_handler import (
 from .preset_manager import Preset
 from .prompt import (
     IMAGE_ONLY_USER_TEXT,
+    IMAGE_PLACEHOLDER_TEXT,
     RANDOM_REPLY_SYSTEM_PROMPT,
     TOOL_VISION_IMAGE_TEXT,
     build_scheduled_task_message,
@@ -123,6 +124,9 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         self.temp_history_messages_kv = {}
         # 随机插话冷却时间记录（内存态，不持久化）：group_id -> monotonic 时间戳
         self._last_random_reply_ts: dict[str, float] = {}
+        # 视觉能力探测（内存态）：供应商返回「content.type 非法/仅支持 text」后置 True，
+        # 之后请求自动压平多模态内容并停止下载用户图片（纯文本模型兼容）
+        self._vision_unsupported = False
         # 会话级锁（内存态）：普通聊天与定时任务共用，保证同一会话的轮次串行执行
         self._session_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
@@ -455,6 +459,50 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         return messages
 
     @staticmethod
+    def _content_to_text_only(content):
+        """把多模态 content 列表压平成纯文本（图片替换为 ``[图片]`` 占位符）。
+
+        纯文本模型/网关（如智谱 GLM 返回 400 code 1210）只接受
+        ``content.type == 'text'``，历史里遗留的 ``image_url`` 会让后续每一轮
+        请求都失败，因此请求前需要降级。
+        """
+        if not isinstance(content, list):
+            return content
+        parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get('type') == 'text':
+                parts.append(part.get('text') or '')
+            elif part.get('type') == 'image_url':
+                parts.append(IMAGE_PLACEHOLDER_TEXT)
+        return '\n'.join(text for text in parts if text) or IMAGE_PLACEHOLDER_TEXT
+
+    @classmethod
+    def _text_only_messages(cls, messages: list[dict]) -> list[dict]:
+        """返回多模态内容压平后的消息副本（不修改会话历史）。"""
+        normalized: list[dict] = []
+        for message in messages:
+            item = dict(message)
+            item['content'] = cls._content_to_text_only(item.get('content'))
+            normalized.append(item)
+        return normalized
+
+    @staticmethod
+    def _is_text_only_content_error(exc: BadRequestError) -> bool:
+        """判断 400 是否由「模型不支持多模态 content」导致。
+
+        兼容智谱 GLM 的 ``messages.content.type 参数非法，取值范围 ['text']``
+        （错误码 1210）以及 OpenAI 兼容网关的 ``image_url is not supported`` 等文案。
+        """
+        if str(getattr(exc, 'code', '') or '') == '1210':
+            return True
+        text = str(exc).lower()
+        if 'content.type' in text or 'content type' in text:
+            return True
+        return 'image_url' in text and ('unsupported' in text or 'not support' in text)
+
+    @staticmethod
     def _is_silent_reply(text: str) -> bool:
         """随机插话的「不发言」判定：空正文或模型只回 NO_REPLY 哨兵。
 
@@ -616,14 +664,31 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                 'model': self.get_config('Model'),
                 'messages': self._build_request_messages(working, random_reply),
             }
+            # 已确认模型不支持视觉：后续请求直接压平多模态内容，避免每轮都吃 400
+            if self._vision_unsupported:
+                request_kwargs['messages'] = self._text_only_messages(
+                    request_kwargs['messages'])
             if available_tools:
                 request_kwargs['tools'] = available_tools
                 request_kwargs['tool_choice'] = 'auto'
 
             # 同步 SDK 调用放到线程池执行，避免阻塞事件循环导致
             # NapCat 心跳超时/其他会话卡死（定时任务同样走 to_thread）
-            response = await asyncio.to_thread(
-                self._default_client.chat.completions.create, **request_kwargs)
+            try:
+                response = await asyncio.to_thread(
+                    self._default_client.chat.completions.create, **request_kwargs)
+            except BadRequestError as e:
+                # 纯文本模型遇到历史里的 image_url 会 400：降级为纯文本重试一次，
+                # 并记住该模型不支持视觉（后续轮次不再下载/发送图片）
+                if self._vision_unsupported or not self._is_text_only_content_error(e):
+                    raise
+                _log.warning(
+                    f'模型不支持多模态 content，已自动降级为纯文本重试（图片将以 [图片] 代替）: {e}')
+                self._vision_unsupported = True
+                request_kwargs['messages'] = self._text_only_messages(
+                    request_kwargs['messages'])
+                response = await asyncio.to_thread(
+                    self._default_client.chat.completions.create, **request_kwargs)
 
             _log.debug(
                 f'请求尝试: {current_retries_times + 1}/{self.get_config("MaxRetriesTimes")}，'
@@ -764,13 +829,18 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                      'content': history_content})
 
                 if vision:
-                    vision_messages.append({
-                        'role': 'user',
-                        'content': [
-                            {'type': 'text', 'text': TOOL_VISION_IMAGE_TEXT},
-                            {'type': 'image_url', 'image_url': {'url': vision['data_url']}},
-                        ],
-                    })
+                    # 纯文本模型不追加 image_url（否则下一轮请求会 400）；工具历史里
+                    # 已保留图片摘要，模型仍知道有图片存在
+                    if self._vision_unsupported:
+                        _log.debug('模型不支持视觉输入，工具图片已省略（仅保留摘要）')
+                    else:
+                        vision_messages.append({
+                            'role': 'user',
+                            'content': [
+                                {'type': 'text', 'text': TOOL_VISION_IMAGE_TEXT},
+                                {'type': 'image_url', 'image_url': {'url': vision['data_url']}},
+                            ],
+                        })
 
             # 所有 tool 消息追加完毕后，再附加视觉消息（保持 tool_calls 与 tool 的相邻顺序）
             for vision_message in vision_messages:
@@ -837,10 +907,13 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             self.data['data'][conversation_dict][session_id] = default_preset.to_conversations()
             self._set_preset_name(conversation_dict, session_id, DEFAULT_PRESET_NAME)
 
-        # 识别用户消息中携带的图片（可配置关闭），作为视觉输入交给模型
+        # 识别用户消息中携带的图片（可配置关闭），作为视觉输入交给模型。
+        # 已探测到模型不支持视觉时跳过下载，避免无谓的网络开销
         user_vision_infos: list[dict] = []
-        if self.get_config('EnableImageRecognition'):
+        if self.get_config('EnableImageRecognition') and not self._vision_unsupported:
             user_vision_infos = await self._extract_user_image_visions(event)
+        elif self._vision_unsupported:
+            _log.debug('模型不支持视觉输入，已跳过用户图片下载')
 
         # 构建写入会话的用户消息内容：
         # - 无图片：保持纯文本字符串（与旧行为一致）
@@ -860,6 +933,10 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                 f'将作为视觉输入附加到对话')
         else:
             user_content = user_message
+            # 模型已确认不支持视觉：图片不会被下载，纯图片消息不能退化成空内容
+            if (self._vision_unsupported and event.message.filter_image()
+                    and not event.message.text.strip()):
+                user_content = IMAGE_PLACEHOLDER_TEXT
 
         # 添加用户消息到会话
         self.data['data'][conversation_dict][session_id].append({'role': 'user', 'content': user_content})

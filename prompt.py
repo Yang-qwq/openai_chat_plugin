@@ -6,6 +6,7 @@
 - ``RANDOM_REPLY_SYSTEM_PROMPT``：群聊随机插话时临时插入的提示（固定 user 角色，
   不写入会话历史）
 - ``IMAGE_ONLY_USER_TEXT``：用户只发图片、未带文字时补充的默认文本
+- ``IMAGE_PLACEHOLDER_TEXT``：模型不支持视觉时，多模态图片在纯文本请求中的占位符
 - ``TOOL_VISION_IMAGE_TEXT``：工具获取图片后附加视觉消息时的引导文本
 - ``SCHEDULED_TASK_MESSAGE_TEMPLATE``：定时任务轮次注入的内部消息模板
 
@@ -25,6 +26,9 @@ RANDOM_REPLY_SYSTEM_PROMPT = (
 
 # 用户消息仅包含图片、没有文字时，作为文本部分的兜底说明
 IMAGE_ONLY_USER_TEXT = '用户发送了图片，请查看随附图片。'
+
+# 模型不支持视觉输入时，多模态图片在纯文本请求中的占位符
+IMAGE_PLACEHOLDER_TEXT = '[图片]'
 
 # 工具返回图片（content_format="image"）后，附加视觉消息的引导文本
 TOOL_VISION_IMAGE_TEXT = '以下是通过工具获取的图片：'

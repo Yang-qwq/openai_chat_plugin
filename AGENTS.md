@@ -31,6 +31,7 @@ OpenAIChatPlugin/
 
 - `RANDOM_REPLY_SYSTEM_PROMPT`：随机插话临时提示（固定 user 角色，不写回会话历史）
 - `IMAGE_ONLY_USER_TEXT`：用户仅发图片、无文字时的兜底文本
+- `IMAGE_PLACEHOLDER_TEXT`：模型不支持视觉时，图片在纯文本请求中的占位符（`[图片]`）
 - `TOOL_VISION_IMAGE_TEXT`：工具返回图片后附加视觉消息的引导文本
 - `SCHEDULED_TASK_MESSAGE_TEMPLATE` / `build_scheduled_task_message()`：定时任务轮次的内部消息
 
@@ -306,9 +307,16 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
   多张图片全部附加；仅发图片无文字时文本部分补默认说明
 - 文本部分取 `event.message.text`（纯文字，避免把 `[CQ:image,...]` 段标记交给模型）
 - 识别关闭或图片下载失败时，用户消息保持纯文本字符串，行为与旧版一致
+- **纯文本模型自动降级**：历史里已持久化的 `image_url` 会让只接受 `content.type='text'`
+  的供应商（如智谱 GLM 返回 400 code 1210）整轮失败。`_generate_reply()` 捕获
+  `BadRequestError` 且文案匹配 `content.type` / 不支持的 `image_url` 时，用
+  `_text_only_messages()` 把请求副本压平成纯文本（图片 → `[图片]`，**不改会话历史**）
+  重试一次，并置 `_vision_unsupported=True`：后续轮次提前压平、跳过用户图片下载、
+  工具图片只保留摘要不追加视觉消息。无关的 400 不会被误判
 - 测试见 `tests/test_image_vision.py`（`fetch_image_data_url`/`_sniff_image_mime` 单测
   用 `httpx.MockTransport`，对话链路用 `FakeOpenAIClient` + monkeypatch
-  `tools._default_http_transport`），覆盖私聊/群聊 @、多图、关闭、下载失败降级
+  `tools._default_http_transport`），覆盖私聊/群聊 @、多图、关闭、下载失败降级；
+  `tests/test_text_only_model.py` 覆盖 400 降级、后续请求提前压平与无关 400 不误判
 
 ## 思维链剥离（reasoning.py）
 
@@ -427,7 +435,8 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
   `test_random_reply.py`（随机插话：命中/沉默/冷却/群开关/提示固定 user 角色）、
   `test_cron_tools.py`（定时任务：可见性/增删查/失败分支/投递/恢复/分派拦截）、
   `test_ssrf.py`（SSRF 防护：地址段分类/主机校验/重定向逐跳复核/配置注入与
-  模型参数隔离）
+  模型参数隔离）、`test_text_only_model.py`（纯文本模型兼容：400 降级重试/后续
+  请求提前压平/无关 400 不误判）
 - `test_trpg_coordination.py` 会在模块级探测 `plugins/NcatBotTRPG/manifest.toml`，
   插件不存在时整体 skip，而不是加载报错
 
