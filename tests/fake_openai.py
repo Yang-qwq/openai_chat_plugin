@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """OpenAI 客户端 stub：隔离真实网络，驱动对话链路测试。"""
 import httpx
-from openai import RateLimitError
+from openai import BadRequestError, RateLimitError
 
 
 def make_rate_limit_error() -> RateLimitError:
@@ -9,6 +9,14 @@ def make_rate_limit_error() -> RateLimitError:
     request = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
     return RateLimitError(
         "429 rate limit", response=httpx.Response(429, request=request), body=None)
+
+
+def make_bad_request_error(message: str, code: str = "1210") -> BadRequestError:
+    """构造 SDK 的 400 异常，用于模拟纯文本模型拒绝多模态 content"""
+    request = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
+    body = {"error": {"code": code, "message": message}}
+    return BadRequestError(
+        message, response=httpx.Response(400, request=request, json=body), body=body)
 
 
 class FakeMessage:

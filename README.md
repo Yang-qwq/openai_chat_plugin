@@ -171,28 +171,28 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 
 ## 🔧 配置项说明
 
-| 配置项                         | 类型    | 默认值                    | 说明                                               |
-|--------------------------------|---------|---------------------------|----------------------------------------------------|
-| `ApiKey`                       | string  | -                         | OpenAI API密钥                                     |
-| `Model`                        | string  | openai/gpt-4o-mini        | 使用的AI模型                                       |
-| `BaseUrl`                      | string  | https://api.openai.com/v1 | API基础URL                                         |
-| `MustAtBot`                    | boolean | True                      | 群聊中是否必须@机器人                              |
-| `InsertUserdataAsPrefix`       | boolean | False                     | 是否插入用户信息作为前缀                           |
-| `EnableBuiltinFunctionCalling` | boolean | False                     | 是否启用内置函数调用功能                           |
-| `AllowAccessMemory`            | boolean | False                     | 是否允许访问会话记忆（内置函数调用功能需要开启）   |
-| `AllowWebRequests`             | boolean | False                     | 是否允许AI进行网络请求（内置函数调用功能需要开启） |
-| `AllowLoopbackIps`             | boolean | False                     | 是否允许网络/图片请求访问回环地址（如 127.0.0.1、::1） |
-| `AllowLocalNetworkIps`         | boolean | False                     | 是否允许网络/图片请求访问内网地址（如 10.x、192.168.x、fc00::） |
-| `EnableImageRecognition`       | boolean | True                      | 是否识别用户消息中携带的图片并作为视觉输入交给模型（无需开启函数调用） |
-| `StripReasoning`               | boolean | True                      | 是否剥离推理模型的思维链（`<think>` / `<reasoning>` / DeepSeek 全角分隔符等），仅写日志 |
-| `EnableRandomReplyGroup`       | boolean | False                     | 是否允许群聊随机插话（未 @机器人 的消息按概率参与） |
-| `GroupRandomReplyChance`       | number  | 0.02                      | 群聊随机插话概率（0~1），命中后仍由模型决定是否发言 |
-| `AllowScheduledTasks`          | boolean | False                     | 是否允许 AI 创建/管理定时任务（内置函数调用功能需要开启） |
-| `EnableScheduledTaskExecution` | boolean | True                      | 定时任务执行总开关（kill switch）；关闭后不注册/不执行，记录保留 |
-| `MaxRetriesTimes`              | integer | 15                        | 工具调用轮次的最大重试次数                         |
-| `MaxConversationCacheStoreAmount` | integer | 1000                    | 最大对话缓存存储数量                               |
-| `EnableGroupOwnerAutoAuth`     | boolean | True                      | 群主/群管理自动放行本群管理员命令                  |
-| `IsConfigured`                 | boolean | False                     | 插件是否已配置                                     |
+| 配置项                            | 类型    | 默认值                    | 说明                                                                                    |
+|-----------------------------------|---------|---------------------------|-----------------------------------------------------------------------------------------|
+| `ApiKey`                          | string  | -                         | OpenAI API密钥                                                                          |
+| `Model`                           | string  | openai/gpt-4o-mini        | 使用的AI模型                                                                            |
+| `BaseUrl`                         | string  | https://api.openai.com/v1 | API基础URL                                                                              |
+| `MustAtBot`                       | boolean | True                      | 群聊中是否必须@机器人                                                                   |
+| `InsertUserdataAsPrefix`          | boolean | False                     | 是否插入用户信息作为前缀                                                                |
+| `EnableBuiltinFunctionCalling`    | boolean | False                     | 是否启用内置函数调用功能                                                                |
+| `AllowAccessMemory`               | boolean | False                     | 是否允许访问会话记忆（内置函数调用功能需要开启）                                        |
+| `AllowWebRequests`                | boolean | False                     | 是否允许AI进行网络请求（内置函数调用功能需要开启）                                      |
+| `AllowLoopbackIps`                | boolean | False                     | 是否允许网络/图片请求访问回环地址（如 127.0.0.1、::1）                                  |
+| `AllowLocalNetworkIps`            | boolean | False                     | 是否允许网络/图片请求访问内网地址（如 10.x、192.168.x、fc00::）                         |
+| `EnableImageRecognition`          | boolean | True                      | 是否识别用户消息中携带的图片并作为视觉输入交给模型（无需开启函数调用）                  |
+| `StripReasoning`                  | boolean | True                      | 是否剥离推理模型的思维链（`<think>` / `<reasoning>` / DeepSeek 全角分隔符等），仅写日志 |
+| `EnableRandomReplyGroup`          | boolean | False                     | 是否允许群聊随机插话（未 @机器人 的消息按概率参与）                                     |
+| `GroupRandomReplyChance`          | number  | 0.02                      | 群聊随机插话概率（0~1），命中后仍由模型决定是否发言                                     |
+| `AllowScheduledTasks`             | boolean | False                     | 是否允许 AI 创建/管理定时任务（内置函数调用功能需要开启）                               |
+| `EnableScheduledTaskExecution`    | boolean | True                      | 定时任务执行总开关（kill switch）；关闭后不注册/不执行，记录保留                        |
+| `MaxRetriesTimes`                 | integer | 15                        | 工具调用轮次的最大重试次数                                                              |
+| `MaxConversationCacheStoreAmount` | integer | 1000                      | 最大对话缓存存储数量                                                                    |
+| `EnableGroupOwnerAutoAuth`        | boolean | True                      | 群主/群管理自动放行本群管理员命令                                                       |
+| `IsConfigured`                    | boolean | False                     | 插件是否已配置                                                                          |
 
 ## 🎯 高级功能
 
@@ -211,6 +211,11 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 - 关闭：在全局 config.yaml 的 `plugin_configs.OpenAIChatPlugin` 中设置
   `EnableImageRecognition: false`
 
+**纯文本模型自动降级**：若模型/网关只接受 `content.type='text'`（如智谱 GLM 返回
+400 code 1210 `messages.content.type 参数非法，取值范围 ['text']`），插件会在首次
+失败后用纯文本重试（历史图片替换为 `[图片]`，会话历史本身不改），并记住该模型不支持
+视觉：后续请求提前压平、不再下载用户图片、工具图片只保留摘要。无关的 400 不会触发降级。
+
 > 注意：图片识别默认开启即意味着插件会下载用户发送的图片。若不希望插件访问图片
 > 资源（例如仅纯文本对话、或处于受限网络环境），请将 `EnableImageRecognition` 置为 false。
 
@@ -219,12 +224,12 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 需要同时开启 `EnableBuiltinFunctionCalling` 与 `AllowWebRequests`。开启后模型可以调用
 `create_http_request` 工具：
 
-| `content_format` | 用途 |
-|------------------|------|
-| `text` | 获取纯文本响应 |
-| `markdown` | 抓取网页，HTML 会自动转换为 Markdown |
-| `json` | 调用 JSON API 并返回结构化数据 |
-| `image` | 获取图片并作为视觉输入交给模型阅读 |
+| `content_format` | 用途                                 |
+|------------------|--------------------------------------|
+| `text`           | 获取纯文本响应                       |
+| `markdown`       | 抓取网页，HTML 会自动转换为 Markdown |
+| `json`           | 调用 JSON API 并返回结构化数据       |
+| `image`          | 获取图片并作为视觉输入交给模型阅读   |
 
 示例（模型自动完成，无需手动输入）：
 
@@ -292,11 +297,11 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 需要同时开启 `EnableBuiltinFunctionCalling` 与 `AllowScheduledTasks`。开启后模型可调用
 `manage_cron_tasks` 工具：
 
-| action | 说明 |
-|--------|------|
-| `add` | 创建任务（投递到当前会话），需要 `task_name`、`interval`、`prompt` |
-| `delete` | 删除任务，需要 `task_name`；只能删除**当前会话**创建的任务 |
-| `list` | 查看所有会话的任务与下次执行时间 |
+| action   | 说明                                                               |
+|----------|--------------------------------------------------------------------|
+| `add`    | 创建任务（投递到当前会话），需要 `task_name`、`interval`、`prompt` |
+| `delete` | 删除任务，需要 `task_name`；只能删除**当前会话**创建的任务         |
+| `list`   | 查看所有会话的任务与下次执行时间                                   |
 
 - 到点后插件用「主会话历史 + 一条内部消息 `[定时任务 <name>] <prompt>`」执行一次完整对话轮次
   （**支持工具调用**，与普通聊天共用 `EnableBuiltinFunctionCalling` 与各 `AllowXxx` 开关），
@@ -382,6 +387,12 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 ```
 
 ## 📝 更新日志
+
+### v0.4.4
+
+- 🖼️ **纯文本模型兼容**：历史中的 `image_url` 不再让只支持纯文本的供应商（如智谱 GLM
+  400 code 1210）永久失败——首次 400 自动以纯文本重试并记住模型不支持视觉，后续请求
+  提前压平多模态内容、跳过图片下载，会话历史保持不变
 
 ### v0.4.3
 
