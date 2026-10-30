@@ -89,10 +89,10 @@ async def test_at_bot_triggers_group_chat(tmp_path, monkeypatch):
         assert len(client.chat.completions.calls) == 1
         h.assert_api("send_group_msg").called().with_text("你好，我是AI")
 
-        # 会话已持久化（data.json 存在且包含 assistant 回复）
-        data_file = plugin.workspace / "data.json"
-        assert data_file.is_file()
-        session = plugin.data["data"]["group_conversations"][GROUP_ID]
+        # 会话已持久化（分离文件存在且包含 assistant 回复）
+        session_file = plugin.workspace / "group" / f"{GROUP_ID}.json"
+        assert session_file.is_file()
+        session = plugin._sessions.load("group_conversations", GROUP_ID)
         assert {"role": "assistant", "content": "你好，我是AI"} in session
 
 

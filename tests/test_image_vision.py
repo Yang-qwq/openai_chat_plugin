@@ -195,7 +195,7 @@ async def test_private_image_attached_as_vision_message(tmp_path, monkeypatch):
         assert image_parts[0]['image_url']['url'].startswith('data:image/png;base64,')
 
         # 会话历史同样保存多模态内容
-        session = plugin.data['data']['user_conversations'][ROOT_QQ]
+        session = plugin._sessions.load('user_conversations', ROOT_QQ)
         user_entry = next(m for m in session if m['role'] == 'user')
         assert any(
             isinstance(p, dict) and p.get('type') == 'image_url'

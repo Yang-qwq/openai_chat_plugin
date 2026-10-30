@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """群聊随机插话测试
 
-覆盖：概率命中绕过 MustAtBot、模型回 NO_REPLY/空正文保持沉默、群级 nolisten、
-冷却时间、插话提示固定 user 角色（避免双 system 被严格网关拒绝）、
-随机插话轮的工具调用（暴露工具、发言才提交工具轮、沉默回滚、错误静默）。
+覆盖：概率命中绕过 MustAtBot、模型回 NO_REPLY/空正文保持沉默（完整轮次落库）、
+群级 nolisten、冷却时间、插话提示固定 user 角色（避免双 system 被严格网关拒绝）、
+随机插话轮的工具调用（暴露工具、发言/沉默均提交工具轮、异常回滚、错误静默）。
 
 运行：python -m pytest tests -v -o "addopts="
 """
@@ -90,7 +90,7 @@ async def test_random_reply_bypasses_must_at_bot(tmp_path, monkeypatch):
         assert len(client.chat.completions.calls) == 1
         h.assert_api("send_group_msg").with_text("确实，今天适合出门")
 
-        session = plugin.data["data"]["group_conversations"][GROUP_ID]
+        session = plugin._sessions.load("group_conversations", GROUP_ID)
         assert session[-1] == {"role": "assistant", "content": "确实，今天适合出门"}
 
 
@@ -109,7 +109,7 @@ async def test_random_reply_disabled_keeps_must_at_bot(tmp_path, monkeypatch):
 
         assert len(client.chat.completions.calls) == 0
         h.assert_api("send_group_msg").not_called()
-        assert GROUP_ID not in plugin.data["data"]["group_conversations"]
+        assert not plugin._sessions.has("group_conversations", GROUP_ID)
 
 
 async def test_nolisten_closes_random_reply(tmp_path, monkeypatch):
@@ -167,8 +167,8 @@ async def test_nolisten_toggle_and_query(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("silent_reply", ["NO_REPLY", "`NO_REPLY`", "NO_REPLY.", "no-reply", ""])
-async def test_silent_reply_does_not_send(tmp_path, monkeypatch, silent_reply):
-    """模型回 NO_REPLY 哨兵或空正文时保持沉默：不发送、不写 assistant 历史"""
+async def test_silent_reply_records_full_turn(tmp_path, monkeypatch, silent_reply):
+    """模型回 NO_REPLY 哨兵或空正文时不发送，但完整轮次（归一化的沉默决定）写入历史"""
     monkeypatch.chdir(tmp_path)
     _force_random_hit(monkeypatch)
     async with _harness() as h:
@@ -179,8 +179,10 @@ async def test_silent_reply_does_not_send(tmp_path, monkeypatch, silent_reply):
         await h.settle()
 
         h.assert_api("send_group_msg").not_called()
-        session = plugin.data["data"]["group_conversations"][GROUP_ID]
-        assert [m["role"] for m in session] == ["user"]
+        session = plugin._sessions.load("group_conversations", GROUP_ID)
+        # 哨兵变体与空正文统一归一为 NO_REPLY，保持轮次完整
+        assert [m["role"] for m in session] == ["user", "assistant"]
+        assert session[-1] == {"role": "assistant", "content": "NO_REPLY"}
 
 
 async def test_random_reply_cooldown(tmp_path, monkeypatch):
@@ -250,7 +252,7 @@ async def test_random_reply_hint_inserted_before_latest_message(tmp_path, monkey
         assert messages[-1]["content"] == "第二条消息"
         assert "NO_REPLY" in messages[-2]["content"]
         # 提示只存在于本次请求副本，不写回持久化历史
-        session = plugin.data["data"]["group_conversations"][GROUP_ID]
+        session = plugin._sessions.load("group_conversations", GROUP_ID)
         assert [m["role"] for m in session] == [
             "system", "user", "assistant", "user", "assistant"]
         assert all("NO_REPLY" not in str(m.get("content")) for m in session)
@@ -269,7 +271,7 @@ async def test_random_reply_rate_limit_stays_silent(tmp_path, monkeypatch):
 
         # 不发送任何消息（既不是 AI 回复，也不是「插件内部错误」）
         h.assert_api("send_group_msg").not_called()
-        session = plugin.data["data"]["group_conversations"][GROUP_ID]
+        session = plugin._sessions.load("group_conversations", GROUP_ID)
         assert [m["role"] for m in session] == ["user"]
 
 
@@ -325,7 +327,7 @@ async def test_random_reply_tool_round_commits_when_speaking(tmp_path, monkeypat
         h.assert_api("send_group_msg").times(1)
         h.assert_api("send_group_msg").with_text("现在是 UTC 时间")
 
-        session = plugin.data["data"]["group_conversations"][GROUP_ID]
+        session = plugin._sessions.load("group_conversations", GROUP_ID)
         assert [m["role"] for m in session] == ["user", "assistant", "tool", "assistant"]
         assert session[1].get("tool_calls")
         assert '"status": "success"' in session[2]["content"]
@@ -336,8 +338,8 @@ async def test_random_reply_tool_round_commits_when_speaking(tmp_path, monkeypat
         assert any(m["role"] == "tool" for m in client.chat.completions.calls[1]["messages"])
 
 
-async def test_random_reply_tool_round_rolled_back_on_no_reply(tmp_path, monkeypatch):
-    """随机插话走工具轮但最终 NO_REPLY：工具轮回滚，主会话只留用户消息"""
+async def test_random_reply_tool_round_recorded_on_no_reply(tmp_path, monkeypatch):
+    """随机插话走工具轮但最终 NO_REPLY：工具轮与沉默决定一并落库，主会话保留完整轮次"""
     monkeypatch.chdir(tmp_path)
     _force_random_hit(monkeypatch)
     async with _harness() as h:
@@ -350,13 +352,16 @@ async def test_random_reply_tool_round_rolled_back_on_no_reply(tmp_path, monkeyp
         await h.settle()
 
         h.assert_api("send_group_msg").not_called()
-        session = plugin.data["data"]["group_conversations"][GROUP_ID]
-        assert [m["role"] for m in session] == ["user"]
+        session = plugin._sessions.load("group_conversations", GROUP_ID)
+        assert [m["role"] for m in session] == ["user", "assistant", "tool", "assistant"]
+        assert session[1].get("tool_calls")
+        assert '"status": "success"' in session[2]["content"]
+        assert session[-1] == {"role": "assistant", "content": "NO_REPLY"}
 
-        # 工具确实执行过（两轮请求），但结果没有落库
+        # 工具确实执行过（两轮请求），完整轮次已落库
         assert len(client.chat.completions.calls) == 2
-        saved = json.loads((plugin.workspace / "data.json").read_text(encoding="utf-8"))
-        assert [m["role"] for m in saved["data"]["group_conversations"][GROUP_ID]] == ["user"]
+        saved = json.loads((plugin.workspace / "group" / f"{GROUP_ID}.json").read_text(encoding="utf-8"))
+        assert [m["role"] for m in saved] == ["user", "assistant", "tool", "assistant"]
 
 
 async def test_random_reply_tool_limit_stays_silent(tmp_path, monkeypatch):
@@ -376,5 +381,88 @@ async def test_random_reply_tool_limit_stays_silent(tmp_path, monkeypatch):
         await h.settle()
 
         h.assert_api("send_group_msg").not_called()
-        session = plugin.data["data"]["group_conversations"][GROUP_ID]
+        session = plugin._sessions.load("group_conversations", GROUP_ID)
         assert [m["role"] for m in session] == ["user"]
+
+
+async def test_random_reply_hint_stays_before_user_message_in_tool_round(tmp_path, monkeypatch):
+    """工具轮追加消息后，提示仍紧贴本次用户消息，不插进 tool_calls 与 tool 之间
+
+    回归：提示曾按 ``len(messages) - 1`` 插入，第二轮请求会变成
+    ``assistant(tool_calls) → user(提示) → tool``，破坏工具消息相邻顺序。
+    """
+    monkeypatch.chdir(tmp_path)
+    _force_random_hit(monkeypatch)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        plugin.config["EnableBuiltinFunctionCalling"] = True
+        client = _configure(plugin, _tool_call_responses("现在是 UTC 时间"))
+
+        await h.inject(_group_text())
+        await h.settle()
+
+        messages = client.chat.completions.calls[1]["messages"]
+        assert [m["role"] for m in messages] == ["user", "user", "assistant", "tool"]
+        assert "NO_REPLY" in messages[0]["content"]
+        assert messages[1]["content"] == "今天天气不错"
+        assert messages[2].get("tool_calls")
+        assert messages[3].get("tool_call_id") == "call_1"
+
+
+async def test_random_reply_hint_carries_recent_group_context(tmp_path, monkeypatch):
+    """未启用函数调用时，提示附带固定长度的群聊记录（去重、截断、过滤 NO_REPLY）"""
+    monkeypatch.chdir(tmp_path)
+    _force_random_hit(monkeypatch)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        client = _configure(plugin, ["嗯", "确实热"])
+
+        # 第一条命中随机插话并写入会话历史
+        await h.inject(_group_text("有人在吗"))
+        await h.settle()
+        # 冷却期内的消息不会进入会话历史，只留在临时群聊缓存
+        await h.inject(_group_text("今天好热"))
+        await h.settle()
+        await h.inject(_group_text("x" * 500))
+        await h.settle()
+        await h.inject(_group_text("NO_REPLY 是什么意思"))
+        await h.settle()
+        # 冷却结束后再命中一次
+        plugin._last_random_reply_ts.clear()
+        await h.inject(_group_text("真的吗"))
+        await h.settle()
+
+        messages = client.chat.completions.calls[1]["messages"]
+        hint = next(m for m in messages if "NO_REPLY" in str(m["content"]))
+        assert "今天好热" in hint["content"]
+        assert "有人在吗" not in hint["content"]
+        assert "真的吗" not in hint["content"]
+        # 单条超长消息截断到 200 字符；含 NO_REPLY 的群友发言不进入上下文
+        assert "x" * 200 in hint["content"]
+        assert "x" * 201 not in hint["content"]
+        assert "是什么意思" not in hint["content"]
+
+
+async def test_random_reply_prefers_context_tool_over_pasted_history(tmp_path, monkeypatch):
+    """启用函数调用时，只鼓励模型调用 query_missing_message_context，不直接附带群聊记录"""
+    monkeypatch.chdir(tmp_path)
+    _force_random_hit(monkeypatch)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        plugin.config["EnableBuiltinFunctionCalling"] = True
+        client = _configure(plugin, ["嗯", "确实热"])
+
+        await h.inject(_group_text("有人在吗"))
+        await h.settle()
+        # 冷却期内被忽略的消息：有工具时不应被插件硬塞进提示
+        await h.inject(_group_text("今天好热"))
+        await h.settle()
+        plugin._last_random_reply_ts.clear()
+        await h.inject(_group_text("真的吗"))
+        await h.settle()
+
+        messages = client.chat.completions.calls[1]["messages"]
+        hint = next(m for m in messages if "NO_REPLY" in str(m["content"]))
+        assert "query_missing_message_context" in hint["content"]
+        assert "今天好热" not in hint["content"]
+        assert "【群聊最近消息】" not in hint["content"]

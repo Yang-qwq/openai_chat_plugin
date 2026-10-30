@@ -82,6 +82,11 @@ MAX_HTTP_REDIRECTS = 5
 # 默认 transport（None 表示使用 httpx 默认实现；测试中可注入 MockTransport）
 _default_http_transport: httpx.AsyncBaseTransport | None = None
 
+# ---- 群聊上下文查询工具 ----
+# query_missing_message_context 未指定 count 时取回的条数；上限由插件按
+# MaxConversationCacheStoreAmount 在分派链注入
+DEFAULT_MISSING_CONTEXT_COUNT = 50
+
 # ---- 定时任务工具限制 ----
 SCHEDULED_TASK_TOOL_NAME = 'manage_cron_tasks'
 # 框架的定时任务名全局唯一（跨插件共享命名空间），加插件前缀避免冲突
@@ -182,10 +187,20 @@ tools = [
         'type': 'function',
         'function': {
             'name': 'query_missing_message_context',
-            'description': 'Query the missing message context between single chat messages (only for group chats)',
+            'description': 'Query recently missed group messages (only for group chats). '
+                           'Use count to control how many of the latest messages are returned; '
+                           'a successful retrieval clears the temporary message cache.',
             'parameters': {
                 'type': 'object',
-                'properties': {},
+                'properties': {
+                    'count': {
+                        'type': 'integer',
+                        'minimum': 1,
+                        'description': 'How many of the most recent messages to return. '
+                                       'Defaults to 50; the upper bound is the '
+                                       'MaxConversationCacheStoreAmount configuration.',
+                    },
+                },
                 'required': []
             }
         }
@@ -699,18 +714,48 @@ async def get_group_info(api: QQAPIClient, group_id: int) -> str:
     return _generate_tool_payload('success', '', _to_jsonable(data))
 
 
-async def query_missing_message_context(temp_history_messages_kv: dict, group_id: int) -> str:
+async def query_missing_message_context(
+        temp_history_messages_kv: dict,
+        group_id: int,
+        count: object = None,
+        max_count: object = None) -> str:
     """查询忽略的消息上下文（仅限群聊）
+
+    只返回**最近的若干条**，避免模型一次拉回整段缓存撑爆上下文；取回成功后
+    清空该群的临时缓存（这些消息已经交给模型，继续保留只会在下次查询时重复返回）。
+    缓存被清空为 ``[]`` 而不是删除 key，后续查询仍返回 success + 空数组。
 
     :param temp_history_messages_kv: 外部对话临时存储
     :param group_id: 群ID
+    :param count: 取回最近多少条；缺省 / 非法时为 ``DEFAULT_MISSING_CONTEXT_COUNT``
+    :param max_count: 允许的上限，由插件按 ``MaxConversationCacheStoreAmount`` 注入
     :return: str, json字符串
     """
     try:
         missing_context = temp_history_messages_kv[str(group_id)]
     except Exception as e:
         return _generate_tool_payload('error', f'查询消息上下文时出错: {e}')
-    return _generate_tool_payload('success', f'已获取{len(missing_context)}条消息', missing_context)
+
+    total = len(missing_context)
+    if total == 0:
+        return _generate_tool_payload('success', '暂无被忽略的群消息', [])
+
+    limit = _parse_int_id(count)
+    if limit is None:
+        limit = DEFAULT_MISSING_CONTEXT_COUNT
+    upper = _parse_int_id(max_count)
+    if upper is not None and upper > 0:
+        limit = min(limit, upper)
+    limit = max(1, min(limit, total))
+
+    recent = list(missing_context)[-limit:]
+    # 取回成功：整批临时消息都算已消费（即使只返回了最近 N 条）
+    missing_context.clear()
+
+    message = f'已获取{len(recent)}条消息'
+    if limit < total:
+        message += f'（共{total}条）'
+    return _generate_tool_payload('success', message, recent)
 
 async def get_system_time() -> str:
     """获取多种格式的系统时间

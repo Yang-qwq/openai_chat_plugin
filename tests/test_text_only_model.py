@@ -48,7 +48,7 @@ def _configure(plugin, responses):
 
 def _with_image_history(plugin):
     """伪造“上一轮用户发过图片”的会话历史（图片以多模态 list 持久化）"""
-    plugin.data["data"]["user_conversations"][ROOT_QQ] = [
+    plugin._sessions.replace("user_conversations", ROOT_QQ, [
         {
             'role': 'user',
             'content': [
@@ -57,7 +57,7 @@ def _with_image_history(plugin):
             ],
         },
         {'role': 'assistant', 'content': '收到'},
-    ]
+    ])
 
 
 def _has_multimodal_content(messages) -> bool:
@@ -91,7 +91,7 @@ async def test_text_only_model_retries_with_plain_text(tmp_path, monkeypatch):
         h.assert_api("send_private_msg").with_text("好的，我看看")
 
         # 只降级请求副本，会话历史保留原始多模态消息
-        history = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        history = plugin._sessions.load("user_conversations", ROOT_QQ)
         assert isinstance(history[0]["content"], list)
 
 

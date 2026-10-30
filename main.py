@@ -25,14 +25,20 @@ from .preset_manager import Preset
 from .prompt import (
     IMAGE_ONLY_USER_TEXT,
     IMAGE_PLACEHOLDER_TEXT,
+    RANDOM_REPLY_CONTEXT_HEADER,
     RANDOM_REPLY_SYSTEM_PROMPT,
     TOOL_VISION_IMAGE_TEXT,
-    build_scheduled_task_message,
+    SCHEDULED_TASK_MESSAGE_TEMPLATE,
+    CONVERSATION_COMPRESSION_SYSTEM_PROMPT,
+    CONVERSATION_COMPRESSION_USER_TEMPLATE,
 )
+from .session_store import SessionStore
 from .update import (
+    migrate_conversations_to_split_files,
     migrate_legacy_workspace,
     migrate_memory_format,
     migrate_presents_dir,
+    needs_conversation_split_migration,
     needs_memory_migration,
 )
 
@@ -43,8 +49,15 @@ OMITTED_TEXT_LENGTH = 100
 
 # 随机插话的「不发言」哨兵：容忍 NO_REPLY / NO-REPLY / `no_reply` 等写法
 NO_REPLY_PATTERN = re.compile(r'^\W*no[_\-\s]?reply\W*$', re.IGNORECASE)
+# 沉默决定写入会话历史时的规范化文本：哨兵变体与空正文统一记为 NO_REPLY
+NO_REPLY_SENTINEL = 'NO_REPLY'
 # 同一群的随机插话最小间隔（秒），防止连续刷屏
 RANDOM_REPLY_COOLDOWN_SECONDS = 30
+# 随机插话提示里附带的历史群聊条数上限：给模型提供「大家在聊什么」的上下文，
+# 避免它因为看不到群聊历史而反复调用记忆工具、或直接判定没什么可说
+RANDOM_REPLY_CONTEXT_MESSAGES = 20
+# 上下文里单条群消息的字符上限：群友可能粘贴长文，不能让一条消息挤占整个上下文
+RANDOM_REPLY_CONTEXT_LINE_CHARS = 200
 # 单次 OpenAI 请求超时（秒）。同步客户端在网络异常时可能长时间阻塞，
 # 因此限制单请求耗时并减少重试，避免定时任务卡住事件循环太久
 REQUEST_TIMEOUT_SECONDS = 60.0
@@ -52,6 +65,13 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 # 并遵守响应头 Retry-After）。生产环境出现过瞬时 429：只重试 1 次时，第二次
 # 仍被限流就会把异常抛给用户，因此放宽到 4 次（最多 5 次尝试）
 REQUEST_MAX_RETRIES = 4
+
+# 会话压缩生成摘要时的输入预算（字符）与单条消息的保留上限。
+# 被压缩的历史超出预算时**等距抽样**而不是只截取开头，保证摘要覆盖整段历史。
+SUMMARY_INPUT_BUDGET_CHARS = 12000
+SUMMARY_LINE_MAX_CHARS = 1000
+# 自动清理循环的默认检查间隔（秒）：配置为 0/负数/非法值时回退到该值，避免忙等扫描磁盘
+AUTO_CLEANUP_DEFAULT_INTERVAL_SECONDS = 1800.0
 
 
 class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
@@ -61,7 +81,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
     """
 
     name = 'OpenAIChatPlugin'  # 插件名（须与 manifest.toml 一致）
-    version = '0.4.4'  # 插件版本（须与 manifest.toml 一致）
+    version = '0.5.1'  # 插件版本
     author = 'Yang-qwq'
     description = 'OpenAI 对话插件：多预设管理、函数调用（Function Calling）、会话持久化'
 
@@ -95,6 +115,14 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             'AllowLoopbackIps': False,  # 是否允许回环访问（如 127.0.0.1）
             'AllowLocalNetworkIps': False,  # 是否允许访问局域网内网IP段（如 192.168.0.0/16）
             'GroupRandomReplyChance': 0.02,  # 群随机回复概率（0~1）
+            # 会话压缩配置
+            'EnableConversationCompression': False,  # 是否启用会话压缩（超阈值历史压缩为摘要）
+            # 自动清理（后台循环）总开关：与 EnableConversationCompression 任一开启即启动循环
+            'EnableAutoCleanup': False,
+            'AutoCleanupInterval': 1800,  # 自动清理检查间隔（秒），默认 30 分钟；<=0 回退默认值
+            'AutoCleanupIdleSeconds': 28800,  # 会话闲置多久才允许自动压缩（秒），默认 8 小时
+            'CompressionThresholdBytes': 1048576,  # 压缩阈值（字节），默认 1MB（约 350k 中文字符，需按模型上下文调整）
+            'CompressionKeepRecentBytes': 524288,   # 保留最近的会话大小（字节），默认 512KB
         })
 
         # ---- RBAC：注册管理员权限点并自动授予 root（幂等） ----
@@ -105,9 +133,10 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             _log.info(f'已自动授予 root({root}) 插件全局管理员权限')
 
         # ---- 初始化持久化数据结构（逐字段补齐，兼容旧版本数据缺字段的情况） ----
+        # 注：group_conversations / user_conversations 自 v0.5.0 起由 SessionStore
+        # 按会话独立文件（group|user/<id>.json）管理，不再放在 data.json 中；
+        # 旧版集中存储的数据由会话拆分迁移（见下文）搬走
         self.data.setdefault('data', {
-            'group_conversations': {},
-            'user_conversations': {},
             'group_preset_names': {},
             'user_preset_names': {},
             # 群级随机插话开关：group_id -> bool（True = 该群不再随机插话）
@@ -115,8 +144,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             # AI 定时任务记录：task_name -> {interval, prompt, session_type, session_id, created_at}
             'scheduled_tasks': {}
         })
-        for key in ('group_conversations', 'user_conversations',
-                    'group_preset_names', 'user_preset_names', 'group_nolisten',
+        for key in ('group_preset_names', 'user_preset_names', 'group_nolisten',
                     'scheduled_tasks'):
             self.data['data'].setdefault(key, {})
 
@@ -129,6 +157,8 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         self._vision_unsupported = False
         # 会话级锁（内存态）：普通聊天与定时任务共用，保证同一会话的轮次串行执行
         self._session_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # 会话历史存储（分离文件：<workspace>/group|user/<id>.json）
+        self._sessions = SessionStore(self.workspace)
 
         workspace_path = str(self.workspace)
 
@@ -149,6 +179,18 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                 _log.debug('未检测到需要迁移的 4.x 运行时数据')
         except Exception as e:  # 迁移失败不应阻塞插件整体加载
             _log.error(f'迁移旧版运行时数据失败: {e}')
+
+        # ---- 会话数据拆分迁移（data.json 集中存储 -> group|user/<id>.json 分离文件，失败不阻塞加载） ----
+        # 必须排在 migrate_legacy_workspace 之后：4.x 数据先汇入 data.json，再由这里拆分
+        try:
+            if needs_conversation_split_migration(self):
+                _log.info('检测到 data.json 中仍存在集中存储的会话数据，正在拆分到分离文件...')
+                if migrate_conversations_to_split_files(self):
+                    _log.info('已将会话数据拆分到 group/、user/ 分离文件')
+            else:
+                _log.debug('未检测到需要拆分的会话数据，跳过拆分迁移')
+        except Exception as e:
+            _log.error(f'会话数据拆分迁移失败（旧数据仍保留在 data.json，下次启动重试）: {e}')
 
         # ---- 记忆格式升级迁移（legacy memory.json -> v0.1.4+，失败不阻塞加载） ----
         try:
@@ -203,6 +245,28 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         # ---- 恢复持久化的 AI 定时任务（失败不阻塞加载） ----
         self._restore_scheduled_tasks()
 
+        # 启动会话压缩后台循环（异步任务）。
+        # 压缩只能由该循环触发，因此 EnableConversationCompression 单独开启也启动；
+        # EnableAutoCleanup 是兼容用的总开关，两者任一开启即可。
+        # 任务引用必须保留（否则可能被 GC），并在 on_close() 中取消
+        self._cleanup_task: asyncio.Task | None = None
+        if self._cleanup_enabled():
+            self._cleanup_task = asyncio.create_task(self._auto_cleanup_loop())
+
+    async def on_close(self):
+        """插件卸载时取消后台清理循环，避免热重载后留下孤儿任务/重复压缩。"""
+        task = getattr(self, '_cleanup_task', None)
+        self._cleanup_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # 任务内部异常不应阻塞卸载
+            _log.warning(f'后台会话压缩任务退出异常: {e}')
+
     def _restore_scheduled_tasks(self) -> int:
         """把 data.json 中记录的定时任务重新注册到框架调度器。
 
@@ -244,25 +308,41 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             _log.info(f'已恢复 {restored}/{len(tasks)} 个 AI 定时任务')
         return restored
 
+    def _save_session(self, conversation_dict: str, session_id) -> None:
+        """持久化单个会话及其关联状态。
+
+        会话消息由 ``SessionStore`` 写入分离文件；同时 ``_save_data()`` 落盘
+        data.json 中与此会话相关的状态（``*_preset_names`` 等）。
+
+        :param conversation_dict: ``group_conversations`` 或 ``user_conversations``
+        :param session_id: 会话 ID
+        """
+        self._sessions.save(conversation_dict, str(session_id))
+        self._save_data()
+
     def _ensure_session(self, conversation_dict: str, session_id: str) -> list[dict]:
         """确保会话存在，返回该会话的消息列表（不存在时用默认预设初始化）。
 
+        会话消息存于分离文件（``<workspace>/group|user/<id>.json``，v0.5.0+）。
+
         :param conversation_dict: ``group_conversations`` 或 ``user_conversations``
         :param session_id: 会话 ID（统一转为 str）
-        :return: 会话消息列表（原地修改即可持久化）
+        :return: 会话消息列表（原地修改即可持久化，需随后调用 _save_session）
         """
-        conversations = self.data['data'][conversation_dict]
         session_key = str(session_id)
-        if session_key not in conversations:
-            preset = Preset()
-            if preset.load(str(self.workspace), DEFAULT_PRESET_NAME):
-                conversations[session_key] = preset.to_conversations()
-                self._set_preset_name(conversation_dict, session_key, DEFAULT_PRESET_NAME)
-            else:
-                # 预设缺失时不阻塞定时任务：退化为无 system 提示的会话
-                _log.warning('默认预设不存在，会话将以无 system 提示的方式初始化')
-                conversations[session_key] = []
-        return conversations[session_key]
+        existing = self._sessions.load(conversation_dict, session_key)
+        if existing is not None:
+            return existing
+        preset = Preset()
+        if preset.load(str(self.workspace), DEFAULT_PRESET_NAME):
+            messages = self._sessions.replace(
+                conversation_dict, session_key, preset.to_conversations())
+            self._set_preset_name(conversation_dict, session_key, DEFAULT_PRESET_NAME)
+        else:
+            # 预设缺失时不阻塞定时任务：退化为无 system 提示的会话
+            _log.warning('默认预设不存在，会话将以无 system 提示的方式初始化')
+            messages = self._sessions.replace(conversation_dict, session_key, [])
+        return messages
 
     async def _run_scheduled_task_turn(self, session_type: str, session_id: str,
                                        task_name: str, prompt: str,
@@ -288,7 +368,8 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         is_group = session_type == 'group'
         internal_message = {
             'role': 'user',
-            'content': build_scheduled_task_message(task_name, prompt),
+            'content': SCHEDULED_TASK_MESSAGE_TEMPLATE.format(
+                task_name=task_name, prompt=prompt),
         }
 
         if getattr(self, '_default_client', None) is None:
@@ -315,7 +396,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             await self._post_session_text(session_key, is_group, reply)
             working.append({'role': 'assistant', 'content': reply})
             history[:] = working
-            self._save_data()
+            self._save_session(conversation_dict, session_key)
 
         _log.info(
             f'[{"群组" if is_group else "用户"} {session_key}] '
@@ -434,8 +515,57 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         self._last_random_reply_ts[group_id] = now
         return True
 
+    def _recent_group_messages(self, conversation: list[dict],
+                               group_id: str) -> list[str]:
+        """取最近若干条群聊记录（不含已在会话历史中的消息）。
+
+        随机插话需要「大家在聊什么」才能判断是否值得接话。群会话历史里只保留
+        与机器人相关的轮次，其他人的日常发言在 ``temp_history_messages_kv``；
+        已经在会话历史里的内容不再重复附上，避免同一句话出现两遍。
+
+        :param conversation: 当前会话消息列表（末尾为本次用户消息）
+        :param group_id: 群号
+        :return: 最近的群聊消息文本（最多 ``RANDOM_REPLY_CONTEXT_MESSAGES`` 条，
+                 单条最多 ``RANDOM_REPLY_CONTEXT_LINE_CHARS`` 字符；含 ``NO_REPLY``
+                 的消息会被剔除，避免群友的文本影响沉默哨兵）
+        """
+        history = self.temp_history_messages_kv.get(str(group_id)) or []
+        known = {
+            message.get('content')
+            for message in conversation
+            if message.get('role') == 'user' and isinstance(message.get('content'), str)
+        }
+        candidates = [
+            text[:RANDOM_REPLY_CONTEXT_LINE_CHARS]
+            for text in history
+            # 群友自己打出 NO_REPLY 不应影响模型对哨兵的理解，也不能挤进提示里
+            if text not in known and 'NO_REPLY' not in text.upper()
+        ]
+        return candidates[-RANDOM_REPLY_CONTEXT_MESSAGES:]
+
+    def _build_random_reply_hint(self, conversation: list[dict], group_id: str,
+                                 use_tools: bool) -> str:
+        """组装随机插话的临时提示。
+
+        函数调用可用时只给提示，由模型自己调用 ``query_missing_message_context``
+        查看被忽略的群消息；不可用时才由插件附带固定长度的群聊记录兜底。
+
+        :param conversation: 当前会话消息列表（末尾为本次用户消息）
+        :param group_id: 群号
+        :param use_tools: 本次请求是否启用工具调用
+        :return: 注入到请求副本中的 user 消息内容
+        """
+        if use_tools:
+            return RANDOM_REPLY_SYSTEM_PROMPT
+        context_lines = self._recent_group_messages(conversation, group_id)
+        if not context_lines:
+            return RANDOM_REPLY_SYSTEM_PROMPT
+        return (f'{RANDOM_REPLY_SYSTEM_PROMPT}\n\n{RANDOM_REPLY_CONTEXT_HEADER}\n'
+                + '\n'.join(context_lines))
+
     def _build_request_messages(self, conversation: list[dict],
-                                random_reply: bool = False) -> list[dict]:
+                                insert_at: int | None = None,
+                                hint: str | None = None) -> list[dict]:
         """构造本次 API 请求的消息列表（副本，不写回会话历史）。
 
         随机插话时插入一条临时提示，固定使用 user 角色。不用 system 是因为
@@ -447,15 +577,23 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         消息、避免长历史下被稀释，也保留 system 之后的历史前缀缓存；同时不会
         把提示伪装成早先的独立用户轮次。
 
-        :param conversation: 会话消息列表（末尾为本次用户消息）
-        :param random_reply: 本次是否为随机插话
+        ``insert_at`` 必须由调用方按「本次用户消息在列表中的下标」给出，并在
+        工具循环中保持不变：工具轮会不断往末尾追加 assistant/tool 消息，若每轮
+        都用 ``len - 1`` 重新推断，提示会被插到 assistant(tool_calls) 与 tool
+        结果之间，破坏工具消息的相邻顺序（严格网关直接 400），语义上也会变成
+        「对工具结果的备注」而不是「对用户消息的插话判断」。
+
+        :param conversation: 会话消息列表
+        :param insert_at: 提示插入位置（本次用户消息的下标）；None 表示插在最后一条之前
+        :param hint: 提示内容；None 表示普通聊天，不插入任何提示
         :return: 供 API 使用的消息列表副本
         """
         messages = list(conversation)
-        if not random_reply or not messages:
+        if hint is None or not messages:
             return messages
-        messages.insert(len(messages) - 1,
-                        {'role': 'user', 'content': RANDOM_REPLY_SYSTEM_PROMPT})
+        index = len(messages) - 1 if insert_at is None else insert_at
+        index = max(0, min(index, len(messages)))
+        messages.insert(index, {'role': 'user', 'content': hint})
         return messages
 
     @staticmethod
@@ -633,7 +771,8 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
     async def _generate_reply(self, working: list[dict], *, conversation_dict: str,
                               session_id: str, is_group: bool, sender_id: str,
                               event: MessageEvent | None, random_reply: bool,
-                              use_tools: bool) -> str | None:
+                              use_tools: bool,
+                              random_hint: str | None = None) -> str | None:
         """执行模型请求与工具调用循环，返回清理后的最终正文。
 
         ``working`` 是本轮的工作消息列表：普通聊天直接传主会话列表（工具轮次原地
@@ -647,6 +786,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         :param event: 普通聊天的消息事件；定时任务为 None
         :param random_reply: 是否随机插话轮
         :param use_tools: 是否允许工具调用
+        :param random_hint: 随机插话的临时提示（含最近的群聊记录）；普通聊天为 None
         :return: 最终回复正文；模型未产生响应（MaxRetriesTimes 非正）时返回 None
         :raises exceptions.TooManyToolCallsException: 达到工具轮次上限且没有正文
         """
@@ -655,6 +795,11 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         response = None
         current_retries_times = 0
 
+        # 提示的插入位置在循环前固定为「本次用户消息」的下标：工具轮会往 working
+        # 末尾追加 assistant/tool 消息，若每轮按 len-1 重新推断，提示会被插进
+        # assistant(tool_calls) 与 tool 结果之间（见 _build_request_messages）
+        random_hint_at = len(working) - 1 if random_hint is not None and working else None
+
         # 如果启用了内置函数调用功能，则在模型想要调用工具时会循环执行工具调用并获取结果，
         # 直到模型不再想要调用工具或达到最大重试次数为止
         while current_retries_times < self.get_config('MaxRetriesTimes'):
@@ -662,7 +807,8 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             # 被严格网关（如 AMD Radeon）判为非法请求
             request_kwargs = {
                 'model': self.get_config('Model'),
-                'messages': self._build_request_messages(working, random_reply),
+                'messages': self._build_request_messages(
+                    working, insert_at=random_hint_at, hint=random_hint),
             }
             # 已确认模型不支持视觉：后续请求直接压平多模态内容，避免每轮都吃 400
             if self._vision_unsupported:
@@ -757,8 +903,11 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                     result = await tools.get_group_info(self.api.qq, **tool_args)
                 elif tool_name == 'query_missing_message_context':
                     if is_group:
+                        # 取回条数由模型指定，上限强制为缓存配置，防止一次拉回整段历史
                         result = await tools.query_missing_message_context(
-                            self.temp_history_messages_kv, session_id)
+                            self.temp_history_messages_kv, session_id,
+                            count=tool_args.get('count'),
+                            max_count=self.get_config('MaxConversationCacheStoreAmount'))
                     else:
                         result = tools._generate_tool_payload(
                             'error', '查询漏掉的消息上下文仅支持群聊')
@@ -898,13 +1047,17 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             conversation_dict = 'user_conversations'
             session_id = event.user_id
 
-        # 检查会话是否存在，不存在则用默认预设初始化
-        if session_id not in self.data['data'][conversation_dict]:
+        # 会话不存在或文件损坏（load 返回 None）时用默认预设（重新）初始化。
+        # 不能用 has() 判断：文件损坏时 has() 为 True 但 load() 仍返回 None，
+        # 后面 append 会抛 AttributeError 让该会话永久不可用
+        conversation = self._sessions.load(conversation_dict, session_id)
+        if conversation is None:
             default_preset = Preset()
             if not default_preset.load(str(self.workspace), DEFAULT_PRESET_NAME):
                 _log.error('默认预设不存在，无法初始化会话')
                 return
-            self.data['data'][conversation_dict][session_id] = default_preset.to_conversations()
+            conversation = self._sessions.replace(
+                conversation_dict, session_id, default_preset.to_conversations())
             self._set_preset_name(conversation_dict, session_id, DEFAULT_PRESET_NAME)
 
         # 识别用户消息中携带的图片（可配置关闭），作为视觉输入交给模型。
@@ -939,18 +1092,26 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                 user_content = IMAGE_PLACEHOLDER_TEXT
 
         # 添加用户消息到会话
-        self.data['data'][conversation_dict][session_id].append({'role': 'user', 'content': user_content})
+        conversation.append({'role': 'user', 'content': user_content})
         _log.info(
             f'[{"群组" if is_group else "用户"} {session_id}] 用户输入: '
             f'{user_message[:OMITTED_TEXT_LENGTH]}{"..." if len(user_message) > OMITTED_TEXT_LENGTH else ""}')
 
-        conversation = self.data['data'][conversation_dict][session_id]
-        # 随机插话可能最终不发言：工具轮写入工作副本，确认发言后才提交回主会话，
-        # 避免 NO_REPLY 时留下「user → assistant(tool_calls) → tool」的半截轮次
+        # 随机插话可能最终不发言：工具轮写入工作副本，发言成功或沉默（NO_REPLY）时
+        # 提交回主会话；只有异常（限流/工具上限/内部错误）才丢弃，避免失败轮次污染上下文
         working = list(conversation) if random_reply else conversation
+
+        # 随机插话轮同样保留工具能力；副作用类工具仍由各 AllowXxx 开关在分派链拦截
+        use_tools = self.get_config('EnableBuiltinFunctionCalling')
+
+        # 有工具时由模型主动调用 query_missing_message_context 查上下文；
+        # 只有工具不可用时才由插件附带固定长度的群聊记录兜底
+        random_hint = None
+        if random_reply:
+            random_hint = self._build_random_reply_hint(
+                conversation, str(session_id), use_tools)
+
         try:
-            # 随机插话轮同样保留工具能力；副作用类工具仍由各 AllowXxx 开关在分派链拦截
-            use_tools = self.get_config('EnableBuiltinFunctionCalling')
             reply_message = await self._generate_reply(
                 working,
                 conversation_dict=conversation_dict,
@@ -960,20 +1121,27 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                 event=event,
                 random_reply=random_reply,
                 use_tools=use_tools,
+                random_hint=random_hint,
             )
 
             if reply_message is None:
                 return
 
-            # 随机插话：模型回空正文或 NO_REPLY 哨兵时保持沉默（不发送、不写 assistant 历史）
+            # 随机插话：模型回空正文或 NO_REPLY 哨兵时不发送，但完整调用轮（工具轮 +
+            # 归一化的沉默决定）仍写回主会话，保持轮次完整，便于后续对话延续上下文
             if random_reply and self._is_silent_reply(reply_message):
                 _log.info(f'[群组 {session_id}] 随机插话未命中/模型选择不发言，已跳过发送')
-                self._save_data()
+                # 工具轮消息提交回主会话（user 消息此前已写入）
+                if working is not conversation:
+                    conversation.extend(working[len(conversation):])
+                # 哨兵变体（反引号/句点/连字符/大小写）与空正文统一归一为 NO_REPLY
+                conversation.append({'role': 'assistant', 'content': NO_REPLY_SENTINEL})
+                self._save_session(conversation_dict, session_id)
                 return
 
             if not reply_message:
                 _log.warning('模型返回了空回复，已跳过发送')
-                self._save_data()
+                self._save_session(conversation_dict, session_id)
                 return
 
             _log.info(
@@ -989,10 +1157,10 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                 conversation.extend(working[len(conversation):])
 
             # 添加AI回复到会话
-            self.data['data'][conversation_dict][session_id].append({'role': 'assistant', 'content': reply_message})
+            conversation.append({'role': 'assistant', 'content': reply_message})
 
             # 保存持久化文件
-            self._save_data()
+            self._save_session(conversation_dict, session_id)
         except exceptions.TooManyToolCallsException as e:
             # 随机插话未 @ 机器人，工具轮上限提示保持静默（只记日志）
             if not random_reply:
@@ -1004,7 +1172,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             _log.warning(
                 f'[{"群组" if is_group else "用户"} {session_id}] OpenAI 请求触发限流（429），'
                 f'本次{"随机插话" if random_reply else "对话"}已放弃')
-            self._save_data()
+            self._save_session(conversation_dict, session_id)
             if not random_reply:
                 await event.reply(text='请求过于频繁，请稍后再试', at_sender=False)
 
@@ -1034,16 +1202,15 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         await self._handle_message(event)
 
     async def _record_group_history(self, event: GroupMessageEvent):
-        """记录群消息到临时历史缓存（仅 EnableBuiltinFunctionCalling 开启时）
+        """记录群消息到临时历史缓存
 
-        缓存长度受 MaxConversationCacheStoreAmount 限制，超过则丢弃最早的消息。
+        缓存有两处用途：``query_missing_message_context`` 工具，以及随机插话时
+        附带的「群聊最近消息」上下文——后者不依赖函数调用开关，因此这里始终记录
+        （纯内存，长度受 ``MaxConversationCacheStoreAmount`` 限制）。
 
         :param event: 群消息事件
         :return: None
         """
-        if not self.get_config('EnableBuiltinFunctionCalling'):
-            return
-
         group_key = str(event.group_id)
         # 如果不存在群记录，则新建该key
         self.temp_history_messages_kv.setdefault(group_key, []).append(await self._build_user_message(event))
@@ -1056,6 +1223,307 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         while len(self.temp_history_messages_kv[group_key]) > limit:
             self.temp_history_messages_kv[group_key].pop(0)
             _log.debug(f'[群组 {group_key}] 超过最大缓存存储数量，已删除最早的消息记录')
+
+    # ------------------------------------------------------------------
+    # 会话压缩功能
+    # ------------------------------------------------------------------
+
+    def _cleanup_enabled(self) -> bool:
+        """后台压缩循环是否需要运行：压缩开关或自动清理开关任一开启即可。"""
+        return bool(self.get_config('EnableConversationCompression')
+                    or self.get_config('EnableAutoCleanup'))
+
+    def _cleanup_interval_seconds(self) -> float:
+        """检查间隔（秒）；配置为 0/负数/非法值时回退默认值，避免忙等扫描。"""
+        try:
+            interval = float(self.get_config('AutoCleanupInterval'))
+        except (TypeError, ValueError):
+            return AUTO_CLEANUP_DEFAULT_INTERVAL_SECONDS
+        return interval if interval > 0 else AUTO_CLEANUP_DEFAULT_INTERVAL_SECONDS
+
+    async def _auto_cleanup_loop(self):
+        """自动清理循环：按检查间隔扫描全部会话，仅压缩闲置达标的会话。"""
+        while True:
+            _log.debug('闲置会话扫描已启动')
+            if self._cleanup_enabled():
+                await self._auto_cleanup_all()
+            # 休眠间隔秒数（检查频率，本身不消耗 API 额度）
+            await asyncio.sleep(self._cleanup_interval_seconds())
+
+    async def _auto_cleanup_all(self):
+        """执行所有会话的自动清理（静默）。
+
+        只压缩**闲置时间超过 ``AutoCleanupIdleSeconds``** 的会话：以会话文件
+        mtime 作为「最后活跃时间」（对话轮次落库 / reset / set-preset 等任何
+        会话变动都会写入文件，读操作不更新）。这样活跃会话不会被反复压缩
+        消耗 token，也不会在对话进行到一半时被截断。
+
+        压缩前获取会话锁，避免与正在进行的对话轮次 / 定时轮次交错；拿锁后
+        再读 mtime，保证判断基于最新状态（在此期间刚落库的轮次会被视为活跃）。
+        """
+        success_count = 0
+        failure_count = 0
+        skipped_count = 0
+        idle_seconds = self.get_config('AutoCleanupIdleSeconds')
+
+        for conv_type in ['group_conversations', 'user_conversations']:
+            # 枚举分离文件中的全部会话（含当前未活跃、仅存在于磁盘的会话）
+            for session_id in self._sessions.ids(conv_type):
+                session_id = str(session_id)
+                # 先拿会话锁再判断闲置：防止与在途轮次竞态（在途轮次落库后
+                # mtime 更新，本轮自然跳过）
+                async with self._get_session_lock(conv_type, session_id):
+                    mtime = self._sessions.mtime(conv_type, session_id)
+                    if mtime is not None and (time.time() - mtime) < idle_seconds:
+                        skipped_count += 1
+                        _log.debug(
+                            f'会话 {conv_type}/{session_id} 闲置不足 {idle_seconds}s，跳过自动压缩')
+                        continue
+                    try:
+                        result = await self._compress_conversation(conv_type, session_id)
+                        if result == 'compressed':
+                            success_count += 1
+                        elif result == 'skipped':
+                            skipped_count += 1
+                        else:
+                            failure_count += 1
+                    except Exception as e:
+                        _log.error(f'压缩会话 {conv_type}/{session_id} 失败：{e}')
+                        failure_count += 1
+
+        if success_count > 0:
+            _log.info(f'自动清理完成：成功{success_count}个，跳过{skipped_count}个，失败{failure_count}个')
+
+    async def _compress_conversation(self, conversation_dict: str, session_id: str) -> str:
+        """压缩单个会话历史。
+
+        规则：
+
+        - 会话首条 ``system`` 提示词（预设人格）**永不参与压缩**，压缩后仍在最前；
+        - 保留**尾部** ``CompressionKeepRecentBytes`` 字节的最近消息（至少 1 条），
+          只压缩更早的历史；
+        - 摘要插在 ``system`` 之后（``_compress_with_summary``）或写入预设记忆
+          （``_compress_with_memory``）；
+        - 摘要生成 / 记忆写入失败一律返回 ``'failed'``，会话历史保持不变。
+
+        返回：'compressed' | 'skipped' | 'failed'
+        """
+        # 检查配置
+        if not self.get_config('EnableConversationCompression'):
+            return 'skipped'
+
+        conv = self._sessions.load(conversation_dict, session_id)
+        if conv is None:
+            return 'skipped'  # 无会话文件
+
+        # 计算当前会话大小（字节）
+        size_bytes = self._calculate_conversation_size(conv, method='bytes')
+        threshold = self.get_config('CompressionThresholdBytes', 1048576)
+        keep_recent_bytes = self.get_config('CompressionKeepRecentBytes', 524288)
+
+        if size_bytes <= threshold:
+            return 'skipped'  # 未达阈值
+
+        # system 提示词不参与压缩；正文至少要有 1 条可压缩 + 1 条保留
+        system_count = self._system_prefix_count(conv)
+        body = conv[system_count:]
+        if len(body) <= 2:
+            return 'skipped'
+
+        keep_count = self._keep_recent_count(body, keep_recent_bytes)
+        messages_to_compress = body[:-keep_count]
+        if not messages_to_compress:
+            return 'skipped'
+
+        # 执行压缩
+        try:
+            use_tools = self.get_config('EnableBuiltinFunctionCalling')
+            allow_memory = self.get_config('AllowAccessMemory')
+
+            if use_tools and allow_memory:
+                await self._compress_with_memory(
+                    conv, messages_to_compress, str(session_id), conversation_dict)
+            else:
+                await self._compress_with_summary(conv, messages_to_compress)
+
+            # 压缩直接改了内存中的消息列表，显式落盘分离文件
+            self._sessions.save(conversation_dict, session_id)
+            _log.info(
+                f'会话 {conversation_dict}/{session_id} 已压缩：'
+                f'压缩 {len(messages_to_compress)} 条，保留最近 {keep_count} 条')
+            return 'compressed'
+
+        except Exception as e:
+            _log.error(f'压缩 {conversation_dict}/{session_id} 失败（会话历史保持不变）：{e}')
+            return 'failed'
+
+    @staticmethod
+    def _system_prefix_count(conv: list[dict]) -> int:
+        """会话开头 system 提示词的条数（0 或 1），压缩时需原样保留。"""
+        return 1 if conv and conv[0].get('role') == 'system' else 0
+
+    @staticmethod
+    def _keep_recent_count(body: list[dict], keep_recent_bytes: int) -> int:
+        """从尾部往前统计需要原样保留的消息条数（至少 1 条）。"""
+        keep_bytes = keep_recent_bytes
+        keep_count = 0
+        for msg in reversed(body):
+            msg_size = len(json.dumps(msg, ensure_ascii=False).encode('utf-8'))
+            if keep_bytes >= msg_size:
+                keep_bytes -= msg_size
+                keep_count += 1
+            else:
+                break
+        return max(1, keep_count)
+
+    def _calculate_conversation_size(self, messages: list[dict], method: str = 'bytes') -> int:
+        """计算会话大小。"""
+        if method == 'bytes':
+            return len(json.dumps(messages, ensure_ascii=False).encode('utf-8'))
+        elif method == 'tokens':
+            # 粗略估算 token 数
+            total = 0
+            for msg in messages:
+                content = msg.get('content', '')
+                if isinstance(content, str):
+                    # 简单估算：中文字符×1.5，英文字符×1
+                    total += sum(1.5 if ord(c) > 127 else 1 for c in content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if part.get('type') == 'text':
+                            text = part.get('text', '')
+                            total += sum(1.5 if ord(c) > 127 else 1 for c in text)
+            return int(total)
+        return 0
+
+    @staticmethod
+    def _message_text_for_summary(content) -> str:
+        """把单条消息的 content 渲染成摘要用的纯文本。
+
+        图片仅保留 ``[图片]`` 占位，绝不把 base64 送进摘要请求。
+        """
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get('type') == 'text':
+                    text = str(part.get('text', '')).strip()
+                    if text:
+                        parts.append(text)
+                elif part.get('type') == 'image_url':
+                    parts.append(IMAGE_PLACEHOLDER_TEXT)
+            return ' '.join(parts).strip()
+        return ''
+
+    def _build_summary_input(self, messages: list[dict]) -> str:
+        """把待压缩消息拼成摘要请求的输入文本。
+
+        超出 ``SUMMARY_INPUT_BUDGET_CHARS`` 时按**等距抽样**取行（而不是只截取
+        开头），保证摘要覆盖整段被删除的历史；抽样比例会写警告日志，便于发现
+        阈值配置过大的情况。
+        """
+        lines: list[str] = []
+        for msg in messages:
+            text = self._message_text_for_summary(msg.get('content'))
+            if not text:
+                continue
+            if len(text) > SUMMARY_LINE_MAX_CHARS:
+                text = text[:SUMMARY_LINE_MAX_CHARS] + '…'
+            lines.append(f'{msg.get("role")}: {text}')
+        if not lines:
+            return ''
+
+        total_chars = sum(len(line) + 1 for line in lines)
+        if total_chars <= SUMMARY_INPUT_BUDGET_CHARS:
+            return '\n'.join(lines)
+
+        # 等距抽样：按平均行长估算可容纳的行数，再按比例挑行；
+        # 末行（最接近保留窗口的最新消息）必须保留，否则摘要会缺掉紧邻的上下文
+        avg_line_chars = total_chars / len(lines)
+        max_lines = max(8, int(SUMMARY_INPUT_BUDGET_CHARS / max(avg_line_chars, 1)))
+        step = len(lines) / max_lines
+        picked = [lines[int(i * step)] for i in range(max_lines - 1)]
+        picked.append(lines[-1])
+        sampled = '\n'.join(picked)[:SUMMARY_INPUT_BUDGET_CHARS]
+        _log.warning(
+            f'待压缩历史共 {total_chars} 字符，超出摘要预算 {SUMMARY_INPUT_BUDGET_CHARS}，'
+            f'已等距抽样 {len(picked)}/{len(lines)} 条消息；'
+            '如需更完整的摘要请调低 CompressionThresholdBytes')
+        return sampled
+
+    async def _generate_compression_summary(self, to_compress: list[dict]) -> str:
+        """调用模型把待压缩历史汇总成摘要（失败向上抛出，由外层统一处理）。"""
+        history_text = self._build_summary_input(to_compress)
+        response = await asyncio.to_thread(
+            lambda: self._default_client.chat.completions.create(
+                model=self.get_config('Model'),
+                messages=[
+                    {'role': 'system', 'content': CONVERSATION_COMPRESSION_SYSTEM_PROMPT},
+                    {'role': 'user', 'content': CONVERSATION_COMPRESSION_USER_TEMPLATE.format(
+                        history=history_text)},
+                ],
+                temperature=0.3,
+            )
+        )
+        summary = (response.choices[0].message.content or '').strip()
+        if not summary:
+            raise RuntimeError('模型返回了空摘要')
+        return summary
+
+    @staticmethod
+    def _tool_payload_succeeded(raw) -> bool:
+        """判断 tools.* 返回的 JSON payload 是否成功。"""
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError:
+            return False
+        return isinstance(payload, dict) and payload.get('status') == 'success'
+
+    async def _compress_with_memory(self, conv: list[dict], to_compress: list[dict],
+                                    session_id: str, conv_type: str) -> None:
+        """使用记忆工具进行压缩：摘要写入预设 memory.json 后删除被压缩的历史。"""
+        summary = await self._generate_compression_summary(to_compress)
+
+        # 存储到记忆
+        preset_name = self._get_preset_name(conv_type, session_id)
+        from_user = 0
+        from_group = -1
+
+        if conv_type == 'group_conversations':
+            from_group = int(session_id) if session_id.isdigit() else -1
+        else:
+            from_user = int(session_id) if session_id.isdigit() else 0
+
+        raw = tools.access_memory(
+            os.path.join(str(self.workspace), 'presets', preset_name),
+            action='add',
+            content=f'[会话压缩摘要]\n{summary}',
+            from_user=from_user,
+            from_group=from_group,
+        )
+        # 写入记忆失败必须中止：否则摘要丢了、历史也被删了
+        if not self._tool_payload_succeeded(raw):
+            raise RuntimeError(f'写入预设记忆失败：{raw}')
+
+        # 移除被压缩的原始消息（保留 system 与最近的尾部消息）
+        insert_at = self._system_prefix_count(conv)
+        del conv[insert_at:insert_at + len(to_compress)]
+
+    async def _compress_with_summary(self, conv: list[dict], to_compress: list[dict]) -> None:
+        """使用摘要进行压缩：摘要作为独立消息插回 system 之后。"""
+        summary = await self._generate_compression_summary(to_compress)
+
+        # 从 system 之后删掉被压缩的消息，再把摘要插回去
+        insert_at = self._system_prefix_count(conv)
+        del conv[insert_at:insert_at + len(to_compress)]
+        conv.insert(insert_at, {
+            'role': 'user',
+            'content': f'[历史摘要] {summary}'
+        })
+
 
     @registrar.qq.on_private_message()
     async def on_private_message(self, event: PrivateMessageEvent):

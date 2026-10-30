@@ -55,7 +55,7 @@ async def test_reasoning_stripped_from_reply_and_history(tmp_path, monkeypatch):
         texts = [extract_text(call) for call in h.assert_api("send_private_msg").calls]
         assert all("先推理一下" not in t for t in texts)
 
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         assert session[-1]["content"] == "你好，我是AI"
 
 
@@ -73,7 +73,7 @@ async def test_orphan_reasoning_close_stripped(tmp_path, monkeypatch):
         texts = [extract_text(call) for call in h.assert_api("send_private_msg").calls]
         assert all("我先在心里推理一遍" not in t for t in texts)
 
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         assert session[-1]["content"] == "你好，我是AI"
 
 
@@ -88,7 +88,7 @@ async def test_reasoning_only_reply_skipped(tmp_path, monkeypatch):
         await h.settle()
 
         h.assert_api("send_private_msg").not_called()
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         assert [m["role"] for m in session] == ["user"]
         assert all("这里没有正文" not in json.dumps(m, ensure_ascii=False) for m in session)
 
@@ -117,7 +117,7 @@ async def test_tool_intermediate_reasoning_stripped(tmp_path, monkeypatch):
         h.assert_api("send_private_msg").times(1)
         h.assert_api("send_private_msg").with_text("现在是 UTC 时间")
 
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         assert all("<think" not in json.dumps(m, ensure_ascii=False) for m in session)
         assistant_entries = [m for m in session if m["role"] == "assistant"]
         assert assistant_entries[0]["content"] is None  # tool_calls 轮已剥离为无正文

@@ -524,7 +524,7 @@ async def test_plugin_config_gates_loopback_by_default(tmp_path, monkeypatch):
         await h.settle()
 
         h.assert_api("send_private_msg").with_text("目标地址被拒绝了")
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         tool_entry = next(m for m in session if m["role"] == "tool")
         assert "被禁止访问" in tool_entry["content"]
 
@@ -561,7 +561,7 @@ async def test_plugin_config_allow_loopback_opens_loopback(tmp_path, monkeypatch
         await h.settle()
 
         h.assert_api("send_private_msg").with_text("本地服务返回 local-ok")
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         tool_entry = next(m for m in session if m["role"] == "tool")
         assert '"status": "success"' in tool_entry["content"]
 
@@ -598,6 +598,6 @@ async def test_plugin_ignores_model_supplied_policy_args(tmp_path, monkeypatch):
 
         # 模型注入的参数不能生效：请求仍被拦截，且流程不因重复关键字报错
         h.assert_api("send_private_msg").with_text("仍然被拒绝")
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         tool_entry = next(m for m in session if m["role"] == "tool")
         assert "被禁止访问" in tool_entry["content"]

@@ -218,10 +218,10 @@ class OpenAICommandHandlerMixin:
 
                 if target is None:
                     if isinstance(event, GroupMessageEvent):
-                        self.data['data']['group_conversations'][event.group_id] = conversations.copy()
+                        self._sessions.replace('group_conversations', event.group_id, conversations.copy())
                         self._set_preset_name('group_conversations', event.group_id, preset_name)
                     else:
-                        self.data['data']['user_conversations'][event.user_id] = conversations.copy()
+                        self._sessions.replace('user_conversations', event.user_id, conversations.copy())
                         self._set_preset_name('user_conversations', event.user_id, preset_name)
 
                     await event.reply(text=f'已设置当前预设为: {preset_name}({display_name})', at_sender=False)
@@ -229,14 +229,14 @@ class OpenAICommandHandlerMixin:
                     try:
                         if target.startswith('group:'):
                             group_id = int(target.split(':')[1])
-                            self.data['data']['group_conversations'][group_id] = conversations.copy()
+                            self._sessions.replace('group_conversations', group_id, conversations.copy())
                             self._set_preset_name('group_conversations', group_id, preset_name)
                             await event.reply(
                                 text=f'已为群组 {group_id} 设置预设: {preset_name}({display_name})',
                                 at_sender=False)
                         elif target.startswith('user:'):
                             user_id = int(target.split(':')[1])
-                            self.data['data']['user_conversations'][user_id] = conversations.copy()
+                            self._sessions.replace('user_conversations', user_id, conversations.copy())
                             self._set_preset_name('user_conversations', user_id, preset_name)
                             await event.reply(
                                 text=f'已为用户 {user_id} 设置预设: {preset_name}({display_name})',
@@ -264,7 +264,7 @@ class OpenAICommandHandlerMixin:
                     if not preset.load(str(self.workspace), preset_name):
                         await event.reply(text=f'预设 {preset_name} 不存在，无法重置会话', at_sender=False)
                         return
-                    self.data['data'][conversation_dict][session_id] = preset.to_conversations()
+                    self._sessions.replace(conversation_dict, session_id, preset.to_conversations())
                     await event.reply(text='已重置当前会话', at_sender=False)
                 else:
                     try:
@@ -275,7 +275,7 @@ class OpenAICommandHandlerMixin:
                             if not preset.load(str(self.workspace), preset_name):
                                 await event.reply(text=f'预设 {preset_name} 不存在，无法重置会话', at_sender=False)
                                 return
-                            self.data['data']['group_conversations'][group_id] = preset.to_conversations()
+                            self._sessions.replace('group_conversations', group_id, preset.to_conversations())
                             await event.reply(text=f'已重置群组 {group_id} 的会话', at_sender=False)
                         elif target.startswith('user:'):
                             user_id = int(target.split(':')[1])
@@ -284,7 +284,7 @@ class OpenAICommandHandlerMixin:
                             if not preset.load(str(self.workspace), preset_name):
                                 await event.reply(text=f'预设 {preset_name} 不存在，无法重置会话', at_sender=False)
                                 return
-                            self.data['data']['user_conversations'][user_id] = preset.to_conversations()
+                            self._sessions.replace('user_conversations', user_id, preset.to_conversations())
                             await event.reply(text=f'已重置用户 {user_id} 的会话', at_sender=False)
                         else:
                             await event.reply(text='目标格式错误，请使用 group:<id> 或 user:<id>', at_sender=False)
@@ -299,10 +299,10 @@ class OpenAICommandHandlerMixin:
 
                 if target is None or target.lower() == 'all':
                     updated = 0
-                    for group_id in self.data['data']['group_conversations']:
+                    for group_id in self._sessions.ids('group_conversations'):
                         if self._refresh_system_prompt_in_session('group_conversations', group_id):
                             updated += 1
-                    for user_id in self.data['data']['user_conversations']:
+                    for user_id in self._sessions.ids('user_conversations'):
                         if self._refresh_system_prompt_in_session('user_conversations', user_id):
                             updated += 1
                     _log.info(f'已批量更新提示词，成功处理 {updated} 个会话')
@@ -311,7 +311,7 @@ class OpenAICommandHandlerMixin:
                     try:
                         if target.startswith('group:'):
                             group_id = int(target.split(':')[1])
-                            if group_id not in self.data['data']['group_conversations']:
+                            if not self._sessions.has('group_conversations', group_id):
                                 _log.warning(f'群组 {group_id} 暂无会话记录，无法更新提示词')
                                 await event.reply(text=f'群组 {group_id} 暂无会话记录', at_sender=False)
                                 return
@@ -325,7 +325,7 @@ class OpenAICommandHandlerMixin:
                                     at_sender=False)
                         elif target.startswith('user:'):
                             user_id = int(target.split(':')[1])
-                            if user_id not in self.data['data']['user_conversations']:
+                            if not self._sessions.has('user_conversations', user_id):
                                 _log.warning(f'用户 {user_id} 暂无会话记录，无法更新提示词')
                                 await event.reply(text=f'用户 {user_id} 暂无会话记录', at_sender=False)
                                 return
@@ -495,11 +495,11 @@ class OpenAICommandHandlerMixin:
                 conversations = preset.to_conversations()
                 display_name = preset.get_display_name()
                 session_id = event.group_id if isinstance(event, GroupMessageEvent) else event.user_id
-                self.data['data'][conversation_dict][session_id] = conversations.copy()
+                self._sessions.replace(conversation_dict, session_id, conversations.copy())
                 self._set_preset_name(conversation_dict, session_id, preset_name)
                 await event.reply(text=f'已设置当前预设为: {preset_name}({display_name})', at_sender=False)
 
-                # 设置预设后持久化数据
+                # 设置预设后持久化数据（preset_names 存 data.json，会话文件已由 replace 落盘）
                 self._save_data()
 
             elif command[1] == 'reset':
@@ -510,9 +510,9 @@ class OpenAICommandHandlerMixin:
                     await event.reply(text=f'预设 {preset_name} 不存在，无法重置会话', at_sender=False)
                     return
 
-                self.data['data'][conversation_dict][session_id] = preset.to_conversations()
+                self._sessions.replace(conversation_dict, session_id, preset.to_conversations())
                 await event.reply(text='已重置当前会话', at_sender=False)
-                # 重置会话后持久化数据
+                # 重置会话后持久化数据（会话文件已由 replace 落盘，此处保存 data.json）
                 self._save_data()
                 return
 
@@ -646,21 +646,30 @@ class OpenAICommandHandlerMixin:
         """获取会话当前使用的预设名称
 
         :param conversation_dict: 'group_conversations' 或 'user_conversations'
-        :param session_id: 群组ID或用户ID
+        :param session_id: 群组ID或用户ID（统一按 str 查表，与 SessionStore / data.json 一致）
         :return: 预设名称，若无记录则返回默认预设
         """
         key = 'group_preset_names' if conversation_dict == 'group_conversations' else 'user_preset_names'
-        return self.data['data'][key].get(session_id, DEFAULT_PRESET_NAME)
+        names = self.data['data'][key]
+        session_key = str(session_id)
+        # 统一按 str 查表；同时兼容历史遗留的 int 键（旧版 /chat-admin set-preset 曾用 int 写入）
+        preset_name = names.get(session_key) or names.get(session_id)
+        return preset_name or DEFAULT_PRESET_NAME
 
     def _set_preset_name(self, conversation_dict: str, session_id, preset_name: str) -> None:
         """记录会话使用的预设名称
 
         :param conversation_dict: 'group_conversations' 或 'user_conversations'
-        :param session_id: 群组ID或用户ID
+        :param session_id: 群组ID或用户ID（统一存为 str 键，避免 int/str 两份记录）
         :param preset_name: 预设名称
         """
         key = 'group_preset_names' if conversation_dict == 'group_conversations' else 'user_preset_names'
-        self.data['data'][key][session_id] = preset_name
+        names = self.data['data'][key]
+        session_key = str(session_id)
+        # 清掉可能存在的 int 旧键，避免同一会话出现两份预设记录
+        if not isinstance(session_id, str):
+            names.pop(session_id, None)
+        names[session_key] = preset_name
 
     def _refresh_system_prompt_in_session(self, conversation_dict: str, session_id) -> bool:
         """从磁盘预设更新会话中的 system 提示词，保留 user / assistant 等其余消息
@@ -669,7 +678,7 @@ class OpenAICommandHandlerMixin:
         :param session_id: 群组ID或用户ID
         :return: 是否成功更新
         """
-        conversations = self.data['data'][conversation_dict].get(session_id)
+        conversations = self._sessions.load(conversation_dict, session_id)
         if conversations is None:
             return False
         preset_name = self._get_preset_name(conversation_dict, session_id)
@@ -686,5 +695,7 @@ class OpenAICommandHandlerMixin:
             conversations[0] = new_system
         else:
             conversations.insert(0, new_system)
+        # 消息列表已原地修改，显式落盘分离文件
+        self._sessions.save(conversation_dict, session_id)
         _log.info(f'已更新 {conversation_dict} 中 {session_id} 的提示词')
         return True

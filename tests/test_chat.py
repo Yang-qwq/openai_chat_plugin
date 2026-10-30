@@ -59,7 +59,7 @@ async def test_private_chat_reply_and_history(tmp_path, monkeypatch):
         # （fake 客户端持有会话列表引用，回复追加后末项会变为 assistant，故用包含断言）
         sent_messages = client.chat.completions.calls[0]["messages"]
         assert {"role": "user", "content": "你好"} in sent_messages
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         roles = [m["role"] for m in session]
         assert roles == ["user", "assistant"]
 
@@ -76,7 +76,7 @@ async def test_private_chat_rate_limit_replies_friendly(tmp_path, monkeypatch):
 
         h.assert_api("send_private_msg").called().with_text("请求过于频繁，请稍后再试")
         # 失败的一轮不写入 assistant 历史
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         assert [m["role"] for m in session] == ["user"]
 
 
@@ -91,7 +91,7 @@ async def test_reply_strips_leading_and_trailing_whitespace(tmp_path, monkeypatc
         await h.settle()
 
         h.assert_api("send_private_msg").with_text("你好！")
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         assert session[-1] == {"role": "assistant", "content": "你好！"}
 
 
@@ -116,7 +116,7 @@ async def test_tool_call_loop_with_system_time(tmp_path, monkeypatch):
 
         h.assert_api("send_private_msg").with_text("现在是 UTC 时间")
         # 会话历史应包含 assistant(tool_calls) 与 tool 结果消息
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         assistant_entries = [m for m in session if m["role"] == "assistant" and "tool_calls" in m]
         tool_entries = [m for m in session if m["role"] == "tool"]
         assert len(assistant_entries) == 1
@@ -197,7 +197,7 @@ async def test_memory_tool_blocked_when_disabled(tmp_path, monkeypatch):
         await h.settle()
 
         h.assert_api("send_private_msg").with_text("好的")
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         tool_entry = next(m for m in session if m["role"] == "tool")
         assert "AllowAccessMemory" in tool_entry["content"]
 
@@ -223,7 +223,7 @@ async def test_web_tool_blocked_when_disabled(tmp_path, monkeypatch):
         await h.settle()
 
         h.assert_api("send_private_msg").with_text("好的")
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         tool_entry = next(m for m in session if m["role"] == "tool")
         assert "AllowWebRequests" in tool_entry["content"]
         # 未启用时不应发起任何真实请求（fake 客户端只会收到两轮对话）
@@ -283,7 +283,7 @@ async def test_web_image_attached_as_vision_message(tmp_path, monkeypatch):
         assert image_parts[0]["image_url"]["url"].startswith("data:image/png;base64,")
 
         # 工具历史只保留摘要，不能把 base64 写进上下文
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         tool_entry = next(m for m in session if m["role"] == "tool")
         assert "data:image" not in tool_entry["content"]
         assert json.loads(tool_entry["content"])["data"]["type"] == "image"

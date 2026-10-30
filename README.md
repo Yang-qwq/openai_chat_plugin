@@ -1,8 +1,8 @@
 # OpenAI Chat Plugin
 
-[![Version](https://img.shields.io/badge/version-0.4.3-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
+[![Version](https://img.shields.io/badge/version-0.5.1-blue.svg)](https://github.com/Yang-qwq/openai_chat_plugin)
 [![License](https://img.shields.io/badge/license-AGPL-red.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 
 一个基于新版OpenAI SDK的智能聊天插件，为NcatBot 5提供强大的AI对话功能。
 
@@ -21,6 +21,7 @@
 - 🧠 **思维链隔离**：自动剥离 `<think>` / `<reasoning>` / DeepSeek-R1 全角分隔符等思维链，只写日志不外泄
 - 🎲 **群聊随机插话**：按概率参与未 @机器人 的群聊，由模型自行决定是否发言（可群级关闭）
 - ⏰ **AI 定时任务**：AI 可创建周期任务，到点用当前预设生成内容并投递回本会话
+- 🗜️ **会话压缩**：超长会话历史自动压缩为摘要（写入记忆或插回会话），后台循环只处理长期闲置会话
 
 ## 📋 系统要求
 
@@ -74,6 +75,10 @@ plugin:
 > 旧目录会被重命名为 `data/openai_chat_plugin.migrated.bak` 作为备份。
 >
 > 从早期 v0.2.x 升级：若工作区仍存在拼写错误的 `presents/` 目录，首次启动会自动重命名为 `presets/`。
+>
+> 从 v0.4.x 升级：首次启动会把集中存储在 `data.json` 里的会话历史一次性拆分到
+> `group/<群号>.json` / `user/<QQ>.json` 分离文件（迁移前自动备份 `data.json.bak.<时间戳>`；
+> 若有会话写出失败，旧数据原样保留，下次启动自动重试）。
 
 想要编辑预设配置，可以直接编辑对应的`prompt.md`文件：
 
@@ -190,8 +195,14 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 | `AllowScheduledTasks`             | boolean | False                     | 是否允许 AI 创建/管理定时任务（内置函数调用功能需要开启）                               |
 | `EnableScheduledTaskExecution`    | boolean | True                      | 定时任务执行总开关（kill switch）；关闭后不注册/不执行，记录保留                        |
 | `MaxRetriesTimes`                 | integer | 15                        | 工具调用轮次的最大重试次数                                                              |
-| `MaxConversationCacheStoreAmount` | integer | 1000                      | 最大对话缓存存储数量                                                                    |
+| `MaxConversationCacheStoreAmount` | integer | 1000                      | 最大对话缓存存储数量；也是 `query_missing_message_context` 取回条数的上限              |
 | `EnableGroupOwnerAutoAuth`        | boolean | True                      | 群主/群管理自动放行本群管理员命令                                                       |
+| `EnableConversationCompression`   | boolean | False                     | 是否启用会话压缩（超过阈值的历史压缩为摘要）；单独开启即启动后台循环                    |
+| `EnableAutoCleanup`               | boolean | False                     | 后台压缩循环总开关（与上一项任一开启都会启动循环）                                      |
+| `AutoCleanupInterval`             | integer | 1800                      | 自动清理**检查**间隔（秒，默认 30 分钟）；只扫描会话文件，本身不消耗 API 额度；`<=0` 回退 1800 |
+| `AutoCleanupIdleSeconds`          | integer | 28800                     | 会话**闲置多久**才允许自动压缩（秒，默认 8 小时）；活跃会话不会被压缩                   |
+| `CompressionThresholdBytes`       | integer | 1048576                   | 触发压缩的会话字节数阈值（默认 1MB，需按模型上下文调整）                                |
+| `CompressionKeepRecentBytes`      | integer | 524288                    | 压缩时保留的**最近**会话字节数（默认 512KB，尾部窗口）                                  |
 | `IsConfigured`                    | boolean | False                     | 插件是否已配置                                                                          |
 
 ## 🎯 高级功能
@@ -279,9 +290,17 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 群消息会按 `GroupRandomReplyChance` 概率参与对话：
 
 - 命中后仍由模型决定是否发言：模型输出 `NO_REPLY` 或空正文时插件保持沉默
+- 临时提示不描述性格（人设、语气仍由预设 `prompt.md` 决定），只决定「是否发言」：
+  开启函数调用时鼓励模型调用 `query_missing_message_context` 查看错过的群消息
+  （该工具支持 `count` 参数，默认 50 条，上限为 `MaxConversationCacheStoreAmount`；
+  取回成功后清空该群临时缓存，视为已消费）；
+  未开启函数调用时才由插件附带最近最多 20 条群聊记录（只存在于本次请求副本，
+  不写入会话历史）作为兜底。提示词包含正向的发言条件，并在拿不准时倾向简短接一句，
+  而不是默认沉默
 - 随机插话轮同样保留工具调用能力（与普通聊天一致，受 `EnableBuiltinFunctionCalling`
-  与各 `AllowXxx` 开关约束）；工具轮只在最终发言成功后写入会话历史，回 `NO_REPLY`
-  时整轮回滚，不会污染上下文
+  与各 `AllowXxx` 开关约束）；工具轮在发言成功或沉默（`NO_REPLY`）时都写入会话历史——
+  沉默时工具调用结果与归一化的 `NO_REPLY` 决定一并保留（哨兵变体与空正文统一记为
+  `NO_REPLY`），仅异常（限流/工具上限/内部错误）时整轮回滚，不会污染上下文
 - 工具轮产生的中间正文不会投递到群里，避免「先说话再沉默」；工具轮上限与内部错误
   同样静默处理
 - 同一群有 30 秒冷却，避免连续刷屏；机器人自己的消息不参与
@@ -303,7 +322,7 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 | `delete` | 删除任务，需要 `task_name`；只能删除**当前会话**创建的任务         |
 | `list`   | 查看所有会话的任务与下次执行时间                                   |
 
-- 到点后插件用「主会话历史 + 一条内部消息 `[定时任务 <name>] <prompt>`」执行一次完整对话轮次
+- 到点后插件用「主会话历史 + 一条内部消息 `![定时任务 <name>] <prompt>`」执行一次完整对话轮次
   （**支持工具调用**，与普通聊天共用 `EnableBuiltinFunctionCalling` 与各 `AllowXxx` 开关），
   再把生成的内容投递回创建者会话（模型无法指定其他群/私聊，避免越权骚扰）
 - 投递成功后，整轮消息（内部消息、工具调用轮次、最终 assistant 回复）会一起写入主会话历史；
@@ -336,7 +355,11 @@ your_editor data/OpenAIChatPlugin/presets/default/prompt.md
 
 ```
 data/OpenAIChatPlugin/
-| -- data.json            <-- 会话数据（自动持久化）
+| -- data.json            <-- 会话状态（预设名、群开关、定时任务记录）
+| -- group/               <-- 群会话历史（v0.5.0 起按会话独立文件）
+|   | -- <群号>.json
+| -- user/                <-- 私聊会话历史
+|   | -- <QQ号>.json
 | -- presets/
     | -- default/
         | -- config.yaml
@@ -352,9 +375,28 @@ data/OpenAIChatPlugin/
 
 ### 会话持久化
 
-- 群聊会话独立存储
-- 私聊会话独立存储
-- 支持会话重置和配置切换
+- 群聊 / 私聊会话各自独立存储（`group/<群号>.json` / `user/<QQ号>.json`，纯消息数组）
+- 支持会话重置和配置切换；预设名等小状态仍在 `data.json`
+- 会话文件原子写入（临时文件 + 替换），不会因为进程中断留下半截 JSON
+
+### 会话压缩
+
+开启 `EnableConversationCompression` 后，超过 `CompressionThresholdBytes` 的会话历史会被
+压缩为摘要，避免长对话逐渐撑爆模型上下文：
+
+- 后台压缩循环由压缩开关或 `EnableAutoCleanup` 任一开启即启动（无需两个都开），
+  默认每 `AutoCleanupInterval`（30 分钟）检查一次，**只处理闲置超过
+  `AutoCleanupIdleSeconds`（默认 8 小时）的会话**，检查本身不消耗 API 额度
+- 会话首条 system 提示词（预设人格）不会被压缩；保留**最近** `CompressionKeepRecentBytes`
+  字节的消息，只把更早的历史汇总成摘要
+- 同时开启 `EnableBuiltinFunctionCalling` + `AllowAccessMemory` 时，摘要写入当前预设的
+  记忆文件（`memory.json`）；否则摘要作为一条 `[历史摘要] …` 消息插在 system 提示词**之后**
+- 摘要只包含文本内容（图片以 `[图片]` 占位），base64 不会进入摘要；被压缩历史很长时
+  摘要输入会等距抽样并写警告日志
+- 摘要生成失败、或记忆写入失败，都不会修改会话历史（原样保留，下次重试）
+- 默认 1 MB 阈值按 200k+ 上下文模型估算，**128k 上下文模型建议调低**
+  （例如 `CompressionThresholdBytes: 300000`、`CompressionKeepRecentBytes: 100000`），
+  否则会话会先撞到模型上下文上限
 
 ## 🐛 故障排除
 
@@ -377,6 +419,14 @@ data/OpenAIChatPlugin/
     - 确认使用者为机器人 owner 或已通过 `/chatrbac grant` 授权
     - 群内使用可依赖群主/群管理身份（检查 `EnableGroupOwnerAutoAuth` 是否开启）
 
+5. **开启压缩后会话没变短**
+    - 压缩只由后台循环触发：确认 `EnableConversationCompression`（或 `EnableAutoCleanup`）已开启，
+      且插件重启过（循环在加载时启动）
+    - 只压缩**闲置超过 `AutoCleanupIdleSeconds`（默认 8 小时）**且超过
+      `CompressionThresholdBytes`（默认 1 MB）的会话；活跃会话不会被动
+    - 日志里出现「已等距抽样」说明单次摘要预算不够覆盖整段历史，可调低阈值
+    - 压缩后仍报上下文超限：阈值相对模型上下文过大，参考上面的调低建议
+
 ### 日志查看
 
 插件会输出详细的调试日志，可以通过日志查看运行状态：
@@ -388,11 +438,49 @@ tail -f logs/ncatbot.log | grep openai_chat_plugin
 
 ## 📝 更新日志
 
+### v0.5.1
+
+- 🔧 **修复随机插话提示插错位置**：工具轮第二次请求曾把临时提示插到
+  `assistant(tool_calls)` 与 `tool` 结果之间，破坏工具消息的相邻顺序（严格网关会 400），
+  也让提示看起来像「对工具结果的备注」；现在按本次用户消息的固定下标插入。
+- 🎲 **随机插话不再几乎必然沉默**：提示词补回「什么时候适合发言」的正向条件与
+  「拿不准时倾向接一句」的默认，移除「调用过工具就必须 NO_REPLY」的表述；同时明确
+  「不要为了决定是否插话而反复查记忆」，避免模型在随机轮反复调用 `access_memory`
+  后判定无话可说。提示词不描述性格，人设仍完全由预设 `prompt.md` 决定
+- 💬 **随机插话的上下文获取**：开启函数调用时，提示词鼓励模型主动调用
+  `query_missing_message_context` 查看被忽略的群消息；该工具新增 `count` 参数
+  （默认 50 条），并在分派链按 `MaxConversationCacheStoreAmount` 截断，避免一次拉回
+  整段缓存撑爆上下文；**取回成功后清空该群的全部临时消息**（视为已消费）。函数调用
+  不可用时才由插件附带最近最多 20 条群聊记录
+  （`temp_history_messages_kv`，不写入会话历史、不重复会话里已有的内容、单条截断、
+  剔除含 `NO_REPLY` 的发言）。`_record_group_history` 改为始终记录（纯内存，仍受
+  `MaxConversationCacheStoreAmount` 限制）
+
+### v0.5.0
+
+- 🗂️ **会话分离文件存储**：会话历史不再集中塞在 `data.json`，改为按会话独立文件
+  `group/<群号>.json` / `user/<QQ号>.json`（纯消息数组，原子写入）。从 v0.4.x 升级时
+  首次启动自动迁移：迁移前备份 `data.json.bak.<时间戳>`，全部成功才删除旧键，部分失败
+  保留旧数据下次重试；已存在的分离文件不会被旧数据覆盖
+- 🗜️ **会话压缩**：新增 `EnableConversationCompression` / `CompressionThresholdBytes` /
+  `CompressionKeepRecentBytes`，超长会话压缩为摘要，避免长对话撑爆模型上下文
+  - 保留**最近** `CompressionKeepRecentBytes` 字节的消息，只压缩更早的历史；
+    预设 system 提示词永不参与压缩
+  - 摘要写入预设 `memory.json`（开启函数调用 + 记忆时），否则作为 `[历史摘要] …`
+    消息插在 system 提示词之后
+  - 摘要生成或记忆写入失败时不修改会话历史；图片以 `[图片]` 占位，base64 绝不进入摘要
+  - 新增 `EnableAutoCleanup` / `AutoCleanupInterval` 后台循环：默认每 30 分钟检查一次，
+    只压缩**闲置超过 8 小时**的会话（任一开关开启即启动，卸载时自动取消）
+- 🛠️ **健壮性**：会话文件损坏时自动按默认预设重建，不再让该会话永久报错；
+  `group_preset_names` / `user_preset_names` 键统一为字符串，修复
+  `/chat-admin set-preset group:<id>` 后 `update-prompt all` 误用默认预设覆盖提示词
+- 📦 **目录结构调整**：新增 `session_store.py`（分离文件存储层）、`update.py` 拆分迁移；
+  测试新增 `test_session_split.py`、`test_compression.py`
+
 ### v0.4.4
 
 - 🖼️ **纯文本模型兼容**：历史中的 `image_url` 不再让只支持纯文本的供应商（如智谱 GLM
-  400 code 1210）永久失败——首次 400 自动以纯文本重试并记住模型不支持视觉，后续请求
-  提前压平多模态内容、跳过图片下载，会话历史保持不变
+  400 code 1210）永久失败
 
 ### v0.4.3
 

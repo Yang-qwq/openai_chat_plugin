@@ -20,15 +20,24 @@
    group_nolisten / scheduled_tasks 等新键由 main.on_load() 中的 setdefault 幂等补齐，
    旧版 data.json 缺字段时会在加载阶段自动补全，因此这里不提供迁移函数。
 
-调用顺序由 main.on_load() 决定：先修正目录拼写，再迁移 4.x 数据，最后升级记忆格式。
+5. 会话数据拆分（v0.4.x -> v0.5.0+）
+   旧版集中在 data.json 的 group/user_conversations 拆分到工作区 group|user/<id>.json
+   —— needs_conversation_split_migration() / migrate_conversations_to_split_files()
+
+调用顺序由 main.on_load() 决定：先修正目录拼写，再迁移 4.x 数据，接着升级记忆格式，
+最后拆分会话数据（必须在 migrate_legacy_workspace 之后，让 4.x 数据先汇入 data.json）。
 
 预设数据结构：
 <workspace>/
 | -- presets/
-    | -- <preset_name>/   # 每个预设一个目录，目录名即预设名
-        | -- config.yaml  # 本预设的配置文件
-        | -- prompt.md    # 本预设使用的提示词
-        | -- memory.json  # 启用记忆功能时自动创建
+|   | -- <preset_name>/   # 每个预设一个目录，目录名即预设名
+|       | -- config.yaml  # 本预设的配置文件
+|       | -- prompt.md    # 本预设使用的提示词
+|       | -- memory.json  # 启用记忆功能时自动创建
+| -- group/
+|   | -- <group_id>.json  # 群会话消息数组（v0.5.0+，由 SessionStore 管理）
+| -- user/
+    | -- <user_id>.json   # 私聊会话消息数组（v0.5.0+，由 SessionStore 管理）
 """
 
 import json
@@ -40,10 +49,14 @@ from typing import Any
 
 from ncatbot.utils.logger import get_log
 
+from .session_store import SessionStore
+
 _log = get_log('openai_chat_plugin.update')
 
 # v5 DataMixin 持久化的四个会话数据键
 _DATA_KEYS = ('group_conversations', 'user_conversations', 'group_preset_names', 'user_preset_names')
+# v0.5.0 起拆分到分离文件的会话字典（preset_names 两字典仍留在 data.json）
+_SPLIT_CONVERSATION_KEYS = ('group_conversations', 'user_conversations')
 
 
 # ======================================================================
@@ -189,7 +202,7 @@ def _backup_legacy_workspace(legacy_dir: Path) -> None:
         backup_dir = legacy_dir.with_name(f'openai_chat_plugin.migrated.bak.{int(time.time())}')
     try:
         legacy_dir.rename(backup_dir)
-        _log.info(f'旧版数据目录已重命名为 {backup_dir.name}（保留备份，可手动删除）')
+        _log.info(f'旧版数据目录已重命名为 {backup_dir.name}')
     except Exception as e:
         _log.warning(f'旧版数据目录改名失败（不影响迁移结果，下次启动将跳过已迁移项）: {e}')
 
@@ -336,3 +349,99 @@ def _migrate_memory_file(memory_file: Path) -> bool:
     with open(memory_file, 'w', encoding='utf-8') as f:
         json.dump(migrated, f, ensure_ascii=False, indent=2)
     return True
+
+
+# ======================================================================
+# 四、会话数据拆分：data.json 集中存储 -> 分离文件（v0.4.x -> v0.5.0+）
+# ======================================================================
+
+def needs_conversation_split_migration(plugin: Any) -> bool:
+    """检测 data.json 中是否仍存在集中存储的会话数据。
+
+    v0.5.0 起会话历史由 ``SessionStore`` 按会话独立文件管理；旧版遗留的
+    ``group_conversations`` / ``user_conversations`` 两个非空字典需要一次性
+    拆分出去。preset_names 两字典仍属于 data.json，不在检测范围。
+
+    :param plugin: 插件实例
+    :return: 是否需要执行拆分迁移
+    """
+    data = plugin.data.get('data') if isinstance(plugin.data, dict) else None
+    if not isinstance(data, dict):
+        return False
+    return any(data.get(key) for key in _SPLIT_CONVERSATION_KEYS)
+
+
+def migrate_conversations_to_split_files(plugin: Any) -> bool:
+    """把 data.json 中集中存储的会话拆分到 group|user/<id>.json 分离文件。
+
+    迁移策略（幂等、失败不阻塞加载）：
+
+    1. 先整体备份 data.json 为 ``data.json.bak.<时间戳>``，保证可回滚；
+    2. 逐会话写入分离文件，**目标文件已存在则跳过**（不覆盖新数据），
+       因此迁移中途失败后下次启动仅重试未完成的会话；
+    3. 仅当全部会话写入成功后，才从 data.json 删除
+       ``group_conversations`` / ``user_conversations`` 两个键并 ``_save_data()``；
+       任一会话写入失败则保留旧键，等待下次启动重试；
+    4. 内容非消息数组的损坏条目记警告后跳过，不阻塞其余会话迁移。
+
+    :param plugin: 插件实例（需具有 workspace / data / _save_data）
+    :return: 是否完成了实际拆分（含从 data.json 移除旧键）
+    """
+    data = plugin.data.get('data') if isinstance(plugin.data, dict) else None
+    if not isinstance(data, dict):
+        return False
+    pending = {
+        key: data.get(key) for key in _SPLIT_CONVERSATION_KEYS
+        if isinstance(data.get(key), dict) and data.get(key)
+    }
+    if not pending:
+        return False
+
+    workspace = Path(plugin.workspace)
+    _backup_data_json(workspace)
+    store = SessionStore(workspace)
+
+    failures = 0
+    for conv_key, conversations in pending.items():
+        for session_id, messages in conversations.items():
+            try:
+                if not isinstance(messages, list):
+                    _log.warning(
+                        f'会话 {conv_key}/{session_id} 的内容不是消息数组，已跳过（请手动检查）')
+                    continue
+                if store.has(conv_key, session_id):
+                    _log.debug(f'分离文件已存在，跳过: {conv_key}/{session_id}')
+                    continue
+                store.replace(conv_key, session_id, messages)
+            except Exception as e:
+                failures += 1
+                _log.error(f'写入会话文件失败 {conv_key}/{session_id}: {e}')
+
+    if failures:
+        _log.error(
+            f'会话拆分迁移存在 {failures} 个失败项，旧数据保留在 data.json，'
+            '下次启动将自动重试已失败的会话')
+        return False
+
+    for conv_key in _SPLIT_CONVERSATION_KEYS:
+        data.pop(conv_key, None)
+    plugin._save_data()
+    total = sum(len(conversations) for conversations in pending.values())
+    _log.info(
+        f'已将 {total} 个会话拆分到分离文件'
+        f'（群会话 {len(pending.get("group_conversations", {}))} 个，'
+        f'用户会话 {len(pending.get("user_conversations", {}))} 个）')
+    return True
+
+
+def _backup_data_json(workspace: Path) -> None:
+    """迁移前整体备份 data.json（失败只记警告，不中断迁移）。"""
+    data_json = workspace / 'data.json'
+    if not data_json.is_file():
+        return
+    try:
+        backup_path = workspace / f'data.json.bak.{int(time.time())}'
+        shutil.copy2(data_json, backup_path)
+        _log.info(f'已备份 data.json 至 {backup_path.name}')
+    except Exception as e:
+        _log.warning(f'备份 data.json 失败（继续迁移）: {e}')

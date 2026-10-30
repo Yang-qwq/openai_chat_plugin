@@ -204,17 +204,18 @@ async def test_callback_uses_main_history_and_writes_back(tmp_path, monkeypatch)
             {"role": "user", "content": "早上好"},
             {"role": "assistant", "content": "早上好呀"},
         ]
-        plugin.data["data"]["group_conversations"][GROUP_ID] = history
+        plugin._sessions.replace("group_conversations", GROUP_ID, history)
 
         await plugin_tools._cron_task_callback(
             plugin, "daily", "提醒我喝水", "group", GROUP_ID)
 
-        assert history[-2] == {"role": "user", "content": "[定时任务 daily] 提醒我喝水"}
-        assert history[-1] == {"role": "assistant", "content": "该喝水了"}
+        session = plugin._sessions.load("group_conversations", GROUP_ID)
+        assert session[-2] == {"role": "user", "content": "![定时任务 daily] 提醒我喝水"}
+        assert session[-1] == {"role": "assistant", "content": "该喝水了"}
 
         call = plugin._default_client.chat.completions.calls[0]
         assert [m["role"] for m in call["messages"]] == ["system", "user", "assistant", "user"]
-        assert call["messages"][-1]["content"] == "[定时任务 daily] 提醒我喝水"
+        assert call["messages"][-1]["content"] == "![定时任务 daily] 提醒我喝水"
         # 定时轮不传工具参数，兼容严格网关（`"tools": null` 会被拒绝）
         assert "tools" not in call
         assert "tool_choice" not in call
@@ -232,7 +233,7 @@ async def test_callback_failure_does_not_pollute_history(tmp_path, monkeypatch):
             {"role": "system", "content": "预设提示"},
             {"role": "user", "content": "早上好"},
         ]
-        plugin.data["data"]["group_conversations"][GROUP_ID] = history
+        plugin._sessions.replace("group_conversations", GROUP_ID, history)
         plugin.data["data"]["scheduled_tasks"]["daily"] = {
             "interval": "1h",
             "prompt": "提醒",
@@ -244,7 +245,7 @@ async def test_callback_failure_does_not_pollute_history(tmp_path, monkeypatch):
         await plugin_tools._cron_task_callback(
             plugin, "daily", "提醒", "group", GROUP_ID)
 
-        assert plugin.data["data"]["group_conversations"][GROUP_ID] == history
+        assert plugin._sessions.load("group_conversations", GROUP_ID) == history
         assert plugin.data["data"]["scheduled_tasks"]["daily"]["failures"] == 1
         h.assert_api("send_group_msg").not_called()
 
@@ -272,7 +273,7 @@ async def test_scheduled_turn_supports_tool_calls(tmp_path, monkeypatch):
         assert all("tools" in call for call in client.chat.completions.calls)
         second_messages = client.chat.completions.calls[1]["messages"]
         assert second_messages[0] == {
-            "role": "user", "content": "[定时任务 daily] 提醒我喝水"}
+            "role": "user", "content": "![定时任务 daily] 提醒我喝水"}
         assert any(m["role"] == "tool" and m["name"] == "get_system_time"
                    for m in second_messages)
 
@@ -281,8 +282,8 @@ async def test_scheduled_turn_supports_tool_calls(tmp_path, monkeypatch):
         h.assert_api("send_group_msg").with_text("时间已查好")
 
         # 整轮写入历史：内部消息 → assistant(tool_calls) → tool → assistant 最终
-        history = plugin.data["data"]["group_conversations"][GROUP_ID]
-        assert history[0] == {"role": "user", "content": "[定时任务 daily] 提醒我喝水"}
+        history = plugin._sessions.load("group_conversations", GROUP_ID)
+        assert history[0] == {"role": "user", "content": "![定时任务 daily] 提醒我喝水"}
         assert history[1]["role"] == "assistant" and history[1].get("tool_calls")
         assert history[2]["role"] == "tool" and history[2]["name"] == "get_system_time"
         assert history[3] == {"role": "assistant", "content": "时间已查好"}
@@ -303,7 +304,7 @@ async def test_scheduled_turn_tool_failure_keeps_history(tmp_path, monkeypatch):
             ), "tool_calls")),
         ])
         history = [{"role": "system", "content": "预设提示"}]
-        plugin.data["data"]["group_conversations"][GROUP_ID] = history
+        plugin._sessions.replace("group_conversations", GROUP_ID, history)
         plugin.data["data"]["scheduled_tasks"]["daily"] = {
             "interval": "1h",
             "prompt": "提醒",
@@ -316,7 +317,7 @@ async def test_scheduled_turn_tool_failure_keeps_history(tmp_path, monkeypatch):
         await plugin_tools._cron_task_callback(
             plugin, "daily", "提醒", "group", GROUP_ID)
 
-        assert plugin.data["data"]["group_conversations"][GROUP_ID] == history
+        assert plugin._sessions.load("group_conversations", GROUP_ID) == history
         assert plugin.data["data"]["scheduled_tasks"]["daily"]["failures"] == 1
         h.assert_api("send_group_msg").not_called()
 
@@ -351,14 +352,14 @@ async def test_scheduled_turn_serialized_per_session(tmp_path, monkeypatch):
         )
 
         contents = [m.get("content") for m in client.calls[1]["messages"]]
-        assert "[定时任务 first] 提醒1" in contents
+        assert "![定时任务 first] 提醒1" in contents
         assert "第1条" in contents
 
-        history = plugin.data["data"]["group_conversations"][GROUP_ID]
+        history = plugin._sessions.load("group_conversations", GROUP_ID)
         assert [(m["role"], m["content"]) for m in history[-4:]] == [
-            ("user", "[定时任务 first] 提醒1"),
+            ("user", "![定时任务 first] 提醒1"),
             ("assistant", "第1条"),
-            ("user", "[定时任务 second] 提醒2"),
+            ("user", "![定时任务 second] 提醒2"),
             ("assistant", "第2条"),
         ]
 
@@ -407,7 +408,7 @@ async def test_dispatch_blocked_when_disabled(tmp_path, monkeypatch):
         await h.inject(private_message("每小時提醒我", user_id=ROOT_QQ))
         await h.settle()
 
-        session = plugin.data["data"]["user_conversations"][ROOT_QQ]
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
         tool_entry = next(m for m in session if m["role"] == "tool")
         assert "AllowScheduledTasks" in tool_entry["content"]
         assert "无法管理定时任务" in tool_entry["content"]
@@ -658,8 +659,8 @@ async def test_callback_cleans_up_one_shot_record(tmp_path, monkeypatch):
             plugin, "once", "提醒", "group", GROUP_ID)
 
         assert "once" not in plugin.data["data"]["scheduled_tasks"]
-        history = plugin.data["data"]["group_conversations"][GROUP_ID]
-        assert history[-2]["content"] == "[定时任务 once] 提醒"
+        history = plugin._sessions.load("group_conversations", GROUP_ID)
+        assert history[-2]["content"] == "![定时任务 once] 提醒"
         assert history[-1] == {"role": "assistant", "content": "一次性提醒"}
         h.assert_api("send_group_msg").with_text("一次性提醒")
 

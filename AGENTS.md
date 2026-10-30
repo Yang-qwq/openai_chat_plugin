@@ -12,13 +12,14 @@ OpenAI 对话插件（NcatBot 5），通过 OpenAI API 实现智能对话，支�
 OpenAIChatPlugin/
 ├── manifest.toml        # 插件清单（name/version/main/entry_class/pip_dependencies）
 ├── __init__.py          # 导出 OpenAIChatPlugin
-├── main.py              # 插件入口：init_defaults、RBAC 注册、消息处理、事件回调
-├── prompt.py            # 集中管理硬编码提示词（随机插话提示、视觉说明、定时任务内部消息等）
+├── main.py              # 插件入口：init_defaults、RBAC 注册、消息处理、事件回调、会话压缩
+├── prompt.py            # 集中管理硬编码提示词（随机插话提示、视觉说明、定时任务内部消息、压缩系统提示等）
 ├── command_handler.py   # 命令 Mixin：/chat、/chat-admin、/chatrbac + 三层权限校验
 ├── preset_manager.py   # 预设管理：Preset 类（config.yaml + prompt.md）
+├── session_store.py     # 会话历史分离文件存储（<workspace>/group|user/<id>.json，v0.5.0 起）
 ├── reasoning.py         # 思维链剥离（移植自 NcatBotTRPG llm.py）：strip_reasoning / extract_reasoning
 ├── tools.py             # Function Calling 工具定义与实现（记忆、环境、HTTP 请求、图片视觉、定时任务等）
-├── update.py            # 数据迁移：4.x 工作区数据迁移、记忆格式升级
+├── update.py            # 数据迁移：4.x 工作区迁移、记忆格式升级、会话拆分迁移
 ├── exceptions.py        # 自定义异常（TooManyToolCallsException）
 ├── requirements.txt     # 依赖：openai, pyyaml, beautifulsoup4, markdownify
 ├── tests/               # pytest 测试（PluginTestHarness + MockAdapter 离线驱动）
@@ -27,13 +28,24 @@ OpenAIChatPlugin/
 
 ## 提示词管理（prompt.py）
 
-所有会作为消息内容发给模型的自然语言提示集中在 `prompt.py`，调整措辞时无需翻 `main.py`：
+`prompt.py` **只放静态文本常量，不写函数**。所有会作为消息内容发给模型的自然语言
+提示集中在这里，调整措辞时无需翻 `main.py`；需要格式化或条件拼接的部分
+（随机插话提示、定时任务内部消息、压缩请求）在 `main.py` 中组装：
 
-- `RANDOM_REPLY_SYSTEM_PROMPT`：随机插话临时提示（固定 user 角色，不写回会话历史）
+- `RANDOM_REPLY_SYSTEM_PROMPT`：随机插话临时提示（固定 user 角色，不写回会话历史），
+  以 `![随机插话提示]` 开头；必须同时包含**正向发言条件**与「拿不准时倾向接一句」的默认，
+  只写负向条件会让模型几乎总是回 `NO_REPLY`
+- `RANDOM_REPLY_CONTEXT_HEADER`：函数调用不可用时，随机插话提示后面附带
+  「群聊最近消息」小节的标题（记录由 `main.py` 从临时缓存截取）
 - `IMAGE_ONLY_USER_TEXT`：用户仅发图片、无文字时的兜底文本
 - `IMAGE_PLACEHOLDER_TEXT`：模型不支持视觉时，图片在纯文本请求中的占位符（`[图片]`）
 - `TOOL_VISION_IMAGE_TEXT`：工具返回图片后附加视觉消息的引导文本
-- `SCHEDULED_TASK_MESSAGE_TEMPLATE` / `build_scheduled_task_message()`：定时任务轮次的内部消息
+- `SCHEDULED_TASK_MESSAGE_TEMPLATE`：定时任务轮次的内部消息模板
+  （`![定时任务 <name>] <prompt>`，`!` 前缀为伪装标记，测试与文档断言须与此一致；
+  `main.py` 用 `.format(task_name=..., prompt=...)` 填充）
+- `CONVERSATION_COMPRESSION_SYSTEM_PROMPT`：会话压缩生成摘要时的系统提示
+- `CONVERSATION_COMPRESSION_USER_TEMPLATE`：压缩请求的用户消息模板
+  （`main.py` 用 `.format(history=...)` 填充）
 
 边界：Function Calling 的工具名/描述/参数说明属于工具 schema，仍在 `tools.py`；
 用户自定义的 system 提示词来自预设目录的 `prompt.md`，不放进 `prompt.py`。
@@ -109,8 +121,10 @@ classDiagram
 
     class OpenAIChatPlugin {
         +_default_client: OpenAI
+        +_sessions: SessionStore
         +temp_history_messages_kv: dict
         +on_load()
+        +on_close()
         +on_group_message(event) [@qq.on_group_message]
         +on_private_message(event) [@qq.on_private_message]
         -_record_group_history(event)
@@ -119,11 +133,18 @@ classDiagram
         -_session_key(event) tuple
         -_get_session_lock(conversation_dict, session_id) Lock
         -_ensure_session(conversation_dict, session_id) list
+        -_save_session(conv_dict, session_id)
         -_run_scheduled_task_turn(session_type, session_id, task_name, prompt, creator_id) str
         -_generate_reply(working, ...) str|None
         -_post_session_text(session_id, is_group, text)
         -_extract_user_image_visions(event) list[dict]
         -_assistant_message_to_history_dict(assistant_message) dict
+        -_cleanup_enabled() bool / _cleanup_interval_seconds() float
+        -_auto_cleanup_loop() / _auto_cleanup_all()
+        -_compress_conversation(conversation_dict, session_id) str
+        -_system_prefix_count(conv) int / _keep_recent_count(body, bytes) int
+        -_build_summary_input(messages) str / _generate_compression_summary(messages) str
+        -_compress_with_memory(...) / _compress_with_summary(...)
     }
 
     class Preset {
@@ -195,25 +216,56 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 | `AllowScheduledTasks` | bool | false | 允许 AI 创建/管理定时任务（需启用函数调用） |
 | `EnableScheduledTaskExecution` | bool | true | 定时任务执行总开关（kill switch），关闭后不注册/不执行 |
 | `MaxRetriesTimes` | int | 15 | 工具调用最大重试次数 |
-| `MaxConversationCacheStoreAmount` | int | 1000 | 最大对话缓存存储数量 |
+| `MaxConversationCacheStoreAmount` | int | 1000 | 最大对话缓存存储数量（也是 `query_missing_message_context` 取回条数的上限） |
 | `IsConfigured` | bool | false | 插件是否已配置 |
 | `EnableGroupOwnerAutoAuth` | bool | true | 群主/群管理自动放行本群管理员命令 |
+| `EnableConversationCompression` | bool | false | 启用会话压缩（超过阈值的历史压缩为摘要）；单独开启即可启动后台压缩循环 |
+| `EnableAutoCleanup` | bool | false | 后台压缩循环总开关（与上一项 **OR** 关系，任一开启都会起循环） |
+| `AutoCleanupInterval` | int | 1800 | 自动清理**检查**间隔（秒，默认 30 分钟）；仅扫描会话文件 mtime，本身不消耗 API 额度；`<=0`/非法值回退 1800 |
+| `AutoCleanupIdleSeconds` | int | 28800 | 会话**闲置多久**才允许自动压缩（秒，默认 8 小时）；活跃会话不会被压缩 |
+| `CompressionThresholdBytes` | int | 1048576 | 触发压缩的会话字节数阈值（默认约 350k 中文字符，需按模型上下文调低） |
+| `CompressionKeepRecentBytes` | int | 524288 | 压缩时保留的**最近**会话字节数（尾部窗口，system 不计入） |
 
 默认值在 `on_load()` 经 `init_defaults()` 注册（仅内存）；可被全局 `config.yaml` 的
 `plugin.plugin_configs.OpenAIChatPlugin` 覆盖（高优先级）。写配置用 `self.set_config(key, value)`（立即持久化）。
 
 ## 数据持久化
 
-- 会话数据存储在 `self.data['data']`（四个会话子字典：group/user_conversations、group/user_preset_names），
-  由 DataMixin 自动持久化到 `<workspace>/data.json`；中途保存用 `self._save_data()`
-- 另有 `group_nolisten`（群级随机插话开关，group_id -> bool）与 `scheduled_tasks`
-  （AI 定时任务记录，task_name -> {interval, prompt, session_type, session_id, creator_id,
-  created_at, failures, disabled, disabled_reason}），
+- **会话消息历史**自 v0.5.0 起由 `SessionStore`（`session_store.py`）按会话独立文件管理：
+  `<workspace>/group/<group_id>.json` 与 `<workspace>/user/<user_id>.json`，文件内容为
+  纯消息数组（JSON list）。`group_preset_names` / `user_preset_names` 两字典仍留在
+  `data.json`（会话维度的小状态，非消息历史）
+- `SessionStore` 内存缓存保留 `list` 引用：`load()` 返回的列表原地 `append` /
+  `history[:] = working` 即可反映到存储层，随后调用 `save()` 落盘——与旧 data.json
+  时代「先改列表、再显式保存」的编写方式一致；`replace()` 内部浅拷贝，**不持有
+  调用方列表**，测试断言历史时必须重新 `load()`，不能持有旧引用；`mtime()`
+  返回会话文件最后修改时间（自动清理用它做闲置检测）
+- `main.py` 的 `_save_session(conv_dict, session_id)` = `_sessions.save()` + `_save_data()`
+  （preset_names 仍在 data.json，会话文件变更后两者都要写）
+- 其余data.json 键：`group_nolisten`（群级随机插话开关，group_id -> bool）与
+  `scheduled_tasks`（AI 定时任务记录，task_name -> {interval, prompt, session_type, session_id,
+  creator_id, created_at, failures, disabled, disabled_reason}），
   均由 `on_load()` 幂等 `setdefault` 补齐，无需迁移函数
-- v5 事件中 `event.group_id` / `event.user_id` / `event.self_id` 均为 **str**，会话字典键统一为字符串
+- v5 事件中 `event.group_id` / `event.user_id` / `event.self_id` 均为 **str**，会话字典键与
+  SessionStore 的 session_id 统一为字符串（文件名经消毒：非 `[A-Za-z0-9_-]` 字符替换为 `_`）
+- 写入采用「临时文件 + `os.replace`」原子替换，避免半截 JSON；会话级并发由
+  `_session_locks` 保证，SessionStore 自身不加锁
+- **文件损坏容错**：`SessionStore.load()` 读到坏 JSON 时记错误日志并返回 `None`；
+  业务侧必须按「`load() is None` → 用默认预设重建」处理（`_handle_message_turn()` /
+  `_ensure_session()` 均如此），**不能**用 `has()` 判断是否存在会话——损坏文件的
+  `has()` 为 True 但 `load()` 为 None，会退化成 `AttributeError` 让会话永久不可用
+- `group_preset_names` / `user_preset_names` 的键统一 `str(session_id)`（`_get/_set_preset_name`
+  内部归一化并清理历史 int 键），否则 `/chat-admin set-preset group:<id>` 写入的 int 键
+  与 `_sessions.ids()` 返回的 str 键对不上，`update-prompt all` 会用默认预设覆盖该会话提示词
 
 ## 数据迁移（update.py）
 
+- `needs_conversation_split_migration(plugin)` / `migrate_conversations_to_split_files(plugin)`（v0.5.0）：
+  一次性把旧版 data.json 集中存储的 `group_conversations` / `user_conversations`
+  拆分到 `<workspace>/group|user/<id>.json` 分离文件（int 键归一化为 str 文件名）；
+  迁移前备份 `data.json.bak.<unix时间戳>`，**全部会话成功才删除旧键**（部分失败保留旧键，
+  下次启动自动重试失败的会话）；目标文件已存在则跳过该会话（幂等，不覆盖新数据）。
+  调用点在 `on_load()` 的 `migrate_legacy_workspace` **之后**（4.x 数据先汇入 data.json 再拆分）
 - `migrate_legacy_workspace(plugin)`：一次性将旧版 `data/openai_chat_plugin/`（4.x 运行时数据）迁移到新位置
   （旧 `presents/` 整目录复制到新 `presets/` + 旧 json `data` 键迁入 data.json），完成后旧目录改名 `.migrated.bak`；幂等，失败不阻塞加载
 - `migrate_presents_dir(plugin)`：将旧工作区中拼写错误的 `presents/` 目录重命名为 `presets/`；幂等，失败不阻塞加载
@@ -347,17 +399,42 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
   `RANDOM_REPLY_SYSTEM_PROMPT`（不写回会话历史）；该条固定用 user 角色，
   避免第二条 system 被严格网关（AMD Radeon、GLM 等）400 拒绝。放在末尾而非
   system 之后，是为了让提示贴近最新消息并复用历史前缀缓存
+- 插入下标由 `_generate_reply()` 在工具循环**前**固定为本次用户消息的下标
+  （`random_hint_at`），不能每轮按 `len-1` 重新推断：工具轮会追加
+  assistant/tool 消息，重新推断会把提示插进 `assistant(tool_calls)` 与 `tool`
+  之间（严格网关 400，语义也变成「对工具结果的备注」）
+- 提示内容由 `main._build_random_reply_hint()` 组装（`prompt.py` 只提供静态文本）：
+  - `EnableBuiltinFunctionCalling` 开启：只注入 `RANDOM_REPLY_SYSTEM_PROMPT`，其中鼓励
+    模型主动调用 `query_missing_message_context` 查看被忽略的群消息，**不**由插件直接
+    附带记录
+  - 该工具的 `count` 参数控制取回条数（默认 `DEFAULT_MISSING_CONTEXT_COUNT`=50），
+    分派链注入 `max_count=MaxConversationCacheStoreAmount` 作为硬上限，避免一次
+    拉回整段缓存撑爆上下文
+  - **取回成功后清空该群的 `temp_history_messages_kv` 全部临时消息**（即使只返回
+    最近 N 条也算已消费），保留空列表而不是删除 key，后续查询仍是 success + 空数组
+  - 函数调用关闭（`query_missing_message_context` 不可调用）：才在提示后追加
+    `RANDOM_REPLY_CONTEXT_HEADER` + 最近最多 `RANDOM_REPLY_CONTEXT_MESSAGES`（20）条
+    群聊记录（`_recent_group_messages()` 从 `temp_history_messages_kv` 取，排除已在会话
+    历史里的文本；单条截断到 `RANDOM_REPLY_CONTEXT_LINE_CHARS`，含 `NO_REPLY` 的发言剔除）
+  - 临时缓存由 `_record_group_history()` **始终记录**（纯内存，仍受
+    `MaxConversationCacheStoreAmount` 限制），不依赖 `EnableBuiltinFunctionCalling`
 - 随机插话轮**保留工具能力**（与普通聊天一致，受 `EnableBuiltinFunctionCalling`
-  与各 `AllowXxx` 开关约束）；工具轮写入**工作副本**，最终发言（回复成功）才提交回
-  主会话，因此回 `NO_REPLY` 时不会留下「user → assistant(tool_calls) → tool」半截轮次
+  与各 `AllowXxx` 开关约束）；工具轮写入**工作副本**，发言成功或沉默（`NO_REPLY`）
+  时提交回主会话——沉默时工具轮与归一化的沉默决定（`NO_REPLY_SENTINEL`）一并落库，
+  哨兵变体与空正文统一记为 `NO_REPLY`；仅异常（限流/工具上限/内部错误）时整轮丢弃，
+  避免失败轮次污染上下文
 - 随机插话轮的工具中间正文**不投递**到群（避免「先说话再沉默」）；工具轮上限
   （`TooManyToolCallsException`）与内部错误在随机轮同样静默，只写日志
-- 提示词明确「调用工具后若仍无值得补充的内容，依旧只输出 NO_REPLY」，避免模型
-  因为用过工具而强行发言
+- 提示词同时给出正向发言条件（话题相关/有人提问没人接/适合附和吐槽）与
+  「拿不准时倾向简短接一句」的默认，并明确「不要为了决定是否插话而反复查记忆」。
+  只保留负向条件（闲聊/没什么可说 → NO_REPLY）会让模型几乎总是沉默
+  （实测 20 次命中 19 次不发言）
+- 提示词**不描述性格**：人设、语气、称呼全部以用户预设 `prompt.md` 为准，随机提示只
+  决定「是否发言」
 - 请求限流（429）由 SDK 按 `REQUEST_MAX_RETRIES`（4 次，指数退避）自动重试；
   重试耗尽仍 429 时随机插话静默放弃，@/私聊回复「请求过于频繁，请稍后再试」
-- `_is_silent_reply()`：空正文或 `NO_REPLY_PATTERN` 命中（容忍反引号/句点/连字符）→ 不发送、
-  不写 assistant 历史、`_save_data()` 后返回
+- `_is_silent_reply()`：空正文或 `NO_REPLY_PATTERN` 命中（容忍反引号/句点/连字符）→
+  不发送，但把工具轮与归一化沉默决定（`NO_REPLY_SENTINEL`）写入主会话后 `_save_session()`
 - `/chat nolisten on|off`（无参查询）写 `data['data']['group_nolisten'][group_id]`，
   `on` 表示关闭本群随机插话；所有人可用
 - 测试见 `tests/test_random_reply.py`
@@ -417,6 +494,69 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
   主会话历史写入与请求复现/失败不污染历史/同会话串行/定时轮工具循环与工具失败回滚）；
   `tests/test_gating.py` 覆盖"未启用函数调用时请求不带 tools/tool_choice"
 
+## 会话压缩与自动清理
+
+`EnableConversationCompression`（默认关）+ `CompressionThresholdBytes`（默认 1 MB）：
+超过阈值的会话历史压缩为摘要，避免长对话撑爆上下文。
+
+**压缩规则（`_compress_conversation`）**
+
+- 返回 `'compressed' | 'skipped' | 'failed'`：未开启 / 无会话文件 / 未达阈值 /
+  正文消息数 ≤ 2 / 无可压缩前缀均 `'skipped'`；**摘要生成或记忆写入失败一律 `'failed'`
+  且不修改会话历史**
+- **`system` 提示词永不参与压缩**：`_system_prefix_count()` 取出会话首条 system，
+  压缩只作用于其后的正文，压缩后 system 仍在 `conv[0]`（预设人格不会因压缩丢失）
+- **保留窗口是尾部**：`_keep_recent_count()` 从后往前累计 `CompressionKeepRecentBytes`
+  字节（至少 1 条），只压缩更早的消息；`messages_to_compress = body[:-keep_count]`，
+  删除时按 `del conv[insert_at:insert_at + len(to_compress)]`（**不要写成 `del conv[-N:]`**，
+  那是删最新的消息，语义正好相反）
+- 压缩直接改内存中的消息列表，之后显式 `_sessions.save()` 落盘分离文件
+
+**两条落点**
+
+- `EnableBuiltinFunctionCalling` + `AllowAccessMemory` 同时开启 → `_compress_with_memory`：
+  摘要写入预设 `memory.json`，`from_group`/`from_user` 按会话类型注入，
+  **必须用 `_tool_payload_succeeded()` 校验返回 payload**，写入失败就中止并保留历史
+- 否则 → `_compress_with_summary`：摘要作为 `[历史摘要] ...` 消息插在 **system 之后**
+  （不是会话末尾）
+
+**摘要输入（`_build_summary_input`）**
+
+- 只取文本部分，图片渲染成 `[图片]` 占位，base64 绝不进入摘要
+- 超出 `SUMMARY_INPUT_BUDGET_CHARS`（12000 字符）时**等距抽样**并保留末行，保证摘要
+  覆盖整段被删历史而不是只截开头；抽样比例写警告日志
+
+**触发与调度**
+
+- 压缩只由后台循环触发。`on_load()` 在 `EnableConversationCompression` 或
+  `EnableAutoCleanup` 任一开启时启动 `_auto_cleanup_loop()`（两者 OR，避免"只开压缩却不生效"）
+- 任务引用存 `self._cleanup_task`，`on_close()` 中取消（防热重载后孤儿任务重复压缩）；
+  `AutoCleanupInterval <= 0 / 非法值` 回退 1800s（`_cleanup_interval_seconds()`），防忙等扫描
+- 循环经 `_sessions.ids()` 枚举**包括仅存磁盘、未加载会话**在内的全部会话逐一检查
+  （静默，失败只计数记日志）
+- **闲置门控**：`_auto_cleanup_all()` 只压缩闲置时间超过 `AutoCleanupIdleSeconds`
+  （默认 28800s = 8 小时）的会话——以会话文件 mtime 作为「最后活跃时间」（任何会话变动
+  ——对话轮次落库、reset/set-preset、压缩本身——都会写文件，读操作不更新）。
+  活跃会话不会被反复压缩消耗 token，也不会在对话进行中被打断；检查节奏默认
+  30 分钟一次（`AutoCleanupInterval`）
+- 压缩前先获取 `_session_locks` 的会话锁再判断闲置，避免与在途对话/定时轮次竞态：
+  在途轮次落库后 mtime 更新，自然跳过
+- `_compress_conversation()` 本身不做闲置判断（直接调用 = 手动压缩语义），
+  闲置门控只属于自动清理循环
+
+**阈值取舍**
+
+- `CompressionThresholdBytes` 默认 1 MB（≈350k 中文字符），对 128k 上下文模型明显偏大
+  （会先撞 `context_length_exceeded` 再触发压缩）。按模型上下文调低阈值，或接受
+  抽样日志提示的静默丢失
+
+**测试**
+
+- 见 `tests/test_compression.py`（保留窗口方向、system 保留、摘要位置、记忆写入失败
+  保留历史、抽样覆盖、开关语义、间隔回退、`on_close` 取消任务）
+- **所有触发压缩的用例必须 stub `plugin._default_client`**
+  （`on_load` 创建的是真实 OpenAI 客户端，不 stub 会发真实请求）
+
 ## 测试要求
 
 - 测试放 `tests/`，用 `ncatbot.testing.PluginTestHarness` + MockAdapter 离线驱动，
@@ -431,14 +571,33 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 - 运行（推荐在插件目录内执行）：`python -m pytest tests -v -o "addopts="`
   （仓库根目录 `.\.venv\Scripts\python -m pytest plugins/OpenAIChatPlugin/tests -o "addopts="` 亦可）
 - 对话链路测试须替换 `plugin._default_client` 为 stub（见 `tests/fake_openai.py`），禁止真实网络请求
-- 功能用例：`test_reasoning.py` / `test_reasoning_unit.py`（思维链剥离）、
-  `test_random_reply.py`（随机插话：命中/沉默/冷却/群开关/提示固定 user 角色）、
+- 功能用例：`test_chat.py`（私聊/群聊对话与工具轮、鉴权拦截）、`test_gating.py`
+  （@/MustAtBot 门控与未启用函数调用时不带 tools）、`test_commands.py` /
+  `test_permission.py`（命令解析与三层权限）、`test_load.py`（加载与配置注册）、
+  `test_reasoning.py` / `test_reasoning_unit.py`（思维链剥离）、
+  `test_random_reply.py`（随机插话：命中/沉默（完整轮次落库）/冷却/群开关/提示固定 user 角色、
+  工具轮提示位置回归、有工具时优先调上下文工具、无工具时附带并去重群聊记录）、
+  `test_context_tool.py`（上下文工具：默认条数/指定 count/配置上限 clamp/非法参数/空缓存/分派链注入）、
   `test_cron_tools.py`（定时任务：可见性/增删查/失败分支/投递/恢复/分派拦截）、
   `test_ssrf.py`（SSRF 防护：地址段分类/主机校验/重定向逐跳复核/配置注入与
-  模型参数隔离）、`test_text_only_model.py`（纯文本模型兼容：400 降级重试/后续
-  请求提前压平/无关 400 不误判）
+  模型参数隔离）、`test_image_vision.py` / `test_tools_http.py`（用户图片识别与
+  HTTP 工具）、`test_text_only_model.py`（纯文本模型兼容：400 降级重试/后续
+  请求提前压平/无关 400 不误判）、`test_compression.py`（会话压缩：阈值触发/
+  记忆路径/摘要路径/失败不修改会话/自动清理循环/**保留最近窗口方向/system 保留/
+  摘要位置/记忆写入失败保留历史/摘要抽样覆盖/开关与间隔语义/on_close 取消任务**）、
+  `test_session_split.py`（分离文件存储 + v0.5.0 拆分迁移/幂等/失败保留旧键/
+  **损坏文件重建**）
 - `test_trpg_coordination.py` 会在模块级探测 `plugins/NcatBotTRPG/manifest.toml`，
   插件不存在时整体 skip，而不是加载报错
+- **沙箱陷阱（重要）**：`monkeypatch.undo()` 会连带撤销 `monkeypatch.chdir()`，
+  之后相对路径与 `PluginTestHarness` 会话会落到 **pytest 调用目录**（从仓库根运行时
+  即真实 `data/`，造成污染）。需要在会话间恢复部分 patch 时，用独立
+  `pytest.MonkeyPatch()` 实例注入故障（只 undo 它），并在会话内先用
+  `plugin.workspace.resolve()` 捕获绝对路径再退出 `async with`。真实数据污染后
+  可从 `data.json.bak.<时间戳>` 回滚（`data/` 为 gitignored，无 git 兜底）
+- patch 目标写插件模块时用 harness 的包名 `OpenAIChatPlugin.xxx`（不存在
+  `plugins.OpenAIChatPlugin` 这个导入路径）；patch `asyncio.to_thread` 这类
+  经 `import asyncio` 引用的全局函数，直接 patch 模块属性本身
 
 ## 注意事项
 
