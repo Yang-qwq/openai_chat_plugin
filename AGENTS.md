@@ -433,8 +433,12 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
   决定「是否发言」
 - 请求限流（429）由 SDK 按 `REQUEST_MAX_RETRIES`（4 次，指数退避）自动重试；
   重试耗尽仍 429 时随机插话静默放弃，@/私聊回复「请求过于频繁，请稍后再试」
-- `_is_silent_reply()`：空正文或 `NO_REPLY_PATTERN` 命中（容忍反引号/句点/连字符）→
-  不发送，但把工具轮与归一化沉默决定（`NO_REPLY_SENTINEL`）写入主会话后 `_save_session()`
+- NO_REPLY 沉默**适用于所有对话轮**（群 @/私聊/随机插话/定时任务），非随机插话专属：
+  `_is_no_reply_sentinel()` 命中（`NO_REPLY_PATTERN`，容忍反引号/句点/连字符/大小写）
+  → 不发送，归一化的沉默决定（`NO_REPLY_SENTINEL`，随机轮含工具轮一并提交）写入
+  主会话后 `_save_session()`，保持轮次完整。历史里落库的 `NO_REPLY` 会教会模型在
+  普通轮也回哨兵，不加识别会把字面文本发给用户。空正文（如仅思维链）同样不发送，
+  但只有随机插话轮归一落库，普通轮维持不追加 assistant 的旧行为（见「思维链剥离」）
 - `/chat nolisten on|off`（无参查询）写 `data['data']['group_nolisten'][group_id]`，
   `on` 表示关闭本群随机插话；所有人可用
 - 测试见 `tests/test_random_reply.py`
@@ -470,7 +474,9 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
   （**支持工具调用**：受 `EnableBuiltinFunctionCalling` 与各 `AllowXxx` 开关控制，
   `asyncio.to_thread` 执行请求避免阻塞事件循环）→ `api.qq.post_group_msg/post_private_msg` →
   **投递成功后**才把整轮消息（内部消息、assistant(tool_calls)、tool、最终回复）写入
-  主会话历史并 `_save_data()`（失败整轮不落库，不污染上下文）
+  主会话历史并 `_save_data()`（失败整轮不落库，不污染上下文）；模型主动沉默
+  （`NO_REPLY` 哨兵）时同样整轮落库（归一化的沉默决定），并视为执行成功、不计
+  `failures`——沉默是有效决定而非失败，空正文（未产生任何内容）仍按失败计
 - 工具调用的中间正文（与 tool_calls 同时返回的 content）同样投递到会话，与普通聊天一致；
   定时轮没有消息事件时，`get_environment_info` 用创建者/会话信息合成结果
 - 任务记录包含 `creator_id`（创建时由 `event.user_id` 注入），供定时轮的
@@ -491,7 +497,8 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 - 定时任务的内部消息与回复**会写入主会话历史**（与普通聊天共用上下文）
 - 测试见 `tests/test_cron_tools.py`（工具可见性/增删查/失败分支/投递/恢复/分派拦截/
   最小间隔/跨会话删除/失败自动停用/一次性清理/暂停与恢复/事件循环不被阻塞/
-  主会话历史写入与请求复现/失败不污染历史/同会话串行/定时轮工具循环与工具失败回滚）；
+  主会话历史写入与请求复现/失败不污染历史/同会话串行/定时轮工具循环与工具失败回滚/
+  主动沉默计成功）；
   `tests/test_gating.py` 覆盖"未启用函数调用时请求不带 tools/tool_choice"
 
 ## 会话压缩与自动清理
@@ -571,14 +578,16 @@ MRO: `OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin)`。
 - 运行（推荐在插件目录内执行）：`python -m pytest tests -v -o "addopts="`
   （仓库根目录 `.\.venv\Scripts\python -m pytest plugins/OpenAIChatPlugin/tests -o "addopts="` 亦可）
 - 对话链路测试须替换 `plugin._default_client` 为 stub（见 `tests/fake_openai.py`），禁止真实网络请求
-- 功能用例：`test_chat.py`（私聊/群聊对话与工具轮、鉴权拦截）、`test_gating.py`
+- 功能用例：`test_chat.py`（私聊/群聊对话与工具轮、鉴权拦截、普通轮 NO_REPLY
+  沉默与归一落库）、`test_gating.py`
   （@/MustAtBot 门控与未启用函数调用时不带 tools）、`test_commands.py` /
   `test_permission.py`（命令解析与三层权限）、`test_load.py`（加载与配置注册）、
   `test_reasoning.py` / `test_reasoning_unit.py`（思维链剥离）、
   `test_random_reply.py`（随机插话：命中/沉默（完整轮次落库）/冷却/群开关/提示固定 user 角色、
   工具轮提示位置回归、有工具时优先调上下文工具、无工具时附带并去重群聊记录）、
   `test_context_tool.py`（上下文工具：默认条数/指定 count/配置上限 clamp/非法参数/空缓存/分派链注入）、
-  `test_cron_tools.py`（定时任务：可见性/增删查/失败分支/投递/恢复/分派拦截）、
+  `test_cron_tools.py`（定时任务：可见性/增删查/失败分支/投递/恢复/分派拦截/
+  主动沉默计成功）、
   `test_ssrf.py`（SSRF 防护：地址段分类/主机校验/重定向逐跳复核/配置注入与
   模型参数隔离）、`test_image_vision.py` / `test_tools_http.py`（用户图片识别与
   HTTP 工具）、`test_text_only_model.py`（纯文本模型兼容：400 降级重试/后续

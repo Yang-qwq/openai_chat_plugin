@@ -47,9 +47,9 @@ _log = get_log('openai_chat_plugin')  # 日志记录器
 # 省略文本长度
 OMITTED_TEXT_LENGTH = 100
 
-# 随机插话的「不发言」哨兵：容忍 NO_REPLY / NO-REPLY / `no_reply` 等写法
+# 模型「不发言」哨兵（所有对话轮通用）：容忍 NO_REPLY / NO-REPLY / `no_reply` 等写法
 NO_REPLY_PATTERN = re.compile(r'^\W*no[_\-\s]?reply\W*$', re.IGNORECASE)
-# 沉默决定写入会话历史时的规范化文本：哨兵变体与空正文统一记为 NO_REPLY
+# 沉默决定写入会话历史时的规范化文本：哨兵变体统一记为 NO_REPLY
 NO_REPLY_SENTINEL = 'NO_REPLY'
 # 同一群的随机插话最小间隔（秒），防止连续刷屏
 RANDOM_REPLY_COOLDOWN_SECONDS = 30
@@ -81,7 +81,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
     """
 
     name = 'OpenAIChatPlugin'  # 插件名（须与 manifest.toml 一致）
-    version = '0.5.1'  # 插件版本
+    version = '0.5.2'  # 插件版本
     author = 'Yang-qwq'
     description = 'OpenAI 对话插件：多预设管理、函数调用（Function Calling）、会话持久化'
 
@@ -352,14 +352,15 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         定时任务与普通聊天共用同一份会话历史，并且同样具备工具调用能力（受
         ``EnableBuiltinFunctionCalling`` 与各 ``AllowXxx`` 开关控制）。请求在内存中
         构造为 ``历史 + 内部消息``，只有最终回复成功投递后才把整轮消息写入历史，
-        失败不会污染上下文。
+        失败不会污染上下文。模型主动选择沉默（回复 ``NO_REPLY`` 哨兵）时同样把
+        整轮消息写入历史（归一化的沉默决定），并视为执行成功、不计失败。
 
         :param session_type: 'group' 或 'private'
         :param session_id: 投递目标会话 ID
         :param task_name: 任务名（不含插件前缀）
         :param prompt: 任务提示
         :param creator_id: 任务创建者 ID（供记忆/环境工具使用，旧记录可能为空）
-        :return: 已投递的回复正文
+        :return: 已投递的回复正文；模型选择沉默时返回 ``NO_REPLY``（不投递）
         :raises RuntimeError: 客户端未初始化、模型返回空内容或投递失败
         """
         conversation_dict = ('group_conversations' if session_type == 'group'
@@ -389,6 +390,18 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                 random_reply=False,
                 use_tools=bool(self.get_config('EnableBuiltinFunctionCalling')),
             )
+            # 模型主动选择沉默（NO_REPLY 哨兵）：不投递，但整轮消息（内部消息、
+            # 工具轮、归一化的沉默决定）写入历史——沉默是有效决定而非失败，
+            # 不累计 failures；空正文（未产生任何内容）仍算失败
+            if self._is_no_reply_sentinel(reply):
+                working.append({'role': 'assistant', 'content': NO_REPLY_SENTINEL})
+                history[:] = working
+                self._save_session(conversation_dict, session_key)
+                _log.info(
+                    f'{self._session_tag(is_group, session_key)} '
+                    f'定时任务 {task_name} 模型选择不发言（NO_REPLY），未投递')
+                return NO_REPLY_SENTINEL
+
             if not reply:
                 raise RuntimeError('模型返回空内容')
 
@@ -399,7 +412,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             self._save_session(conversation_dict, session_key)
 
         _log.info(
-            f'[{"群组" if is_group else "用户"} {session_key}] '
+            f'{self._session_tag(is_group, session_key)} '
             f'定时任务 {task_name} 已投递（{len(reply)} 字）')
         return reply
 
@@ -641,16 +654,28 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         return 'image_url' in text and ('unsupported' in text or 'not support' in text)
 
     @staticmethod
-    def _is_silent_reply(text: str) -> bool:
-        """随机插话的「不发言」判定：空正文或模型只回 NO_REPLY 哨兵。
+    def _is_no_reply_sentinel(text: str) -> bool:
+        """模型是否显式回复「不发言」哨兵（所有对话轮通用）。
 
         :param text: 已剥离思维链并 strip 的回复正文
-        :return: 是否应保持沉默
+        :return: 是否命中 NO_REPLY 哨兵（容忍反引号/句点/连字符/大小写变体）
         """
-        stripped = (text or '').strip()
-        if not stripped:
-            return True
-        return NO_REPLY_PATTERN.match(stripped) is not None
+        return NO_REPLY_PATTERN.match((text or '').strip()) is not None
+
+    @staticmethod
+    def _commit_working_turn(conversation: list[dict], working: list[dict]) -> None:
+        """把随机插话工作副本中的工具轮消息提交回主会话。
+
+        工作副本只在随机插话轮创建（普通轮直接在主会话上追加工具轮），
+        提交即把副本相对主会话新增的 assistant/tool 消息接回尾部。
+        """
+        if working is not conversation:
+            conversation.extend(working[len(conversation):])
+
+    @staticmethod
+    def _session_tag(is_group: bool, session_id: str) -> str:
+        """统一日志里的会话前缀，如 ``[群组 123456]``。"""
+        return f'[{"群组" if is_group else "用户"} {session_id}]'
 
     async def _extract_user_image_visions(self, event: MessageEvent) -> list[dict]:
         """识别并下载用户消息中携带的图片，返回视觉输入信息列表。
@@ -861,7 +886,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             thinking_content = self._clean_content(assistant_msg.content)
             if thinking_content:
                 _log.info(
-                    f'[{"群组" if is_group else "用户"} {session_id}] '
+                    f'{self._session_tag(is_group, session_id)} '
                     f'AI思考/中间内容: {thinking_content[:OMITTED_TEXT_LENGTH]}'
                     f'{"..." if len(thinking_content) > OMITTED_TEXT_LENGTH else ""}')
 
@@ -966,7 +991,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
                 history_content = tools._vision_summary_payload(vision) if vision else result
 
                 _log.info(
-                    f'[{"群组" if is_group else "用户"} {session_id}] 工具调用: '
+                    f'{self._session_tag(is_group, session_id)} 工具调用: '
                     f'{tool_name}({json.dumps(tool_args, ensure_ascii=False)[:OMITTED_TEXT_LENGTH]}) -> '
                     f'{str(history_content)[:OMITTED_TEXT_LENGTH]}'
                     f'{"..." if len(str(history_content)) > OMITTED_TEXT_LENGTH else ""}'
@@ -1082,7 +1107,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             for vision in user_vision_infos:
                 user_content.append({'type': 'image_url', 'image_url': {'url': vision['data_url']}})
             _log.info(
-                f'[{"群组" if is_group else "用户"} {session_id}] 识别到 {len(user_vision_infos)} 张用户图片，'
+                f'{self._session_tag(is_group, session_id)} 识别到 {len(user_vision_infos)} 张用户图片，'
                 f'将作为视觉输入附加到对话')
         else:
             user_content = user_message
@@ -1094,7 +1119,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
         # 添加用户消息到会话
         conversation.append({'role': 'user', 'content': user_content})
         _log.info(
-            f'[{"群组" if is_group else "用户"} {session_id}] 用户输入: '
+            f'{self._session_tag(is_group, session_id)} 用户输入: '
             f'{user_message[:OMITTED_TEXT_LENGTH]}{"..." if len(user_message) > OMITTED_TEXT_LENGTH else ""}')
 
         # 随机插话可能最终不发言：工具轮写入工作副本，发言成功或沉默（NO_REPLY）时
@@ -1127,25 +1152,30 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             if reply_message is None:
                 return
 
-            # 随机插话：模型回空正文或 NO_REPLY 哨兵时不发送，但完整调用轮（工具轮 +
-            # 归一化的沉默决定）仍写回主会话，保持轮次完整，便于后续对话延续上下文
-            if random_reply and self._is_silent_reply(reply_message):
-                _log.info(f'[群组 {session_id}] 随机插话未命中/模型选择不发言，已跳过发送')
-                # 工具轮消息提交回主会话（user 消息此前已写入）
-                if working is not conversation:
-                    conversation.extend(working[len(conversation):])
-                # 哨兵变体（反引号/句点/连字符/大小写）与空正文统一归一为 NO_REPLY
+            # 显式「不发言」哨兵：所有轮次一律不发送，归一化的 NO_REPLY 决定写入
+            # 会话历史（工具轮一并提交），保持轮次完整，便于后续对话延续上下文
+            if self._is_no_reply_sentinel(reply_message):
+                _log.info(
+                    f'{self._session_tag(is_group, session_id)} '
+                    f'模型选择不发言（NO_REPLY），已跳过发送')
+                self._commit_working_turn(conversation, working)
                 conversation.append({'role': 'assistant', 'content': NO_REPLY_SENTINEL})
                 self._save_session(conversation_dict, session_id)
                 return
 
+            # 空正文（如仅返回思维链）：同样不发送；随机插话轮把整轮与归一化的
+            # 沉默决定写回历史，普通轮维持「不追加 assistant」的旧行为
             if not reply_message:
-                _log.warning('模型返回了空回复，已跳过发送')
+                _log.info(
+                    f'{self._session_tag(is_group, session_id)} 模型未返回正文，已跳过发送')
+                if random_reply:
+                    self._commit_working_turn(conversation, working)
+                    conversation.append({'role': 'assistant', 'content': NO_REPLY_SENTINEL})
                 self._save_session(conversation_dict, session_id)
                 return
 
             _log.info(
-                f'[{"群组" if is_group else "用户"} {session_id}] AI回复: '
+                f'{self._session_tag(is_group, session_id)} AI回复: '
                 f'{reply_message[:OMITTED_TEXT_LENGTH]}{"..." if len(reply_message) > OMITTED_TEXT_LENGTH else ""}'
             )
 
@@ -1153,8 +1183,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             await event.reply(reply_message, at_sender=False)
 
             # 发言成功后才把随机插话轮的工具消息提交回主会话（user 消息此前已写入）
-            if working is not conversation:
-                conversation.extend(working[len(conversation):])
+            self._commit_working_turn(conversation, working)
 
             # 添加AI回复到会话
             conversation.append({'role': 'assistant', 'content': reply_message})
@@ -1170,7 +1199,7 @@ class OpenAIChatPlugin(OpenAICommandHandlerMixin, NcatBotPlugin):
             # SDK 已按 REQUEST_MAX_RETRIES 指数退避重试，仍 429 说明限流持续存在。
             # 随机插话静默放弃，避免往群里发错误提示；@/私聊给出可读提示
             _log.warning(
-                f'[{"群组" if is_group else "用户"} {session_id}] OpenAI 请求触发限流（429），'
+                f'{self._session_tag(is_group, session_id)} OpenAI 请求触发限流（429），'
                 f'本次{"随机插话" if random_reply else "对话"}已放弃')
             self._save_session(conversation_dict, session_id)
             if not random_reply:

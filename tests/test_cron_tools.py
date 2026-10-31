@@ -192,6 +192,35 @@ async def test_callback_skips_empty_reply(tmp_path, monkeypatch):
         h.assert_api("send_group_msg").not_called()
 
 
+async def test_callback_no_reply_counts_success(tmp_path, monkeypatch):
+    """模型主动选择沉默（NO_REPLY 哨兵）：不投递，整轮写入历史并计为成功
+
+    沉默是模型的有效决定而非失败：不累计 failures（连续沉默不会自动停用任务），
+    内部消息与归一化的沉默决定仍写入主会话历史，保持轮次完整。
+    """
+    monkeypatch.chdir(tmp_path)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        plugin_tools = _tool_module(plugin)
+        plugin._default_client = make_client("NO_REPLY")
+        plugin.data["data"]["scheduled_tasks"]["daily"] = {
+            "interval": "1h", "prompt": "提醒", "session_type": "group",
+            "session_id": GROUP_ID, "creator_id": ROOT_QQ, "failures": 2,
+        }
+
+        await plugin_tools._cron_task_callback(plugin, "daily", "提醒", "group", GROUP_ID)
+
+        h.assert_api("send_group_msg").not_called()
+        # 计为成功：原有失败计数被清零，任务未被停用
+        record = plugin.data["data"]["scheduled_tasks"]["daily"]
+        assert record["failures"] == 0
+        assert not record.get("disabled")
+        # 整轮消息（内部消息 + 归一化的沉默决定）写入主会话历史
+        session = plugin._sessions.load("group_conversations", GROUP_ID)
+        assert session[-2] == {"role": "user", "content": "![定时任务 daily] 提醒"}
+        assert session[-1] == {"role": "assistant", "content": "NO_REPLY"}
+
+
 async def test_callback_uses_main_history_and_writes_back(tmp_path, monkeypatch):
     """定时轮使用主会话历史，成功后写入内部消息与回复，且请求不带 tools"""
     monkeypatch.chdir(tmp_path)

@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 from ncatbot.testing import PluginTestHarness, extract_text
-from ncatbot.testing.factories.qq import private_message
+from ncatbot.testing.factories.qq import group_message, private_message
 
 from fake_openai import (
     FakeChoice,
@@ -26,6 +26,8 @@ pytestmark = pytest.mark.asyncio
 PLUGINS_DIR = Path(__file__).resolve().parents[2]
 PLUGIN_NAME = "OpenAIChatPlugin"
 ROOT_QQ = "123456"
+GROUP_ID = "200200"
+SELF_ID = "10001"  # 与 ncatbot_test_config.yaml 的 bot_uin 一致
 
 
 def _harness() -> PluginTestHarness:
@@ -93,6 +95,70 @@ async def test_reply_strips_leading_and_trailing_whitespace(tmp_path, monkeypatc
         h.assert_api("send_private_msg").with_text("你好！")
         session = plugin._sessions.load("user_conversations", ROOT_QQ)
         assert session[-1] == {"role": "assistant", "content": "你好！"}
+
+
+@pytest.mark.parametrize("silent_reply", ["NO_REPLY", "`NO_REPLY`", "no-reply"])
+async def test_private_chat_no_reply_sentinel_stays_silent(tmp_path, monkeypatch, silent_reply):
+    """私聊轮回 NO_REPLY 哨兵时不发送，归一化的沉默决定写入会话历史
+
+    所有对话轮（不限于随机插话）都识别哨兵：历史里落库的 NO_REPLY 会教会模型
+    在普通轮也回哨兵，若不加识别会把字面文本原样发给用户。
+    """
+    monkeypatch.chdir(tmp_path)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        _configure(plugin, [FakeResponse(FakeChoice(FakeMessage(silent_reply), "stop"))])
+
+        await h.inject(private_message("你好", user_id=ROOT_QQ))
+        await h.settle()
+
+        h.assert_api("send_private_msg").not_called()
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
+        # 哨兵变体（反引号/连字符/大小写）统一归一为 NO_REPLY，保持轮次完整
+        assert [m["role"] for m in session] == ["user", "assistant"]
+        assert session[-1] == {"role": "assistant", "content": "NO_REPLY"}
+
+
+async def test_group_at_no_reply_sentinel_stays_silent(tmp_path, monkeypatch):
+    """群 @ 普通轮回 NO_REPLY 哨兵时同样不发送，沉默决定写入会话历史"""
+    monkeypatch.chdir(tmp_path)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        _configure(plugin, [FakeResponse(FakeChoice(FakeMessage("NO_REPLY"), "stop"))])
+
+        await h.inject(group_message(
+            "你好",
+            group_id=GROUP_ID,
+            user_id=ROOT_QQ,
+            raw_message=f"[CQ:at,qq={SELF_ID}] 你好",
+            message=[
+                {"type": "at", "data": {"qq": SELF_ID}},
+                {"type": "text", "data": {"text": " 你好"}},
+            ],
+        ))
+        await h.settle()
+
+        h.assert_api("send_group_msg").not_called()
+        session = plugin._sessions.load("group_conversations", GROUP_ID)
+        assert [m["role"] for m in session] == ["user", "assistant"]
+        assert session[-1] == {"role": "assistant", "content": "NO_REPLY"}
+
+
+async def test_normal_turn_tool_round_then_no_reply(tmp_path, monkeypatch):
+    """普通轮工具调用后接 NO_REPLY：工具轮已在主会话，沉默决定归一落库"""
+    monkeypatch.chdir(tmp_path)
+    async with _harness() as h:
+        plugin = h.get_plugin(PLUGIN_NAME)
+        plugin.config["EnableBuiltinFunctionCalling"] = True
+        _configure(plugin, _tool_call_responses(None, "NO_REPLY"))
+
+        await h.inject(private_message("现在几点了", user_id=ROOT_QQ))
+        await h.settle()
+
+        h.assert_api("send_private_msg").not_called()
+        session = plugin._sessions.load("user_conversations", ROOT_QQ)
+        assert [m["role"] for m in session] == ["user", "assistant", "tool", "assistant"]
+        assert session[-1] == {"role": "assistant", "content": "NO_REPLY"}
 
 
 async def test_tool_call_loop_with_system_time(tmp_path, monkeypatch):
